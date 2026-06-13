@@ -475,7 +475,7 @@ export function extractDoneSteps(message: string): number[] {
 
 	// Natural language summaries: "completed steps 1-3", "phases 2 and 4 done".
 	const unit = "(?:steps?|phases?|tasks?|items?)";
-	const status = "(?:completed|finished|done|implemented|resolved|verified)";
+	const status = "(?:complete|completed|finished|done|implemented|resolved|verified)";
 	for (const match of message.matchAll(new RegExp(`${status}\\s+${unit}\\s*:?\\s+([\\d\\s,;&and\\-–—.]+)`, "gi"))) {
 		addNumberList(steps, match[1]);
 	}
@@ -505,7 +505,7 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 			// Pattern 1: explicit step/phase number + completion marker/status.
 			// e.g. "Step 3 ✅", "Phase 3: completed", "#3 ✓"
 			const stepNumMatch = l.match(
-				/(?:step|phase|task)\s*(\d+)\s*[:.)-]?\s*(?:✅|✓|✔|☑|\[x\]|completed|done|finished|resolved|implemented|verified)|#\s*(\d+)\s*[:.)-]?\s*(?:✅|✓|✔|☑|\[x\]|completed|done|finished|resolved|implemented|verified)/i,
+				/(?:step|phase|task)\s*(\d+)\s*[:.)-]?\s*(?:is\s+|was\s+|now\s+)?(?:✅|✓|✔|☑|\[x\]|complete|completed|done|finished|resolved|implemented|verified)|#\s*(\d+)\s*[:.)-]?\s*(?:is\s+|was\s+|now\s+)?(?:✅|✓|✔|☑|\[x\]|complete|completed|done|finished|resolved|implemented|verified)/i,
 			);
 			const stepNum = Number(stepNumMatch?.[1] ?? stepNumMatch?.[2]);
 			if (stepNumMatch && stepNum === item.step) {
@@ -516,7 +516,7 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 			// Pattern 2: markdown/checklist numbering + completion marker/status.
 			// e.g. "1. ✅ Config", "- 2) [x] API client", "3 - done"
 			const numberedListMatch = l.match(
-				/^(?:[-*+]\s*)?(\d+)\s*[.)-]?\s*(?:✅|✓|✔|☑|\[x\]|completed|done|finished|resolved|implemented|verified)/i,
+				/^(?:[-*+]\s*)?(\d+)\s*[.)-]?\s*(?:is\s+|was\s+|now\s+)?(?:✅|✓|✔|☑|\[x\]|complete|completed|done|finished|resolved|implemented|verified)/i,
 			);
 			if (numberedListMatch && Number(numberedListMatch[1]) === item.step) {
 				completed.push(item.step);
@@ -552,7 +552,7 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 
 			// Pattern 5: table row with step number and a check/completed status
 			// e.g. "| 3 | ... | ✅ |" or "| 5 | ... | ✅ Verified"
-			const tableMatch = l.match(/^\|\s*(\d+)\s*\|.*(?:✅|✓|✔|☑|completed|done|implemented|verified)/i);
+			const tableMatch = l.match(/^\|\s*(\d+)\s*\|.*(?:✅|✓|✔|☑|complete|completed|done|implemented|verified)/i);
 			if (tableMatch && Number(tableMatch[1]) === item.step) {
 				completed.push(item.step);
 				break;
