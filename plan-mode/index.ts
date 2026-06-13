@@ -9,6 +9,8 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { Type } from "typebox";
 import {
 	extractProposedPlan,
@@ -90,6 +92,40 @@ function planQuestionsError(message: string, questions: PlanQuestion[] = []) {
 	};
 }
 
+function planTitle(plan: string): string {
+	const heading = plan.match(/^#\s+(.+)$/m)?.[1]?.trim();
+	if (heading) return heading;
+	return plan.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "implementation-plan";
+}
+
+function slugifyPlanTitle(title: string): string {
+	return (
+		title
+			.replace(/`([^`]+)`/g, "$1")
+			.replace(/[^a-z0-9]+/gi, "-")
+			.replace(/^-+|-+$/g, "")
+			.toLowerCase()
+			.slice(0, 80) || "implementation-plan"
+	);
+}
+
+function timestampForFilename(date = new Date()): string {
+	return date.toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[:]/g, "-");
+}
+
+function buildSavedPlanMarkdown(plan: string, createdAt = new Date()): string {
+	return [
+		"---",
+		`created: ${createdAt.toISOString()}`,
+		"source: pi-plan-mode",
+		"status: accepted-for-execution",
+		"---",
+		"",
+		plan.trim(),
+		"",
+	].join("\n");
+}
+
 export default function planModeExtension(pi: ExtensionAPI): void {
 	let planModeEnabled = false;
 	let executionMode = false;
@@ -102,6 +138,42 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		type: "boolean",
 		default: false,
 	});
+
+	async function projectRoot(ctx: ExtensionContext): Promise<string> {
+		const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+			cwd: ctx.cwd,
+			timeout: 5000,
+			signal: ctx.signal,
+		});
+		if (result.code === 0) {
+			const root = result.stdout.trim().split("\n").pop()?.trim();
+			if (root) return root;
+		}
+		return ctx.cwd;
+	}
+
+	async function savePlanForExecution(ctx: ExtensionContext): Promise<string> {
+		if (!lastProposedPlan.trim()) throw new Error("No proposed plan is available to save.");
+
+		const root = await projectRoot(ctx);
+		const plansDir = join(root, "docs", "plans");
+		await mkdir(plansDir, { recursive: true });
+
+		const title = planTitle(lastProposedPlan);
+		const filename = `${timestampForFilename()}-${slugifyPlanTitle(title)}.md`;
+		const absolutePath = join(plansDir, filename);
+		await writeFile(absolutePath, buildSavedPlanMarkdown(lastProposedPlan), "utf8");
+
+		const relativePath = relative(root, absolutePath) || absolutePath;
+		pi.appendEntry("plan-mode-saved-plan", {
+			path: absolutePath,
+			relativePath,
+			root,
+			title,
+			savedAt: new Date().toISOString(),
+		});
+		return relativePath;
+	}
 
 	pi.registerTool({
 		name: PLAN_QUESTIONS_TOOL,
@@ -810,13 +882,25 @@ ${allSteps}
 			]);
 
 			if (choice?.startsWith("Execute")) {
+				let savedPlanPath: string;
+				try {
+					savedPlanPath = await savePlanForExecution(ctx);
+					ctx.ui.notify(`Saved accepted plan to ${savedPlanPath}`, "info");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Could not save the accepted plan; execution cancelled.\n${message}`, "error");
+					updateStatus(ctx);
+					persistState();
+					return;
+				}
+
 				planModeEnabled = false;
 				executionMode = true;
 				restoreSavedTools();
 				updateStatus(ctx);
 				persistState();
 
-				const execMessage = `Execute the plan. Start with: ${todoItems[0].text}`;
+				const execMessage = `Execute the plan saved at ${savedPlanPath}. Start with: ${todoItems[0].text}`;
 				pi.sendMessage(
 					{ customType: "plan-mode-execute", content: execMessage, display: true },
 					{ triggerTurn: true },

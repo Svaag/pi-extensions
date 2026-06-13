@@ -8,6 +8,7 @@ Read-only exploration mode for safe code analysis.
 - **Bash allowlist**: Only read-only bash commands are allowed
 - **Plan extraction**: Prefers `Implementation Steps`, `Execution Steps`, or `Action Plan` sections and extracts only numbered subheadings/top-level list items
 - **Interactive questions**: `plan_questions` tool gives a tabbed TUI wizard for implementation-detail questions instead of long A/B/C chat questionnaires
+- **Plan archival**: Accepted plans are saved to `docs/plans/` in the project repository before execution starts
 - **Progress tracking**: Widget shows completion status during execution
 - **Completion tracking**: Supports `[DONE:n]` markers, `Completed steps/phases: 1-3` status lines, numbered checked lists, and manual `/todos done 1-3` updates
 - **Session persistence**: State survives session resume
@@ -36,8 +37,9 @@ Read-only exploration mode for safe code analysis.
 Keep facts, config examples, sub-bullets, test plans, and acceptance criteria in separate sections so they do not become todos.
 
 4. Choose "Execute the plan" when prompted
-5. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, or numbered checked lists like `1. ✅ ...`
-6. Progress widget shows completion status
+5. Plan Mode saves the accepted plan to `docs/plans/<timestamp>-<title>.md` in the current git repository, then starts execution
+6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, or numbered checked lists like `1. ✅ ...`
+7. Progress widget shows completion status
 
 ## How It Works
 
