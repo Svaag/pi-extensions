@@ -81,6 +81,44 @@ function getTextContent(message: AssistantMessage): string {
 /** Tag that signals the agent considers the goal complete. */
 const GOAL_COMPLETE_PATTERN = /\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|\[DONE\]|Goal complete\./i;
 
+interface PlanModeState {
+	executing: boolean;
+	todos: Array<{ step: number; text: string; completed: boolean }>;
+}
+
+function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
+	const entries = ctx.sessionManager.getEntries();
+	const planEntry = entries
+		.filter((e: any) => e.type === "custom" && e.customType === "plan-mode")
+		.pop() as any;
+	if (!planEntry?.data) return undefined;
+	const todos = Array.isArray(planEntry.data.todos) ? planEntry.data.todos : [];
+	const executing = planEntry.data.executing === true;
+	if (!executing || todos.length === 0) return undefined;
+	return { executing, todos };
+}
+
+function buildPlanModeCoordinationPrompt(state: PlanModeState): string {
+	const remaining = state.todos.filter((t) => !t.completed);
+	const allSteps = state.todos
+		.map((t) => `${t.step}. ${t.completed ? "[x]" : "[ ]"} ${t.text}`)
+		.join("\n");
+	return [
+		"## Active Plan Mode Todos",
+		"The user previously created an implementation plan with the following steps. Continue executing them in order as part of this goal.",
+		"",
+		"All plan steps:",
+		allSteps,
+		"",
+		remaining.length > 0
+			? `Next unfinished step: ${remaining[0].step}. ${remaining[0].text}`
+			: "All plan steps appear complete.",
+		"",
+		"Whenever you finish a plan step, mark it with [DONE:n] where n is the step number (e.g. [DONE:2]). You may also say \"Completed step N\", \"Completed phase N\", or \"Completed steps 1-3\".",
+		"Only emit [GOAL COMPLETE] after every unfinished plan step above is marked done. Once you emit [GOAL COMPLETE], goal mode will exit automatically.",
+	].join("\n");
+}
+
 /** Extract check-list-like items from assistant text: [DONE] item, - [x] item, etc. */
 function extractProgressItems(text: string): { text: string; done: boolean }[] {
 	const items: { text: string; done: boolean }[] = [];
@@ -176,8 +214,15 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	// ── /goal command ──────────────────────────────────────────────────────────
 
 	pi.registerCommand("goal", {
-		description: "Enter goal (execute) mode and work autonomously",
+		description: "Toggle goal (execute) mode",
 		handler: async (args, ctx) => {
+			// Toggle: if already active, exit cleanly
+			if (goalModeEnabled) {
+				exitGoalMode(ctx);
+				ctx.ui.notify("Goal mode exited. Collaboration style restored.", "info");
+				return;
+			}
+
 			const goal = args.trim();
 			if (!goal) {
 				const input = await ctx.ui.input("Goal:", "Describe the task you want executed autonomously");
@@ -194,10 +239,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
-	// ── /no-goal command ───────────────────────────────────────────────────────
+	// ── /no-goal command (legacy alias) ────────────────────────────────────────
 
 	pi.registerCommand("no-goal", {
-		description: "Exit goal (execute) mode",
+		description: "Exit goal mode (legacy alias; /goal toggles)",
 		handler: async (_args, ctx) => {
 			if (!goalModeEnabled) {
 				ctx.ui.notify("Not in goal mode.", "info");
@@ -230,7 +275,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	// ── shortcut: Ctrl+Alt+G to toggle ─────────────────────────────────────────
 
 	pi.registerShortcut(Key.ctrlAlt("g"), {
-		description: "Exit goal mode",
+		description: "Toggle goal mode",
 		handler: async (ctx) => {
 			if (goalModeEnabled) {
 				exitGoalMode(ctx);
@@ -243,15 +288,19 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 
 	// ── inject execute system prompt while goal mode is active ─────────────────
 
-	pi.on("before_agent_start", async (event, _ctx) => {
+	pi.on("before_agent_start", async (event, ctx) => {
 		if (!goalModeEnabled) return;
 
-		// Prepend the execute collaboration-style instructions to the system prompt
-		return {
-			systemPrompt:
-				// Append to existing system prompt so other extensions' injections are preserved
-				event.systemPrompt + "\n\n" + EXECUTE_SYSTEM_PROMPT,
-		};
+		// Append the execute collaboration-style instructions to the system prompt
+		let systemPrompt = event.systemPrompt + "\n\n" + EXECUTE_SYSTEM_PROMPT;
+
+		// Coordinate with active plan-mode todos so progress keeps updating
+		const planState = getPlanModeState(ctx);
+		if (planState) {
+			systemPrompt += "\n\n" + buildPlanModeCoordinationPrompt(planState);
+		}
+
+		return { systemPrompt };
 	});
 
 	// ── turn tracking ──────────────────────────────────────────────────────────
@@ -298,7 +347,16 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			const text = getTextContent(lastAssistant);
 			if (GOAL_COMPLETE_PATTERN.test(text)) {
 				exitGoalMode(ctx);
+				ctx.ui.notify("Goal complete — goal mode exited.", "info");
+				return;
 			}
+		}
+
+		// If we're coordinating with plan mode and every step is done, exit too
+		const planState = getPlanModeState(ctx);
+		if (planState && planState.todos.every((t) => t.completed)) {
+			exitGoalMode(ctx);
+			ctx.ui.notify("All plan steps complete — goal mode exited.", "info");
 		}
 	});
 

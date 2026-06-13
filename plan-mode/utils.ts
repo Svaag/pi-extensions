@@ -532,8 +532,9 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 			}
 
 			// Pattern 4: step text appears on a line with a completion marker
-			// e.g. "✅ Add IPv4 to SPF" or "| 5 | SPF + A record | ✅ Committed"
-			const hasMarker = /(?:✅|✓|✔|☑|\[x\])/.test(l);
+			// e.g. "✅ Add IPv4 to SPF", "| 5 | SPF + A record | ✅ Committed",
+			// "[DONE] Add IPv4 to SPF", or "- [x] Add IPv4 to SPF"
+			const hasMarker = /(?:✅|✓|✔|☑|\[x\]|\[DONE\])/.test(l);
 			if (hasMarker) {
 				// Normalize both for comparison: lowercase, collapse whitespace, strip markdown
 				const normalizeForMatch = (s: string) =>

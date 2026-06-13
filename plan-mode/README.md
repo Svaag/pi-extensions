@@ -38,7 +38,7 @@ Keep facts, config examples, sub-bullets, test plans, and acceptance criteria in
 
 4. Choose "Execute the plan" when prompted
 5. Plan Mode saves the accepted plan to `docs/plans/<timestamp>-<title>.md` in the current git repository, then starts execution
-6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, or numbered checked lists like `1. ✅ ...`
+6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, numbered checked lists like `1. ✅ ...`, or checklist items like `[DONE] item text` / `- [x] item text`
 7. Progress widget shows completion status
 
 ## How It Works
