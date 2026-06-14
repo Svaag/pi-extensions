@@ -36,7 +36,9 @@ Read-only exploration mode for safe code analysis.
 
 Keep facts, config examples, sub-bullets, test plans, and acceptance criteria in separate sections so they do not become todos.
 
-4. Choose "Execute the plan" when prompted
+4. Choose an execution option when prompted:
+   - **Start Implementation** — Continue in the current session with the plan in context.
+   - **Start Implementation with empty context** — Start a fresh session containing only the proposed plan. Useful when the planning conversation has grown large and you want implementation to begin with clean context.
 5. Plan Mode saves the accepted plan to `docs/plans/<timestamp>-<title>.md` in the current git repository, then starts execution
 6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, numbered checked lists like `1. ✅ ...`, or checklist items like `[DONE] item text` / `- [x] item text`
 7. Progress widget shows completion status

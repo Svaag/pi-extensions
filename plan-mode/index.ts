@@ -876,12 +876,57 @@ ${allSteps}
 			);
 
 			const choice = await ctx.ui.select("Plan proposed - what next?", [
-				"Execute the plan (track progress)",
+				"Start Implementation",
+				"Start Implementation with empty context",
 				"Refine the plan (provide feedback)",
 				"Stay in plan mode",
 			]);
 
-			if (choice?.startsWith("Execute")) {
+			if (choice?.startsWith("Start Implementation with empty context")) {
+				let savedPlanPath: string;
+				try {
+					savedPlanPath = await savePlanForExecution(ctx);
+					ctx.ui.notify(`Saved accepted plan to ${savedPlanPath}`, "info");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Could not save the accepted plan; execution cancelled.\n${message}`, "error");
+					updateStatus(ctx);
+					persistState();
+					return;
+				}
+
+				const planOnlyPrompt = `Implement the plan saved at ${savedPlanPath}.\n\n<proposed_plan>\n${lastProposedPlan}\n</proposed_plan>\n\nStart with step 1: ${todoItems[0].text}`;
+
+				const result = await ctx.newSession({
+					parentSession: ctx.sessionManager.getSessionFile(),
+					setup: async (sm) => {
+						// Seed the new session with the plan as the only context message
+						sm.appendMessage({
+							role: "user",
+							content: [{ type: "text" as const, text: planOnlyPrompt }],
+							timestamp: Date.now(),
+						});
+						// Persist plan-mode state so the new session shows the todo widget and tracks progress
+						sm.appendCustomEntry("plan-mode", {
+							enabled: false,
+							todos: todoItems,
+							executing: true,
+							lastProposedPlan,
+							savedTools,
+						});
+					},
+					withSession: async (newCtx) => {
+						newCtx.ui.notify("Started implementation in a fresh session with the plan only.", "info");
+					},
+				});
+
+				if (result.cancelled) {
+					ctx.ui.notify("New session was cancelled. Plan remains in the current session.", "warning");
+				}
+				return;
+			}
+
+			if (choice?.startsWith("Start Implementation") && !choice?.includes("empty context")) {
 				let savedPlanPath: string;
 				try {
 					savedPlanPath = await savePlanForExecution(ctx);
