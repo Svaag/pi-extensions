@@ -7,7 +7,14 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { complete, type AssistantMessage, type Message, type TextContent } from "@earendil-works/pi-ai";
-import { convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+	convertToLlm,
+	serializeConversation,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -285,6 +292,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let lastProposedPlan = "";
 	let todoItems: TodoItem[] = [];
 	let savedTools: string[] = [];
+	let pendingEmptyContextPlanPath: string | undefined;
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only planning and exploration)",
@@ -956,6 +964,48 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("plan-start-empty-context", {
+		description: "Start implementing the accepted plan in a fresh session with only the plan as context",
+		handler: async (_args: any, ctx: ExtensionCommandContext) => {
+			const savedPlanPath = pendingEmptyContextPlanPath;
+			pendingEmptyContextPlanPath = undefined;
+
+			if (!savedPlanPath || !lastProposedPlan.trim() || todoItems.length === 0) {
+				ctx.ui.notify("No pending empty-context plan. Propose and accept a plan first.", "error");
+				return;
+			}
+
+			const planOnlyPrompt = `Implement the plan saved at ${savedPlanPath}.\n\n<proposed_plan>\n${lastProposedPlan}\n</proposed_plan>\n\nStart with step 1: ${todoItems[0].text}`;
+
+			const result = await ctx.newSession({
+				parentSession: ctx.sessionManager.getSessionFile(),
+				setup: async (sm) => {
+					// Seed the new session with the plan as the only context message
+					sm.appendMessage({
+						role: "user",
+						content: [{ type: "text" as const, text: planOnlyPrompt }],
+						timestamp: Date.now(),
+					});
+					// Persist plan-mode state so the new session shows the todo widget and tracks progress
+					sm.appendCustomEntry("plan-mode", {
+						enabled: false,
+						todos: todoItems,
+						executing: true,
+						lastProposedPlan,
+						savedTools,
+					});
+				},
+				withSession: async (newCtx) => {
+					newCtx.ui.notify("Started implementation in a fresh session with the plan only.", "info");
+				},
+			});
+
+			if (result.cancelled) {
+				ctx.ui.notify("New session was cancelled. Plan remains in the current session.", "warning");
+			}
+		},
+	});
+
 	pi.registerShortcut(Key.ctrlAlt("p"), {
 		description: "Toggle plan mode",
 		handler: async (ctx: ExtensionContext) => togglePlanMode(ctx),
@@ -1240,34 +1290,10 @@ If you only partially complete the plan, include exactly which step numbers are 
 					return;
 				}
 
-				const planOnlyPrompt = `Implement the plan saved at ${savedPlanPath}.\n\n<proposed_plan>\n${lastProposedPlan}\n</proposed_plan>\n\nStart with step 1: ${todoItems[0].text}`;
-
-				const result = await ctx.newSession({
-					parentSession: ctx.sessionManager.getSessionFile(),
-					setup: async (sm) => {
-						// Seed the new session with the plan as the only context message
-						sm.appendMessage({
-							role: "user",
-							content: [{ type: "text" as const, text: planOnlyPrompt }],
-							timestamp: Date.now(),
-						});
-						// Persist plan-mode state so the new session shows the todo widget and tracks progress
-						sm.appendCustomEntry("plan-mode", {
-							enabled: false,
-							todos: todoItems,
-							executing: true,
-							lastProposedPlan,
-							savedTools,
-						});
-					},
-					withSession: async (newCtx) => {
-						newCtx.ui.notify("Started implementation in a fresh session with the plan only.", "info");
-					},
-				});
-
-				if (result.cancelled) {
-					ctx.ui.notify("New session was cancelled. Plan remains in the current session.", "warning");
-				}
+				// ctx.newSession is only available in ExtensionCommandContext, not event handlers.
+				// Hand off to the /plan-start-empty-context command so the replacement runs safely.
+				pendingEmptyContextPlanPath = savedPlanPath;
+				pi.sendUserMessage("/plan-start-empty-context");
 				return;
 			}
 
