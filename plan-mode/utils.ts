@@ -592,6 +592,109 @@ export function extractDoneSteps(message: string): number[] {
  * near completion markers (✅, ✓, ✔, ☑, [x], "completed", "done").
  * Returns indices of items that appear completed.
  */
+function normalizeForProgressMatch(text: string): string {
+	return stripMarkdownInline(text)
+		.toLowerCase()
+		.replace(/\.\.\./g, " ")
+		.replace(/[^a-z0-9]+/g, " ")
+		.replace(/\s+/g, " ")
+		.trim();
+}
+
+const PROGRESS_STOPWORDS = new Set([
+	"the",
+	"and",
+	"for",
+	"with",
+	"from",
+	"into",
+	"only",
+	"then",
+	"that",
+	"this",
+	"must",
+	"will",
+	"repo",
+	"repos",
+	"step",
+	"steps",
+	"phase",
+	"phases",
+	"implementation",
+	"execution",
+	"implement",
+	"implemented",
+	"create",
+	"created",
+	"add",
+	"added",
+	"update",
+	"updated",
+]);
+
+function progressKeywords(text: string): string[] {
+	const normalized = normalizeForProgressMatch(text);
+	const words = normalized.split(" ").filter((word) => word.length >= 4 && !PROGRESS_STOPWORDS.has(word));
+	const stems = words.map((word) => word.replace(/(?:ing|ed|es|s)$/i, "")).filter((word) => word.length >= 4);
+	return [...new Set([...words, ...stems])];
+}
+
+const PRIMARY_ACTION_WORDS = new Set([
+	"add",
+	"apply",
+	"build",
+	"commit",
+	"create",
+	"deploy",
+	"enable",
+	"fix",
+	"harden",
+	"implement",
+	"open",
+	"push",
+	"refactor",
+	"release",
+	"roll",
+	"run",
+	"ship",
+	"test",
+	"update",
+	"validate",
+]);
+
+function primaryActionKeyword(text: string): string | undefined {
+	for (const word of normalizeForProgressMatch(text).split(" ")) {
+		if (PRIMARY_ACTION_WORDS.has(word)) return word;
+	}
+	return undefined;
+}
+
+function completedPortion(text: string): string {
+	const split = text.split(/\n\s*#{1,6}\s+(?:still\s+requires|remaining|not\s+executed|to\s+do|todo|next\s+steps?|follow-?ups?)\b/i);
+	return split[0] ?? text;
+}
+
+function fuzzyCompletedSteps(text: string, items: TodoItem[]): number[] {
+	const completed: number[] = [];
+	const normalizedText = normalizeForProgressMatch(completedPortion(text));
+	if (!/\b(?:implemented|completed|finished|created|added|hardened|deployed|validated|passed|opened|merged|pushed)\b/i.test(normalizedText)) {
+		return completed;
+	}
+
+	for (const item of items) {
+		if (item.completed) continue;
+		const action = primaryActionKeyword(item.text);
+		if (action && !normalizedText.includes(action)) continue;
+		const keywords = progressKeywords(item.text);
+		if (keywords.length === 0) continue;
+		const hits = keywords.filter((keyword) => normalizedText.includes(keyword));
+		const uniqueHitCount = new Set(hits).size;
+		const requiredHits = Math.min(3, Math.max(2, Math.ceil(keywords.length * 0.35)));
+		if (uniqueHitCount >= requiredHits) completed.push(item.step);
+	}
+	return completed;
+}
+
 export function heuristicCompletedSteps(text: string, items: TodoItem[]): number[] {
 	const completed: number[] = [];
 	const lines = text.split("\n");
@@ -703,7 +806,7 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	}
 
 	// Fallback: heuristic detection
-	const heuristicSteps = heuristicCompletedSteps(text, items);
+	const heuristicSteps = [...heuristicCompletedSteps(text, items), ...fuzzyCompletedSteps(text, items)];
 	for (const step of heuristicSteps) {
 		const item = items.find((t) => t.step === step);
 		if (item && !item.completed) {

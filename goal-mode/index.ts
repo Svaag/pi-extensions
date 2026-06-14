@@ -17,6 +17,13 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
+import {
+	buildPlanModeCoordinationPrompt,
+	extractProgressItems,
+	isGoalCompleteSignal,
+	mergeProgressItems,
+	type PlanModeState,
+} from "./utils.js";
 
 // ── Codex "Collaboration Style: Execute" system prompt (verbatim) ────────────
 
@@ -78,14 +85,6 @@ function getTextContent(message: AssistantMessage): string {
 		.join("\n");
 }
 
-/** Tag that signals the agent considers the goal complete. */
-const GOAL_COMPLETE_PATTERN = /\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|\[DONE\]|Goal complete\./i;
-
-interface PlanModeState {
-	executing: boolean;
-	todos: Array<{ step: number; text: string; completed: boolean }>;
-}
-
 function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
 	const entries = ctx.sessionManager.getEntries();
 	const planEntry = entries
@@ -96,47 +95,6 @@ function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
 	const executing = planEntry.data.executing === true;
 	if (!executing || todos.length === 0) return undefined;
 	return { executing, todos };
-}
-
-function buildPlanModeCoordinationPrompt(state: PlanModeState): string {
-	const remaining = state.todos.filter((t) => !t.completed);
-	const allSteps = state.todos
-		.map((t) => `${t.step}. ${t.completed ? "[x]" : "[ ]"} ${t.text}`)
-		.join("\n");
-	return [
-		"## Active Plan Mode Todos",
-		"The user previously created an implementation plan with the following steps. Continue executing them in order as part of this goal.",
-		"",
-		"All plan steps:",
-		allSteps,
-		"",
-		remaining.length > 0
-			? `Next unfinished step: ${remaining[0].step}. ${remaining[0].text}`
-			: "All plan steps appear complete.",
-		"",
-		"Whenever you finish a plan step, mark it with [DONE:n] where n is the step number (e.g. [DONE:2]). You may also say \"Completed step N\", \"Completed phase N\", or \"Completed steps 1-3\".",
-		"Only emit [GOAL COMPLETE] after every unfinished plan step above is marked done. Once you emit [GOAL COMPLETE], goal mode will exit automatically.",
-	].join("\n");
-}
-
-/** Extract check-list-like items from assistant text: [DONE] item, - [x] item, etc. */
-function extractProgressItems(text: string): { text: string; done: boolean }[] {
-	const items: { text: string; done: boolean }[] = [];
-	// [DONE] some task
-	for (const match of text.matchAll(/^\s*\[DONE\]\s*(.+)$/gim)) {
-		items.push({ text: match[1].trim(), done: true });
-	}
-	// - [x] some task
-	for (const match of text.matchAll(/^\s*-?\s*\[x\]\s*(.+)$/gim)) {
-		items.push({ text: match[1].trim(), done: true });
-	}
-	// - [ ] some task
-	for (const match of text.matchAll(/^\s*-?\s*\[\s*\]\s*(.+)$/gim)) {
-		if (!items.find((i) => i.text === match[1].trim())) {
-			items.push({ text: match[1].trim(), done: false });
-		}
-	}
-	return items;
 }
 
 // ── main extension ───────────────────────────────────────────────────────────
@@ -319,17 +277,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		// Extract progress items from this turn
 		const extracted = extractProgressItems(text);
 		if (extracted.length > 0) {
-			// Merge new items, preferring done status if seen before
-			for (const item of extracted) {
-				const existing = progressItems.find(
-					(p) => p.text.toLowerCase() === item.text.toLowerCase(),
-				);
-				if (existing) {
-					existing.done = existing.done || item.done;
-				} else {
-					progressItems.push(item);
-				}
-			}
+			progressItems = mergeProgressItems(progressItems, extracted);
 		}
 
 		persistState();
@@ -345,7 +293,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
 		if (lastAssistant) {
 			const text = getTextContent(lastAssistant);
-			if (GOAL_COMPLETE_PATTERN.test(text)) {
+			if (isGoalCompleteSignal(text)) {
 				exitGoalMode(ctx);
 				ctx.ui.notify("Goal complete — goal mode exited.", "info");
 				return;

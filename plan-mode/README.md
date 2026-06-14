@@ -11,12 +11,13 @@ Read-only exploration mode for safe code analysis.
 - **Agent-assisted answers**: Each custom-answer question can ask a user-selected Pi scoped model for a recommendation, with the current planning conversation and any draft/proposed plan forwarded as context
 - **Plan archival**: Accepted plans are saved to `docs/plans/` in the project repository before execution starts
 - **Progress tracking**: Widget shows completion status during execution
-- **Completion tracking**: Supports `[DONE:n]` markers, `Completed steps/phases: 1-3` status lines, numbered checked lists, whole-plan completion summaries, and manual `/todos done 1-3` updates
+- **Completion tracking**: Supports `[DONE:n]` markers, `Completed steps/phases: 1-3` status lines, numbered checked lists, whole-plan completion summaries, fuzzy summary matching, resume-time recovery, and manual `/todos done 1-3` updates
 - **Session persistence**: State survives session resume
 
 ## Commands
 
-- `/plan` - Toggle plan mode
+- `/plan` - Toggle plan mode; while executing, this refuses to replace the active tracker
+- `/plan cancel` - Stop plan execution tracking and restore normal tools
 - `/todos` - Show current plan progress
 - `/todos done 1-3` - Manually mark steps done
 - `/todos reset` - Reset all step completion flags
@@ -47,10 +48,10 @@ The agent answer can be accepted directly or edited before use.
 Keep facts, config examples, sub-bullets, test plans, and acceptance criteria in separate sections so they do not become todos.
 
 4. Choose an execution option when prompted:
-   - **Start Implementation** — Continue in the current session with the plan in context.
-   - **Start Implementation with empty context** — Start a fresh session containing only the proposed plan. Useful when the planning conversation has grown large and you want implementation to begin with clean context.
+   - **Start Implementation in current session** — Continue in the current session with the plan in context.
+   - **Start Implementation in fresh session with empty context** — Start a fresh session containing only the proposed plan. Useful when the planning conversation has grown large and you want implementation to begin with clean context.
 5. Plan Mode saves the accepted plan to `docs/plans/<timestamp>-<title>.md` in the current git repository, then starts execution
-6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, numbered checked lists like `1. ✅ ...`, whole-plan completion summaries like `Plan is complete`, or checklist items like `[DONE] item text` / `- [x] item text`
+6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, numbered checked lists like `1. ✅ ...`, whole-plan completion summaries like `Plan is complete`, fuzzy matching against implementation summaries, or checklist items like `[DONE] item text` / `- [x] item text`
 7. Progress widget shows completion status
 
 ## How It Works

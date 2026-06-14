@@ -22,6 +22,16 @@ ln -s "$PWD/pi-extensions/hyrule-loop" ~/.pi/agent/extensions/hyrule-loop
 
 Reload Pi with `/reload` after installing or updating.
 
+## Testing
+
+Run the pure utility test suite for Plan Mode and Goal Mode:
+
+```bash
+npm test
+```
+
+The tests use Node's built-in test runner with TypeScript type stripping and require no npm dependencies.
+
 ## Notes
 
 Extensions run with your local permissions. Review code before enabling extensions on a machine you care about.

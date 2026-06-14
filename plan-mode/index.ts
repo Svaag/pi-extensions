@@ -838,8 +838,16 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	function togglePlanMode(ctx: ExtensionContext): void {
+		if (executionMode) {
+			ctx.ui.notify(
+				"Plan execution is already active. /plan will not re-enter planning or replace the current todo tracker. Use /todos to view progress, /todos done 1-3 to update it, or /plan cancel to stop tracking.",
+				"warning",
+			);
+			updateStatus(ctx);
+			return;
+		}
+
 		planModeEnabled = !planModeEnabled;
-		executionMode = false;
 
 		if (planModeEnabled) {
 			// Save current tools and filter out edit/write. pi.getActiveTools() returns tool names.
@@ -893,8 +901,21 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("plan", {
-		description: "Toggle plan mode (read-only exploration & planning)",
-		handler: async (_args: any, ctx: ExtensionContext) => togglePlanMode(ctx),
+		description: "Toggle plan mode (read-only exploration & planning). Use /plan cancel to stop execution tracking.",
+		handler: async (args: any, ctx: ExtensionContext) => {
+			const command = String(args ?? "").trim();
+			if (/^(cancel|stop|clear|reset)\b/i.test(command)) {
+				planModeEnabled = false;
+				executionMode = false;
+				todoItems = [];
+				restoreSavedTools();
+				persistState();
+				updateStatus(ctx);
+				ctx.ui.notify("Plan execution tracking cancelled. Full access restored.", "info");
+				return;
+			}
+			togglePlanMode(ctx);
+		},
 	});
 
 	pi.registerCommand("todos", {
@@ -1131,7 +1152,9 @@ ${todoList}
 All steps for reference:
 ${allSteps}
 
-**IMPORTANT**: As you complete each step, you MUST mark it done by including a [DONE:n] tag in your response (e.g. [DONE:1] for step 1, [DONE:5] for step 5). Place the tag right after the section that completes the step, or end your response with a concise status line like \`Completed steps: 1-3\`. Multiple [DONE:n] tags can be included in one response if you complete multiple steps. Without these tags or a clear completion status line, the progress tracker may not update.`,
+**IMPORTANT**: As you complete each step, you MUST mark it done by including a [DONE:n] tag in your response (e.g. [DONE:1] for step 1, [DONE:5] for step 5). Place the tag right after the section that completes the step, or end your response with a concise status line like \`Completed steps: 1-3\`. Multiple [DONE:n] tags can be included in one response if you complete multiple steps.
+
+If you only partially complete the plan, include exactly which step numbers are now complete. Do not omit this even if you also provide a prose summary. Without these tags or a clear completion status line, the progress tracker may not update.`,
 					display: false,
 				},
 			};
@@ -1198,13 +1221,13 @@ ${allSteps}
 			);
 
 			const choice = await ctx.ui.select("Plan proposed - what next?", [
-				"Start Implementation",
-				"Start Implementation with empty context",
+				"Start Implementation in current session",
+				"Start Implementation in fresh session with empty context",
 				"Refine the plan (provide feedback)",
 				"Stay in plan mode",
 			]);
 
-			if (choice?.startsWith("Start Implementation with empty context")) {
+			if (choice?.startsWith("Start Implementation in fresh session")) {
 				let savedPlanPath: string;
 				try {
 					savedPlanPath = await savePlanForExecution(ctx);
@@ -1248,7 +1271,7 @@ ${allSteps}
 				return;
 			}
 
-			if (choice?.startsWith("Start Implementation") && !choice?.includes("empty context")) {
+			if (choice?.startsWith("Start Implementation in current session")) {
 				let savedPlanPath: string;
 				try {
 					savedPlanPath = await savePlanForExecution(ctx);
@@ -1272,11 +1295,14 @@ ${allSteps}
 					{ customType: "plan-mode-execute", content: execMessage, display: true },
 					{ triggerTurn: true },
 				);
+				ctx.ui.notify("Started implementation in the current session. Use /todos to view or repair progress.", "info");
 			} else if (choice?.startsWith("Refine the plan")) {
 				const refinement = await ctx.ui.editor("Provide feedback to refine the plan:", "");
 				if (refinement?.trim()) {
 					pi.sendUserMessage(refinement.trim());
 				}
+			} else {
+				ctx.ui.notify("Plan accepted UI dismissed; staying in Plan Mode with the proposed plan available for refinement.", "info");
 			}
 		}
 	});
@@ -1353,7 +1379,7 @@ ${allSteps}
 				}
 			}
 			const allText = messages.map(getTextContent).join("\n");
-			markCompletedSteps(allText, todoItems);
+			if (markCompletedSteps(allText, todoItems) > 0) persistState();
 		}
 
 		if (executionMode && todoItems.length > 0 && todoItems.every((todo: TodoItem) => todo.completed)) {
