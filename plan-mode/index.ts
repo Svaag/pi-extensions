@@ -6,10 +6,11 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { complete, type AssistantMessage, type Message, type TextContent } from "@earendil-works/pi-ai";
+import { convertToLlm, serializeConversation, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { Type } from "typebox";
 import {
@@ -23,6 +24,7 @@ import {
 const DEFAULT_NORMAL_TOOLS = ["read", "bash", "edit", "write"];
 const PLAN_QUESTIONS_TOOL = "plan_questions";
 const MUTATING_TOOLS_IN_PLAN_MODE = new Set(["edit", "write"]);
+const PLAN_AGENT_CONTEXT_CAP = 120_000;
 
 // Type guard for assistant messages
 function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
@@ -35,6 +37,97 @@ function getTextContent(message: AssistantMessage): string {
 		.filter((block: any): block is TextContent => block.type === "text")
 		.map((block: TextContent) => block.text)
 		.join("\n");
+}
+
+function entryToMessage(entry: SessionEntry): AgentMessage | undefined {
+	if (entry.type === "message") return entry.message;
+	if (entry.type === "compaction") {
+		return {
+			role: "compactionSummary",
+			summary: entry.summary,
+			tokensBefore: entry.tokensBefore,
+			timestamp: new Date(entry.timestamp).getTime(),
+		};
+	}
+	return undefined;
+}
+
+function getPlanningConversationText(ctx: ExtensionContext): string {
+	const messages = ctx.sessionManager.getBranch().map(entryToMessage).filter((message) => message !== undefined);
+	const text = serializeConversation(convertToLlm(messages));
+	if (text.length <= PLAN_AGENT_CONTEXT_CAP) return text;
+	return `[Earlier conversation truncated to fit the plan-review agent context. Showing the most recent ${PLAN_AGENT_CONTEXT_CAP} characters.]\n\n${text.slice(-PLAN_AGENT_CONTEXT_CAP)}`;
+}
+
+function sameModel(a: any, b: any): boolean {
+	return a?.provider === b?.provider && a?.id === b?.id;
+}
+
+function modelLabel(model: any): string {
+	return `${model.provider}/${model.id}`;
+}
+
+interface PlanAgentModelOption {
+	label: string;
+	description?: string;
+	model: any;
+	apiKey: string;
+	headers?: any;
+	isCurrent: boolean;
+	fromScopedConfig: boolean;
+}
+
+async function readEnabledModelPatterns(ctx: ExtensionContext): Promise<string[]> {
+	const paths = [join(homedir(), ".pi", "agent", "settings.json")];
+	if (ctx.isProjectTrusted()) paths.push(join(ctx.cwd, ".pi", "settings.json"));
+	const patterns: string[] = [];
+	for (const path of paths) {
+		try {
+			const settings = JSON.parse(await readFile(path, "utf8"));
+			if (Array.isArray(settings.enabledModels)) {
+				patterns.push(...settings.enabledModels.filter((pattern: unknown): pattern is string => typeof pattern === "string" && pattern.trim().length > 0));
+			}
+		} catch {
+			// Missing or invalid settings should not break the planning UI.
+		}
+	}
+	return [...new Set(patterns)];
+}
+
+function globToRegExp(pattern: string): RegExp {
+	const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+	return new RegExp(`^${escaped}$`, "i");
+}
+
+function modelMatchesPattern(model: any, pattern: string): boolean {
+	const re = globToRegExp(pattern.trim());
+	return re.test(model.id) || re.test(model.name ?? "") || re.test(modelLabel(model));
+}
+
+async function getPlanAgentModelOptions(ctx: ExtensionContext): Promise<PlanAgentModelOption[]> {
+	const enabledPatterns = await readEnabledModelPatterns(ctx);
+	if (enabledPatterns.length === 0) return [];
+	const available = await ctx.modelRegistry.getAvailable();
+	const scoped = available.filter((model: any) => enabledPatterns.some((pattern) => modelMatchesPattern(model, pattern)));
+
+	const options: PlanAgentModelOption[] = [];
+	for (const model of scoped) {
+		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+		if (!auth.ok || !auth.apiKey) continue;
+		const isCurrent = sameModel(ctx.model, model);
+		options.push({
+			label: `${modelLabel(model)}${isCurrent ? " (current)" : ""}`,
+			description: "From enabledModels scoped model config",
+			model,
+			apiKey: auth.apiKey,
+			headers: auth.headers,
+			isCurrent,
+			fromScopedConfig: true,
+		});
+	}
+
+	const nonCurrent = options.filter((option) => !option.isCurrent);
+	return nonCurrent.length > 0 ? nonCurrent : options;
 }
 
 interface PlanQuestionOption {
@@ -57,6 +150,7 @@ interface PlanQuestionAnswer {
 	label: string;
 	wasCustom: boolean;
 	index?: number;
+	source?: "agent" | "user";
 }
 
 interface PlanQuestionsResult {
@@ -90,6 +184,65 @@ function planQuestionsError(message: string, questions: PlanQuestion[] = []) {
 		content: [{ type: "text" as const, text: message }],
 		details: { questions, answers: [], cancelled: true } satisfies PlanQuestionsResult,
 	};
+}
+
+const PLAN_AGENT_SYSTEM_PROMPT = `You are a planning-review sub-agent using the scoped model selected by the user.
+You are helping answer one implementation-detail planning question inside Pi Plan Mode.
+You are not implementing the plan and you cannot ask the user follow-up questions.
+Use the forwarded planning conversation, any partial/current proposed plan, and the available choices to recommend the best answer.
+If the information is incomplete, choose the safest high-quality default and state the assumption.
+Return a concise answer that can be used directly as the user's planning answer: start with "Recommendation:" and include brief reasoning.`;
+
+function formatExistingAnswers(questions: PlanQuestion[], answers: Map<string, PlanQuestionAnswer>): string {
+	const lines: string[] = [];
+	for (const question of questions) {
+		const answer = answers.get(question.id);
+		if (answer) lines.push(`- ${question.label} (${question.id}): ${answer.label}`);
+	}
+	return lines.join("\n") || "(none yet)";
+}
+
+async function askPlanAgentForAnswer(
+	ctx: ExtensionContext,
+	question: PlanQuestion,
+	questions: PlanQuestion[],
+	answers: Map<string, PlanQuestionAnswer>,
+	lastProposedPlan: string,
+	selected: PlanAgentModelOption,
+	signal: AbortSignal,
+): Promise<{ text: string; model: string }> {
+	const optionsText = question.options
+		.map((option, index) => `${index + 1}. ${option.label}${option.description ? ` — ${option.description}` : ""} [value: ${option.value}]`)
+		.join("\n");
+	const conversationText = getPlanningConversationText(ctx);
+	const proposedPlanText = lastProposedPlan.trim()
+		? lastProposedPlan.trim()
+		: "(No complete <proposed_plan> has been produced yet. Use the planning conversation and current question context.)";
+
+	const userMessage: Message = {
+		role: "user",
+		content: [
+			{
+				type: "text",
+				text: `## Planning Conversation Context\n\n${conversationText}\n\n## Current Proposed Plan / Draft\n\n${proposedPlanText}\n\n## Existing Answers in This Question Flow\n\n${formatExistingAnswers(questions, answers)}\n\n## Question To Answer\n\nLabel: ${question.label}\nID: ${question.id}\nPrompt: ${question.prompt}\n\n## Available Choices\n\n${optionsText || "(No predefined choices; recommend a custom answer.)"}\n\nPlease recommend the best answer for this planning question.`,
+			},
+		],
+		timestamp: Date.now(),
+	};
+
+	const response = await complete(
+		selected.model,
+		{ systemPrompt: PLAN_AGENT_SYSTEM_PROMPT, messages: [userMessage] },
+		{ apiKey: selected.apiKey, headers: selected.headers, reasoningEffort: "high", signal },
+	);
+
+	if (response.stopReason === "aborted") throw new Error("Plan-review agent was aborted");
+	const text = response.content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map((part) => part.text)
+		.join("\n")
+		.trim();
+	return { text: text || "(Plan-review agent returned no text.)", model: modelLabel(selected.model) };
 }
 
 function planTitle(plan: string): string {
@@ -202,6 +355,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				options: Array.isArray(q.options) ? q.options : [],
 				allowOther: q.allowOther !== false,
 			}));
+			const planAgentModelOptions = await getPlanAgentModelOptions(ctx);
 			const isMulti = questions.length > 1;
 			const totalTabs = questions.length + 1;
 
@@ -210,6 +364,16 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				let optionIndex = 0;
 				let inputMode = false;
 				let inputQuestionId: string | null = null;
+				let modelSelectMode = false;
+				let modelSelectQuestionId: string | null = null;
+				let modelSelectIndex = 0;
+				let agentReviewMode = false;
+				let agentReviewRunning = false;
+				let agentReviewQuestionId: string | null = null;
+				let agentReviewText = "";
+				let agentReviewModel = "";
+				let agentReviewError = "";
+				let agentReviewAbort: AbortController | null = null;
 				let cachedLines: string[] | undefined;
 				const answers = new Map<string, PlanQuestionAnswer>();
 
@@ -238,11 +402,19 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					return questions[currentTab];
 				}
 
-				function currentOptions(): Array<PlanQuestionOption & { isOther?: boolean }> {
+				function currentOptions(): Array<PlanQuestionOption & { isOther?: boolean; isAgent?: boolean }> {
 					const q = currentQuestion();
 					if (!q) return [];
-					const opts: Array<PlanQuestionOption & { isOther?: boolean }> = [...q.options];
-					if (q.allowOther) opts.push({ value: "__other__", label: "Type a custom answer", isOther: true });
+					const opts: Array<PlanQuestionOption & { isOther?: boolean; isAgent?: boolean }> = [...q.options];
+					if (q.allowOther) {
+						opts.push({
+							value: "__agent__",
+							label: "Ask an agent for a recommendation",
+							description: "Lets you choose one of Pi's scoped models and forwards the current planning context.",
+							isAgent: true,
+						});
+						opts.push({ value: "__other__", label: "Type a custom answer", isOther: true });
+					}
 					return opts;
 				}
 
@@ -260,21 +432,112 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					refresh();
 				}
 
-				function saveAnswer(questionId: string, value: string, label: string, wasCustom: boolean, index?: number): void {
-					answers.set(questionId, { id: questionId, value, label, wasCustom, index });
+				function saveAnswer(questionId: string, value: string, label: string, wasCustom: boolean, index?: number, source?: "agent" | "user"): void {
+					answers.set(questionId, { id: questionId, value, label, wasCustom, index, source });
 				}
 
 				editor.onSubmit = (value: string) => {
 					if (!inputQuestionId) return;
 					const trimmed = value.trim() || "(no response)";
-					saveAnswer(inputQuestionId, trimmed, trimmed, true);
+					saveAnswer(inputQuestionId, trimmed, trimmed, true, undefined, "user");
 					inputMode = false;
 					inputQuestionId = null;
 					editor.setText("");
 					advanceAfterAnswer();
 				};
 
+				function startAgentReview(question: PlanQuestion, modelOption: PlanAgentModelOption): void {
+					if (agentReviewRunning) return;
+					agentReviewMode = true;
+					agentReviewRunning = true;
+					agentReviewQuestionId = question.id;
+					agentReviewText = "";
+					agentReviewModel = "";
+					agentReviewError = "";
+					agentReviewAbort = new AbortController();
+					refresh();
+
+					askPlanAgentForAnswer(ctx, question, questions, answers, lastProposedPlan, modelOption, agentReviewAbort.signal)
+						.then((result) => {
+							agentReviewRunning = false;
+							agentReviewText = result.text;
+							agentReviewModel = result.model;
+							refresh();
+						})
+						.catch((error) => {
+							agentReviewRunning = false;
+							agentReviewError = error instanceof Error ? error.message : String(error);
+							refresh();
+						});
+				}
+
 				function handleInput(data: string): void {
+					if (modelSelectMode) {
+						if (matchesKey(data, Key.up)) {
+							modelSelectIndex = Math.max(0, modelSelectIndex - 1);
+							refresh();
+							return;
+						}
+						if (matchesKey(data, Key.down)) {
+							modelSelectIndex = Math.min(planAgentModelOptions.length - 1, modelSelectIndex + 1);
+							refresh();
+							return;
+						}
+						if (matchesKey(data, Key.enter) && modelSelectQuestionId && planAgentModelOptions.length > 0) {
+							const question = questions.find((candidate) => candidate.id === modelSelectQuestionId);
+							const modelOption = planAgentModelOptions[modelSelectIndex];
+							modelSelectMode = false;
+							modelSelectQuestionId = null;
+							if (question && modelOption) startAgentReview(question, modelOption);
+							return;
+						}
+						if (matchesKey(data, Key.escape)) {
+							modelSelectMode = false;
+							modelSelectQuestionId = null;
+							refresh();
+						}
+						return;
+					}
+
+					if (agentReviewMode) {
+						if (agentReviewRunning) {
+							if (matchesKey(data, Key.escape)) {
+								agentReviewAbort?.abort();
+								agentReviewRunning = false;
+								agentReviewMode = false;
+								agentReviewQuestionId = null;
+								refresh();
+							}
+							return;
+						}
+
+						if (matchesKey(data, Key.enter) && agentReviewText.trim() && agentReviewQuestionId) {
+							const answer = agentReviewText.trim();
+							saveAnswer(agentReviewQuestionId, answer, answer, true, undefined, "agent");
+							agentReviewMode = false;
+							agentReviewQuestionId = null;
+							advanceAfterAnswer();
+							return;
+						}
+
+						if ((data === "e" || data === "E") && agentReviewText.trim() && agentReviewQuestionId) {
+							inputMode = true;
+							inputQuestionId = agentReviewQuestionId;
+							editor.setText(agentReviewText.trim());
+							agentReviewMode = false;
+							agentReviewQuestionId = null;
+							refresh();
+							return;
+						}
+
+						if (matchesKey(data, Key.escape)) {
+							agentReviewMode = false;
+							agentReviewQuestionId = null;
+							refresh();
+						}
+						return;
+					}
+
 					if (inputMode) {
 						if (matchesKey(data, Key.escape)) {
 							inputMode = false;
@@ -326,6 +589,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					if (matchesKey(data, Key.enter) && q) {
 						const opt = opts[optionIndex];
 						if (!opt) return;
+						if (opt.isAgent) {
+							modelSelectMode = true;
+							modelSelectQuestionId = q.id;
+							modelSelectIndex = 0;
+							refresh();
+							return;
+						}
 						if (opt.isOther) {
 							const existing = answers.get(q.id);
 							inputMode = true;
@@ -382,7 +652,50 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 						}
 					}
 
-					if (inputMode && q) {
+					function addMultiline(text: string, color: "text" | "muted" | "warning" | "error" | "success" = "text"): void {
+						for (const line of text.split("\n")) add(theme.fg(color, ` ${line}`));
+					}
+
+					if (modelSelectMode && q) {
+						add(theme.fg("text", ` ${q.prompt}`));
+						lines.push("");
+						add(theme.fg("accent", " Choose a scoped model for the plan-review agent:"));
+						lines.push("");
+						if (planAgentModelOptions.length === 0) {
+							add(theme.fg("warning", " No authenticated scoped models found."));
+							add(theme.fg("muted", " Configure enabledModels in ~/.pi/agent/settings.json or .pi/settings.json."));
+						} else {
+							for (let i = 0; i < planAgentModelOptions.length; i++) {
+								const option = planAgentModelOptions[i];
+								const selected = i === modelSelectIndex;
+								const prefix = selected ? theme.fg("accent", "> ") : "  ";
+								add(prefix + theme.fg(selected ? "accent" : "text", `${i + 1}. ${option.label}`));
+								if (option.description) add(`     ${theme.fg("muted", option.description)}`);
+							}
+						}
+						lines.push("");
+						add(theme.fg("dim", planAgentModelOptions.length > 0 ? " ↑↓ select • Enter ask agent • Esc back" : " Esc back"));
+					} else if (agentReviewMode && q) {
+						add(theme.fg("text", ` ${q.prompt}`));
+						lines.push("");
+						if (agentReviewRunning) {
+							add(theme.fg("accent", " Asking the selected plan-review model..."));
+							lines.push("");
+							add(theme.fg("dim", " Forwarding the current planning conversation and any draft/proposed plan."));
+							add(theme.fg("dim", " Esc cancels"));
+						} else if (agentReviewError) {
+							add(theme.fg("error", " Agent review failed:"));
+							addMultiline(agentReviewError, "error");
+							lines.push("");
+							add(theme.fg("dim", " Esc back"));
+						} else {
+							add(theme.fg("accent", ` Agent recommendation${agentReviewModel ? ` (${agentReviewModel})` : ""}:`));
+							lines.push("");
+							addMultiline(agentReviewText || "(empty response)");
+							lines.push("");
+							add(theme.fg("dim", " Enter use as answer • E edit before using • Esc back"));
+						}
+					} else if (inputMode && q) {
 						add(theme.fg("text", ` ${q.prompt}`));
 						lines.push("");
 						renderOptions();
@@ -407,7 +720,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					}
 
 					lines.push("");
-					if (!inputMode) {
+					if (!inputMode && !agentReviewMode && !modelSelectMode) {
 						add(theme.fg("dim", isMulti ? " Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel" : " ↑↓ select • Enter confirm • Esc cancel"));
 					}
 					add(theme.fg("accent", "─".repeat(width)));
@@ -428,6 +741,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			const answerLines = result.answers.map((answer) => {
 				const question = questions.find((q) => q.id === answer.id);
 				const prefix = question ? `${question.label} (${question.id})` : answer.id;
+				if (answer.source === "agent") return `${prefix}: agent recommended: ${answer.label}`;
 				return answer.wasCustom ? `${prefix}: user wrote: ${answer.label}` : `${prefix}: user selected: ${answer.index}. ${answer.label}`;
 			});
 
@@ -449,7 +763,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			if (details.cancelled) return new Text(theme.fg("warning", "Planning questions cancelled"), 0, 0);
 			return new Text(
 				details.answers
-					.map((a) => `${theme.fg("success", "✓ ")}${theme.fg("accent", a.id)}: ${a.wasCustom ? theme.fg("muted", "(wrote) ") : ""}${a.label}`)
+					.map((a) => {
+						const source = a.source === "agent" ? "(agent) " : a.wasCustom ? "(wrote) " : "";
+						return `${theme.fg("success", "✓ ")}${theme.fg("accent", a.id)}: ${source ? theme.fg("muted", source) : ""}${a.label}`;
+					})
 					.join("\n"),
 				0,
 				0,
@@ -550,6 +867,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			lastProposedPlan: lastProposedPlan,
 			savedTools: savedTools,
 		});
+	}
+
+	function sameTodoTexts(a: TodoItem[], b: TodoItem[]): boolean {
+		return a.length === b.length && a.every((item, index) => item.text.toLowerCase() === b[index]?.text.toLowerCase());
 	}
 
 	function parseStepSpec(spec: string): number[] {
@@ -706,6 +1027,7 @@ You may explore and execute **non-mutating** actions that improve the plan. You 
 Actions that gather truth, reduce ambiguity, or validate feasibility without changing repo-tracked state. Examples:
 * Reading or searching files, configs, schemas, types, manifests, and docs
 * Static analysis, inspection, and repo exploration
+* Read-only Git and GitHub CLI queries such as `git status`, `git log`, `git diff`, `gh pr view`, and `gh issue list`
 * Dry-run style commands when they do not edit repo-tracked files
 * Tests, builds, or checks that do not edit repo-tracked files
 
@@ -996,7 +1318,7 @@ ${allSteps}
 			// completion flags by matching step text where possible.
 			if (lastProposedPlan) {
 				const reparsedTodos = extractTodoItemsFromProposedPlan(lastProposedPlan);
-				if (reparsedTodos.length > 0 && (todoItems.length === 0 || todoItems.length > reparsedTodos.length * 2)) {
+				if (reparsedTodos.length > 0 && !sameTodoTexts(todoItems, reparsedTodos)) {
 					for (const item of reparsedTodos) {
 						const previous = todoItems.find((todo: TodoItem) => todo.text.toLowerCase() === item.text.toLowerCase());
 						item.completed = previous?.completed ?? false;
@@ -1032,6 +1354,12 @@ ${allSteps}
 			}
 			const allText = messages.map(getTextContent).join("\n");
 			markCompletedSteps(allText, todoItems);
+		}
+
+		if (executionMode && todoItems.length > 0 && todoItems.every((todo: TodoItem) => todo.completed)) {
+			executionMode = false;
+			todoItems = [];
+			persistState();
 		}
 
 		if (planModeEnabled) {

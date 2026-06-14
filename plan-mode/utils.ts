@@ -27,7 +27,18 @@ const DESTRUCTIVE_PATTERNS = [
 	/\bpip\s+(install|uninstall)/i,
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
 	/\bbrew\s+(install|uninstall|upgrade)/i,
-	/\bgit\s+(add|commit|push|pull|merge|rebase|reset|checkout|branch\s+-[dD]|stash|cherry-pick|revert|tag|init|clone)/i,
+	/\bgit\s+(add|am|apply|bisect|checkout|cherry-pick|clean|clone|commit|fetch|gc|init|merge|mv|notes|pull|push|rebase|reset|restore|revert|rm|stash|switch)/i,
+	/\bgit\s+branch\s+(?!(?:-[^-\s]*[alrvv]|--all|--remotes|--verbose|--list|--show-current|--contains|--merged|--no-merged)(?:\s|$))\S/i,
+	/\bgit\s+config\s+(?!--(?:get|get-all|list|name-only)\b)/i,
+	/\bgit\s+diff\b[^\n;|&]*\s--output(?:=|\s+)/i,
+	/\bgit\s+reflog\s+(delete|expire)/i,
+	/\bgit\s+remote\s+(add|remove|rename|set-|prune\b(?!\s+--dry-run))/i,
+	/\bgit\s+submodule\s+(add|update|init|deinit|sync)/i,
+	/\bgit\s+tag\s+(?!(?:-[ln]|--list|--contains|--points-at)(?:\s|$))\S/i,
+	/\bgit\s+worktree\s+(add|move|remove|prune|repair)/i,
+	/\bgh\s+(pr\s+(create|checkout|close|comment|edit|lock|merge|ready|reopen|review|update-branch)|issue\s+(create|close|comment|delete|develop|edit|lock|reopen|transfer)|repo\s+(archive|clone|create|delete|edit|fork|rename|sync)|release\s+(create|delete|delete-asset|edit|upload)|run\s+(cancel|delete|rerun)|workflow\s+(disable|enable|run)|secret\s+(set|delete)|variable\s+(set|delete)|label\s+(create|delete|edit)|milestone\s+(create|close|delete|edit)|gist\s+(clone|create|delete|edit)|auth\s+(login|logout|refresh|setup-git))/i,
+	/\bgh\s+api\b.*(?:^|\s)(?:-X|--method)(?:=|\s+)(?!GET(?:\s|$))\S+/i,
+	/\bgh\s+api\b.*(?:^|\s)(?:-F|--field|-f|--raw-field|--input)(?:=|\s+)\S+/i,
 	/\bsudo\b/i,
 	/\bsu\b/i,
 	/\bkill\b/i,
@@ -77,8 +88,6 @@ const SAFE_PATTERNS = [
 	/^\s*top\b/,
 	/^\s*htop\b/,
 	/^\s*free\b/,
-	/^\s*git\s+(status|log|diff|show|branch|remote|config\s+--get)/i,
-	/^\s*git\s+ls-/i,
 	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)/i,
 	/^\s*yarn\s+(list|info|why|audit)/i,
 	/^\s*node\s+--version/i,
@@ -97,9 +106,83 @@ const SAFE_PATTERNS = [
 	/^\s*nslookup\b/,
 ];
 
+function stripKnownGlobalOptions(rest: string, flagPatterns: RegExp[]): string {
+	let remaining = rest.trim();
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const pattern of flagPatterns) {
+			const match = remaining.match(pattern);
+			if (match) {
+				remaining = remaining.slice(match[0].length).trimStart();
+				changed = true;
+				break;
+			}
+		}
+	}
+	return remaining;
+}
+
+const GIT_GLOBAL_FLAG_PATTERNS = [
+	/^(?:--no-pager|--paginate|--no-optional-locks|--literal-pathspecs)\s+/i,
+	/^(?:-C|-c|--git-dir|--work-tree|--namespace)(?:=\S+|\s+\S+)\s*/i,
+];
+
+const READ_ONLY_GIT_PATTERNS = [
+	/^(?:status|log|diff|show|shortlog|whatchanged|blame|grep|describe|rev-parse|rev-list|merge-base|cat-file|ls-files|ls-tree|ls-remote|for-each-ref)(?:\s|$)/i,
+	/^branch(?:\s*$|\s+(?:-[^-\s]*[alrvv]|--all|--remotes|--verbose|--list|--show-current|--contains|--merged|--no-merged)(?:\s|$))/i,
+	/^config\s+(?:--get|--get-all|--list|--name-only)(?:\s|$)/i,
+	/^remote(?:\s*$|\s+-v(?:\s|$)|\s+(?:show|get-url)(?:\s|$)|\s+prune\s+--dry-run(?:\s|$))/i,
+	/^reflog(?:\s*$|\s+show(?:\s|$))/i,
+	/^submodule\s+status(?:\s|$)/i,
+	/^tag(?:\s*$|\s+(?:-[ln]|--list|--contains|--points-at)(?:\s|$))/i,
+	/^worktree\s+list(?:\s|$)/i,
+];
+
+function isReadOnlyGitCommand(command: string): boolean {
+	const match = command.trimStart().match(/^git(?:\s+|$)(.*)$/i);
+	if (!match) return false;
+	const rest = stripKnownGlobalOptions(match[1] ?? "", GIT_GLOBAL_FLAG_PATTERNS);
+	return READ_ONLY_GIT_PATTERNS.some((pattern) => pattern.test(rest));
+}
+
+const GH_GLOBAL_FLAG_PATTERNS = [
+	/^(?:--repo|--hostname|-R)(?:=\S+|\s+\S+)\s*/i,
+	/^(?:--help|--version)\s*/i,
+];
+
+const READ_ONLY_GH_PATTERNS = [
+	/^pr\s+(?:list|view|diff|status|checks)(?:\s|$)/i,
+	/^issue\s+(?:list|view|status)(?:\s|$)/i,
+	/^repo\s+(?:list|view)(?:\s|$)/i,
+	/^release\s+(?:list|view)(?:\s|$)/i,
+	/^run\s+(?:list|view|watch)(?:\s|$)/i,
+	/^workflow\s+(?:list|view)(?:\s|$)/i,
+	/^label\s+list(?:\s|$)/i,
+	/^milestone\s+list(?:\s|$)/i,
+	/^search\s+(?:repos|issues|prs|commits|code)(?:\s|$)/i,
+	/^gist\s+(?:list|view)(?:\s|$)/i,
+	/^auth\s+status(?:\s|$)/i,
+	/^status(?:\s|$)/i,
+];
+
+function isReadOnlyGhApiCommand(rest: string): boolean {
+	if (!/^api(?:\s|$)/i.test(rest)) return false;
+	if (/(?:^|\s)(?:-X|--method)(?:=|\s+)(?!GET(?:\s|$))\S+/i.test(rest)) return false;
+	if (/(?:^|\s)(?:-F|--field|-f|--raw-field|--input)(?:=|\s+)\S+/i.test(rest)) return false;
+	return true;
+}
+
+function isReadOnlyGhCommand(command: string): boolean {
+	const match = command.trimStart().match(/^gh(?:\s+|$)(.*)$/i);
+	if (!match) return false;
+	const rest = stripKnownGlobalOptions(match[1] ?? "", GH_GLOBAL_FLAG_PATTERNS);
+	return READ_ONLY_GH_PATTERNS.some((pattern) => pattern.test(rest)) || isReadOnlyGhApiCommand(rest);
+}
+
 export function isSafeCommand(command: string): boolean {
 	const isDestructive = DESTRUCTIVE_PATTERNS.some((p) => p.test(command));
-	const isSafe = SAFE_PATTERNS.some((p) => p.test(command));
+	const isSafe = SAFE_PATTERNS.some((p) => p.test(command)) || isReadOnlyGitCommand(command) || isReadOnlyGhCommand(command);
 	return !isDestructive && isSafe;
 }
 
@@ -210,10 +293,24 @@ function scoreActionSection(title: string): number {
 	if (!normalized) return 0;
 	if (ACTION_SECTION_EXCLUDES.some((pattern) => pattern.test(normalized))) return 0;
 
-	if (/\bimplementation\b|\bimplement\b|\bexecution\b|\bexecute\b/.test(normalized)) return 100;
-	if (/\baction\b|\bwork\s+plan\b/.test(normalized)) return 95;
+	const hasImplementation = /\bimplementation\b|\bimplement\b/.test(normalized);
+	const hasExecution = /\bexecution\b|\bexecute\b/.test(normalized);
+	const hasAction = /\baction\b/.test(normalized);
+	const hasStepWord = /\bsteps?\b|\btasks?\b|\btodos?\b|\btodo\b|\bplan\b|\broadmap\b/.test(normalized);
+
+	// Sections like "Execution Prompt" describe role behavior. They are not
+	// tracker-level execution steps and frequently contain checklist bullets.
+	if (/\bprompts?\b/.test(normalized) && !/\bsteps?\b|\btasks?\b|\btodos?\b|\btodo\b|\bplan\b/.test(normalized)) {
+		return 0;
+	}
+
+	if (/^(?:implementation|execution|action)\s+(?:steps?|tasks?|todos?|todo|plan)$/.test(normalized)) return 120;
+	if (/^work\s+plan$/.test(normalized)) return 120;
+	if ((hasImplementation || hasExecution || hasAction) && hasStepWord) return 115;
+	if (/^(?:implementation|execution|action)$/.test(normalized)) return 105;
 	if (/\bsteps?\b|\btasks?\b|\btodos?\b|\btodo\b/.test(normalized)) return 90;
 	if (/^(proposed\s+)?plan$/.test(normalized)) return 80;
+	if (hasImplementation) return 70;
 	if (/\bkey\s+changes\b|\bchanges\b|\bapproach\b|\broadmap\b/.test(normalized)) return 50;
 	return 0;
 }
@@ -344,7 +441,11 @@ function extractFromPreferredMarkdownSections(lines: string[]): string[] {
 
 	const maxScore = Math.max(...actionable.map((header) => header.score));
 	const selected = actionable.filter((header) => {
-		// If there is a strong implementation/execution section, ignore weaker generic sections like "Key Changes".
+		// If there is a strong explicit implementation/execution/action-plan section,
+		// use only equally strong sections. This prevents lower-confidence sections
+		// such as role "Execution Prompt" or generic "Tasks" from being merged into
+		// the tracker when a dedicated implementation section already exists.
+		if (maxScore >= 100) return header.score === maxScore;
 		if (maxScore >= 90) return header.score >= 90;
 		return header.score === maxScore;
 	});
@@ -564,8 +665,32 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 	return completed;
 }
 
+function indicatesWholePlanCompleted(text: string): boolean {
+	const normalized = stripMarkdownInline(text).replace(/\s+/g, " ").trim();
+	if (!normalized) return false;
+
+	if (/\b(?:not|n't|cannot|can't|unable|failed)\b.{0,50}\b(?:complete|completed|finish|finished|implement|implemented|deliver|delivered)\b/i.test(normalized)) {
+		return false;
+	}
+
+	return (
+		/\b(?:all|every)\s+(?:plan\s+)?(?:steps?|tasks?|items?|phases?)\b.{0,90}\b(?:complete|completed|done|finished|implemented|verified)\b/i.test(normalized) ||
+		/\b(?:implemented|completed|finished|delivered)\b.{0,90}\b(?:plan|implementation|work|task)\b.{0,90}\b(?:end-to-end|fully|successfully|complete)\b/i.test(normalized) ||
+		/\b(?:plan|implementation|task|work)\s+(?:is\s+|now\s+)?(?:complete|completed|done|finished|delivered)\b/i.test(normalized)
+	);
+}
+
 export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	let marked = 0;
+
+	if (items.length > 0 && indicatesWholePlanCompleted(text)) {
+		for (const item of items) {
+			if (!item.completed) {
+				item.completed = true;
+				marked++;
+			}
+		}
+	}
 
 	// Primary: explicit [DONE:n] tags and natural-language step summaries
 	const doneSteps = extractDoneSteps(text);
