@@ -9,9 +9,12 @@ Read-only exploration mode for safe code analysis.
 - **Plan extraction**: Prefers `Implementation Steps`, `Execution Steps`, or `Action Plan` sections and extracts only numbered subheadings/top-level list items
 - **Interactive questions**: `plan_questions` tool gives a tabbed TUI wizard for implementation-detail questions instead of long A/B/C chat questionnaires
 - **Agent-assisted answers**: Each custom-answer question can ask a user-selected Pi scoped model for a recommendation, with the current planning conversation and any draft/proposed plan forwarded as context
-- **Plan archival**: Accepted plans are saved to `docs/plans/` in the project repository before execution starts
+- **Plan archival**: Accepted plans are saved to `docs/plans/` in the selected project repository before execution starts; when planning from a multi-repo workspace, Plan Mode can detect a more likely nested target repo and asks where to save
+- **Persisted progress**: Saved plan files get a `## Progress` section that is updated as steps are marked done/skipped/deferred/blocked
 - **Progress tracking**: Widget shows completion status during execution
 - **Completion tracking**: Supports `[DONE:n]` markers, `Completed steps/phases: 1-3` status lines, numbered checked lists, whole-plan completion summaries, fuzzy summary matching, resume-time recovery, and manual `/todos done 1-3` updates
+- **Non-done states**: Manual/operator work can be marked skipped, deferred, or blocked without pretending it completed
+- **Handoff guard**: If the agent says a PR/work item is ready while plan items are still open, Plan Mode warns before handoff
 - **Session persistence**: State survives session resume
 
 ## Commands
@@ -20,7 +23,11 @@ Read-only exploration mode for safe code analysis.
 - `/plan cancel` - Stop plan execution tracking and restore normal tools
 - `/todos` - Show current plan progress
 - `/todos done 1-3` - Manually mark steps done
-- `/todos reset` - Reset all step completion flags
+- `/todos skip 4` - Mark a user-skipped/manual step as skipped
+- `/todos defer 4` - Mark a step deferred for later without blocking the current plan
+- `/todos block 4` - Mark a step blocked and keep it visible
+- `/todos open 4` - Reopen a skipped/deferred/blocked/done step as pending
+- `/todos reset` - Reset all step statuses to pending
 - `Ctrl+Alt+P` - Toggle plan mode (shortcut)
 
 ## Agent-Assisted Planning Questions
@@ -50,9 +57,11 @@ Keep facts, config examples, sub-bullets, test plans, and acceptance criteria in
 4. Choose an execution option when prompted:
    - **Start Implementation in current session** — Continue in the current session with the plan in context.
    - **Start Implementation in fresh session with empty context** — Start a fresh session containing only the proposed plan. Useful when the planning conversation has grown large and you want implementation to begin with clean context.
-5. Plan Mode saves the accepted plan to `docs/plans/<timestamp>-<title>.md` in the current git repository, then starts execution
-6. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, numbered checked lists like `1. ✅ ...`, whole-plan completion summaries like `Plan is complete`, fuzzy matching against implementation summaries, or checklist items like `[DONE] item text` / `- [x] item text`
-7. Progress widget shows completion status
+5. Plan Mode saves the accepted plan to `docs/plans/<timestamp>-<title>.md`. If the current directory is a multi-repo workspace and the plan clearly targets a nested repo, Plan Mode asks whether to save under the detected repo or the current git root.
+6. The saved plan file includes a `## Progress` section and Plan Mode updates it as execution proceeds.
+7. During execution, the agent marks steps complete with `[DONE:n]` tags, `Completed steps/phases: 1-3`, numbered checked lists like `1. ✅ ...`, whole-plan completion summaries like `Plan is complete`, fuzzy matching against implementation summaries, or checklist items like `[DONE] item text` / `- [x] item text`.
+8. If the user skips/defer/manual-blocks a step, use `/todos skip`, `/todos defer`, or `/todos block` rather than marking the step done.
+9. Progress widget shows completion status.
 
 ## How It Works
 
@@ -65,6 +74,8 @@ Keep facts, config examples, sub-bullets, test plans, and acceptance criteria in
 - Full tool access restored
 - Agent executes steps in order
 - `[DONE:n]` markers track completion
+- `/todos skip|defer|block|open` handles non-done states explicitly
+- Saved plan files are updated with progress
 - Widget shows progress
 
 ### Command Allowlist

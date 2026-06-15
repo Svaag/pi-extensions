@@ -4,8 +4,12 @@ import {
 	extractDoneSteps,
 	extractProposedPlan,
 	extractTodoItemsFromProposedPlan,
+	hasHandoffClaim,
 	isSafeCommand,
+	isTodoClosed,
 	markCompletedSteps,
+	setTodoStatus,
+	upsertPlanProgressSection,
 	type TodoItem,
 } from "../plan-mode/utils.ts";
 
@@ -131,4 +135,43 @@ Hardened daemon rollout: default daemon repo scope is now the seven core repos, 
 
 test("extractDoneSteps parses multiple tag and phrase formats", () => {
 	assert.deepEqual(extractDoneSteps("[DONE:1, 3-4]\nsteps 6 and 7 done"), [1, 3, 4, 6, 7]);
+});
+
+test("todo statuses distinguish skipped and deferred from done", () => {
+	const items = todos(["Do code", "Manual resize", "Measure"]);
+	setTodoStatus(items[0], "done");
+	setTodoStatus(items[1], "skipped");
+	setTodoStatus(items[2], "deferred");
+
+	assert.deepEqual(items.map((item) => item.completed), [true, false, false]);
+	assert.deepEqual(items.map((item) => isTodoClosed(item)), [true, true, true]);
+});
+
+test("whole-plan completion does not overwrite skipped or deferred items", () => {
+	const items = todos(["Do code", "Manual resize", "Measure"]);
+	setTodoStatus(items[1], "skipped");
+	setTodoStatus(items[2], "deferred");
+
+	assert.equal(markCompletedSteps("Plan is complete and verified.", items), 1);
+	assert.deepEqual(items.map((item) => item.status ?? (item.completed ? "done" : "pending")), ["done", "skipped", "deferred"]);
+});
+
+test("upsertPlanProgressSection adds and replaces persisted progress", () => {
+	const items = todos(["First", "Second"]);
+	setTodoStatus(items[0], "done");
+	const initial = upsertPlanProgressSection("# Plan\n\nBody\n", items);
+	assert.match(initial, /<!-- pi-plan-progress:start -->/);
+	assert.match(initial, /- \[x\] 1\. First _\(done\)_/);
+	assert.match(initial, /- \[ \] 2\. Second _\(pending\)_/);
+
+	setTodoStatus(items[1], "deferred");
+	const updated = upsertPlanProgressSection(initial, items);
+	assert.equal((updated.match(/<!-- pi-plan-progress:start -->/g) ?? []).length, 1);
+	assert.match(updated, /- \[>\] 2\. Second _\(deferred\)_/);
+});
+
+test("handoff claims are detected for review-ready language", () => {
+	assert.equal(hasHandoffClaim("PR is clean and ready for human review."), true);
+	assert.equal(hasHandoffClaim("CI is clean; leaving this for review."), true);
+	assert.equal(hasHandoffClaim("Implemented the parser and will continue with tests."), false);
 });
