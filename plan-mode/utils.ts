@@ -617,7 +617,16 @@ export function extractTodoItemsFromProposedPlan(planContent: string): TodoItem[
 
 	const preferred = extractFromPreferredMarkdownSections(lines);
 	const plainPlan = preferred.length > 0 ? [] : extractFromPlainPlanBlock(lines);
-	let extracted = preferred.length > 0 ? preferred : plainPlan.length > 0 ? plainPlan : extractFallbackTopLevelItems(lines);
+	let extracted = preferred.length > 0 ? preferred : plainPlan.length > 0 ? plainPlan : [];
+
+	// Do not fall back to harvesting every top-level list item from a structured
+	// markdown document. If the model omitted an actionable Implementation/Execution/
+	// Action Plan section, broad fallback turns requirements, tests, evidence checks,
+	// and rollout notes into bogus todos. Only use whole-message fallback for simple
+	// unheaded list responses.
+	if (extracted.length === 0 && findMarkdownHeaders(lines).length === 0) {
+		extracted = extractFallbackTopLevelItems(lines);
+	}
 
 	// Last-resort safety valve: if a model emits a verbose plan shape we did not
 	// anticipate and the list explodes, prefer numbered markdown headings over

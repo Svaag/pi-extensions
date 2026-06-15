@@ -87,6 +87,39 @@ test("extractTodoItemsFromProposedPlan prefers tracker-level implementation step
 	);
 });
 
+test("extractTodoItemsFromProposedPlan does not harvest structured non-plan checklists", () => {
+	const plan = `## 1. Core design decision
+
+- raw signal: proxy_uninitialized=true
+- effect: remove only the incorrect boost
+
+## 5. Deterministic checks for the first pattern
+
+### Required positive checks
+
+1. Bytecode exists and is live.
+2. Opcode scan confirms real DELEGATECALL.
+3. Proxy heuristic matches.
+
+### Required negative checks
+
+1. Do not classify if EIP-1967 impl or beacon slot is nonzero.
+2. Do not suppress upgrade/access-control risks.
+
+## 10. Tests/regressions
+
+1. BNB custom proxy fixture matches approved pattern.
+2. True EIP-1967 uninitialized proxy is not suppressed.
+
+## 11. Rollout
+
+1. Implement schema and store helpers.
+2. Add tests.
+`;
+
+	assert.deepEqual(extractTodoItemsFromProposedPlan(plan), []);
+});
+
 test("markCompletedSteps supports explicit tags and natural-language ranges", () => {
 	const items = todos(["First", "Second", "Third", "Fourth"]);
 	assert.equal(markCompletedSteps("[DONE:1]\nCompleted steps: 2-3", items), 3);

@@ -1210,7 +1210,7 @@ You may explore and execute **non-mutating** actions that improve the plan. You 
 Actions that gather truth, reduce ambiguity, or validate feasibility without changing repo-tracked state. Examples:
 * Reading or searching files, configs, schemas, types, manifests, and docs
 * Static analysis, inspection, and repo exploration
-* Read-only Git and GitHub CLI queries such as `git status`, `git log`, `git diff`, `gh pr view`, and `gh issue list`
+* Read-only Git and GitHub CLI queries such as \`git status\`, \`git log\`, \`git diff\`, \`gh pr view\`, and \`gh issue list\`
 * Dry-run style commands when they do not edit repo-tracked files
 * Tests, builds, or checks that do not edit repo-tracked files
 
@@ -1392,6 +1392,21 @@ If you only partially complete the plan, include exactly which step numbers are 
 		}
 
 		// Prompt user if a proposed plan was found in this turn
+		if (hasNewPlan && todoItems.length === 0) {
+			pi.sendMessage(
+				{
+					customType: "plan-format-warning",
+					content:
+						"⚠️ **Plan format warning:** found a `<proposed_plan>` block, but could not find a dedicated `## Implementation Steps`, `## Execution Steps`, or `## Action Plan` section with tracker-level items. Ask for a revised plan with only executable work items in that section; requirements, checks, tests, and rollout details should stay in separate sections.",
+					display: true,
+				},
+				{ triggerTurn: false },
+			);
+			ctx.ui.notify("Proposed plan needs a dedicated implementation/action steps section before execution can start.", "warning");
+			updateStatus(ctx);
+			return;
+		}
+
 		if (hasNewPlan && todoItems.length > 0) {
 			const todoListText = todoItems.map((t: TodoItem, i: number) => `${i + 1}. ☐ ${t.text}`).join("\n");
 			pi.sendMessage(
@@ -1516,6 +1531,17 @@ If you only partially complete the plan, include exactly which step numbers are 
 					}
 					todoItems = reparsedTodos;
 					persistState();
+				} else if (reparsedTodos.length === 0 && todoItems.length > 0) {
+					// Current extraction rules reject structured plans that lack a dedicated
+					// implementation/action steps section. Clear stale trackers created by
+					// older broad fallback extraction rather than continuing bogus execution.
+					todoItems = [];
+					executionMode = false;
+					persistState();
+					ctx.ui.notify(
+						"Cleared stale plan todos: the saved proposed plan has no dedicated implementation/action steps section.",
+						"warning",
+					);
 				}
 			}
 		}
