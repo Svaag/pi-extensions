@@ -186,10 +186,97 @@ export function isSafeCommand(command: string): boolean {
 	return !isDestructive && isSafe;
 }
 
+export type TodoStatus = "pending" | "done" | "skipped" | "deferred" | "blocked";
+
 export interface TodoItem {
 	step: number;
 	text: string;
 	completed: boolean;
+	status?: TodoStatus;
+}
+
+export function getTodoStatus(item: TodoItem): TodoStatus {
+	if (item.status) return item.status;
+	return item.completed ? "done" : "pending";
+}
+
+export function setTodoStatus(item: TodoItem, status: TodoStatus): void {
+	item.status = status;
+	item.completed = status === "done";
+}
+
+export function isTodoDone(item: TodoItem): boolean {
+	return getTodoStatus(item) === "done";
+}
+
+export function isTodoClosed(item: TodoItem): boolean {
+	const status = getTodoStatus(item);
+	return status === "done" || status === "skipped" || status === "deferred";
+}
+
+export function isTodoOpen(item: TodoItem): boolean {
+	return !isTodoClosed(item);
+}
+
+function statusLabel(status: TodoStatus): string {
+	switch (status) {
+		case "done":
+			return "done";
+		case "skipped":
+			return "skipped";
+		case "deferred":
+			return "deferred";
+		case "blocked":
+			return "blocked";
+		default:
+			return "pending";
+	}
+}
+
+function statusCheckbox(status: TodoStatus): string {
+	switch (status) {
+		case "done":
+			return "[x]";
+		case "skipped":
+			return "[-]";
+		case "deferred":
+			return "[>]";
+		case "blocked":
+			return "[!]";
+		default:
+			return "[ ]";
+	}
+}
+
+export function renderPlanProgressMarkdown(items: TodoItem[]): string {
+	const lines = [
+		"<!-- pi-plan-progress:start -->",
+		"## Progress",
+		"",
+		"Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` pending.",
+		"",
+	];
+	for (const item of items) {
+		const status = getTodoStatus(item);
+		lines.push(`- ${statusCheckbox(status)} ${item.step}. ${item.text} _(${statusLabel(status)})_`);
+	}
+	lines.push("", "<!-- pi-plan-progress:end -->", "");
+	return lines.join("\n");
+}
+
+export function upsertPlanProgressSection(planMarkdown: string, items: TodoItem[]): string {
+	const section = renderPlanProgressMarkdown(items).trimEnd();
+	const pattern = /\n?<!-- pi-plan-progress:start -->[\s\S]*?<!-- pi-plan-progress:end -->\n?/;
+	if (pattern.test(planMarkdown)) {
+		return `${planMarkdown.replace(pattern, `\n\n${section}\n`)}`;
+	}
+	return `${planMarkdown.trimEnd()}\n\n${section}\n`;
+}
+
+export function hasHandoffClaim(text: string): boolean {
+	const normalized = stripMarkdownInline(text).replace(/\s+/g, " ").trim();
+	if (!normalized) return false;
+	return /\b(?:ready\s+for\s+(?:human\s+)?review|ready\s+to\s+(?:merge|review)|handoff|hand\s+off|leav(?:e|ing)\s+(?:it\s+)?for\s+(?:human\s+)?review|ci\s+(?:is\s+)?clean|checks?\s+(?:are\s+)?green|pr\s+(?:is\s+)?clean)\b/i.test(normalized);
 }
 
 interface MarkdownHeader {
@@ -544,6 +631,7 @@ export function extractTodoItemsFromProposedPlan(planContent: string): TodoItem[
 		step: index + 1,
 		text,
 		completed: false,
+		status: "pending" as const,
 	}));
 }
 
@@ -682,7 +770,7 @@ function fuzzyCompletedSteps(text: string, items: TodoItem[]): number[] {
 	}
 
 	for (const item of items) {
-		if (item.completed) continue;
+		if (!isTodoOpen(item)) continue;
 		const action = primaryActionKeyword(item.text);
 		if (action && !normalizedText.includes(action)) continue;
 		const keywords = progressKeywords(item.text);
@@ -700,7 +788,7 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 	const lines = text.split("\n");
 
 	for (const item of items) {
-		if (item.completed) continue; // already marked
+		if (!isTodoOpen(item)) continue; // already closed
 
 		for (const line of lines) {
 			const l = line.trim();
@@ -788,8 +876,8 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 
 	if (items.length > 0 && indicatesWholePlanCompleted(text)) {
 		for (const item of items) {
-			if (!item.completed) {
-				item.completed = true;
+			if (isTodoOpen(item)) {
+				setTodoStatus(item, "done");
 				marked++;
 			}
 		}
@@ -799,8 +887,8 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	const doneSteps = extractDoneSteps(text);
 	for (const step of doneSteps) {
 		const item = items.find((t) => t.step === step);
-		if (item && !item.completed) {
-			item.completed = true;
+		if (item && !isTodoDone(item)) {
+			setTodoStatus(item, "done");
 			marked++;
 		}
 	}
@@ -809,8 +897,8 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	const heuristicSteps = [...heuristicCompletedSteps(text, items), ...fuzzyCompletedSteps(text, items)];
 	for (const step of heuristicSteps) {
 		const item = items.find((t) => t.step === step);
-		if (item && !item.completed) {
-			item.completed = true;
+		if (item && !isTodoDone(item)) {
+			setTodoStatus(item, "done");
 			marked++;
 		}
 	}

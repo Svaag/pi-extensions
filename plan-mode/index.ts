@@ -16,16 +16,24 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { Type } from "typebox";
 import {
 	extractProposedPlan,
 	extractTodoItemsFromProposedPlan,
+	hasHandoffClaim,
 	isSafeCommand,
+	isTodoClosed,
+	isTodoDone,
+	isTodoOpen,
 	markCompletedSteps,
+	renderPlanProgressMarkdown,
+	setTodoStatus,
+	upsertPlanProgressSection,
 	type TodoItem,
+	type TodoStatus,
 } from "./utils.js";
 
 const DEFAULT_NORMAL_TOOLS = ["read", "bash", "edit", "write"];
@@ -292,6 +300,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let lastProposedPlan = "";
 	let todoItems: TodoItem[] = [];
 	let savedTools: string[] = [];
+	let savedPlanAbsolutePath: string | undefined;
+	let savedPlanRelativePath: string | undefined;
+	let savedPlanRoot: string | undefined;
 	let pendingEmptyContextPlanPath: string | undefined;
 
 	pi.registerFlag("plan", {
@@ -300,32 +311,100 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-	async function projectRoot(ctx: ExtensionContext): Promise<string> {
-		const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+	async function gitRootForPath(path: string, ctx: ExtensionContext): Promise<string | undefined> {
+		const result = await pi.exec("git", ["-C", path, "rev-parse", "--show-toplevel"], {
 			cwd: ctx.cwd,
 			timeout: 5000,
 			signal: ctx.signal,
 		});
-		if (result.code === 0) {
-			const root = result.stdout.trim().split("\n").pop()?.trim();
-			if (root) return root;
+		if (result.code === 0) return result.stdout.trim().split("\n").pop()?.trim() || undefined;
+		return undefined;
+	}
+
+	async function projectRoot(ctx: ExtensionContext): Promise<string> {
+		return (await gitRootForPath(ctx.cwd, ctx)) ?? ctx.cwd;
+	}
+
+	async function hasGitMetadata(path: string): Promise<boolean> {
+		try {
+			await stat(join(path, ".git"));
+			return true;
+		} catch {
+			return false;
 		}
-		return ctx.cwd;
+	}
+
+	async function immediateChildGitRoots(path: string, ctx: ExtensionContext): Promise<string[]> {
+		try {
+			const entries = await readdir(path, { withFileTypes: true });
+			const roots = new Set<string>();
+			for (const entry of entries) {
+				if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+				const child = join(path, entry.name);
+				if (!(await hasGitMetadata(child))) continue;
+				roots.add((await gitRootForPath(child, ctx)) ?? child);
+			}
+			return [...roots];
+		} catch {
+			return [];
+		}
+	}
+
+	function scorePlanRootCandidate(root: string, plan: string): number {
+		const base = root.split(/[\\/]+/).filter(Boolean).pop()?.toLowerCase() ?? "";
+		const normalizedPlan = plan.toLowerCase();
+		let score = 0;
+		if (base && normalizedPlan.includes(`/${base}`)) score += 120;
+		if (base && normalizedPlan.includes(` ${base}`)) score += 80;
+		if (base && normalizedPlan.includes(`\`${base}\``)) score += 100;
+		if (base && new RegExp(`\\b${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(plan)) score += 60;
+		return score;
+	}
+
+	async function choosePlanRoot(ctx: ExtensionContext, defaultRoot: string): Promise<string> {
+		const candidates = new Set<string>([defaultRoot]);
+		for (const root of await immediateChildGitRoots(defaultRoot, ctx)) candidates.add(root);
+		if (ctx.cwd !== defaultRoot) {
+			const cwdRoot = (await gitRootForPath(ctx.cwd, ctx)) ?? ctx.cwd;
+			candidates.add(cwdRoot);
+			for (const root of await immediateChildGitRoots(ctx.cwd, ctx)) candidates.add(root);
+		}
+
+		const scored = [...candidates]
+			.map((root) => ({ root, score: scorePlanRootCandidate(root, lastProposedPlan) }))
+			.sort((a, b) => b.score - a.score || a.root.localeCompare(b.root));
+		const best = scored[0];
+		if (!best || best.root === defaultRoot || best.score <= 0) return defaultRoot;
+		if (!ctx.hasUI) return best.root;
+
+		const labels = [
+			`Use detected target repo: ${best.root}`,
+			`Use current git root: ${defaultRoot}`,
+			"Cancel execution",
+		];
+		const choice = await ctx.ui.select("Save accepted plan under which project?", labels);
+		if (choice?.startsWith("Use detected target repo")) return best.root;
+		if (choice?.startsWith("Use current git root")) return defaultRoot;
+		throw new Error("Plan execution cancelled before saving because no project root was selected.");
 	}
 
 	async function savePlanForExecution(ctx: ExtensionContext): Promise<string> {
 		if (!lastProposedPlan.trim()) throw new Error("No proposed plan is available to save.");
 
-		const root = await projectRoot(ctx);
+		const defaultRoot = await projectRoot(ctx);
+		const root = await choosePlanRoot(ctx, defaultRoot);
 		const plansDir = join(root, "docs", "plans");
 		await mkdir(plansDir, { recursive: true });
 
 		const title = planTitle(lastProposedPlan);
 		const filename = `${timestampForFilename()}-${slugifyPlanTitle(title)}.md`;
 		const absolutePath = join(plansDir, filename);
-		await writeFile(absolutePath, buildSavedPlanMarkdown(lastProposedPlan), "utf8");
+		await writeFile(absolutePath, upsertPlanProgressSection(buildSavedPlanMarkdown(lastProposedPlan), todoItems), "utf8");
 
 		const relativePath = relative(root, absolutePath) || absolutePath;
+		savedPlanAbsolutePath = absolutePath;
+		savedPlanRelativePath = relativePath;
+		savedPlanRoot = root;
 		pi.appendEntry("plan-mode-saved-plan", {
 			path: absolutePath,
 			relativePath,
@@ -334,6 +413,17 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			savedAt: new Date().toISOString(),
 		});
 		return relativePath;
+	}
+
+	async function updateSavedPlanProgress(ctx: ExtensionContext): Promise<void> {
+		if (!savedPlanAbsolutePath || todoItems.length === 0) return;
+		try {
+			const existing = await readFile(savedPlanAbsolutePath, "utf8");
+			await writeFile(savedPlanAbsolutePath, upsertPlanProgressSection(existing, todoItems), "utf8");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Could not update saved plan progress in ${savedPlanRelativePath ?? savedPlanAbsolutePath}: ${message}`, "warning");
+		}
 	}
 
 	pi.registerTool({
@@ -785,8 +875,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	function updateStatus(ctx: ExtensionContext): void {
 		// Footer status
 		if (executionMode && todoItems.length > 0) {
-			const completed = todoItems.filter((t: TodoItem) => t.completed).length;
-			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("accent", `📋 ${completed}/${todoItems.length}`));
+			const closed = todoItems.filter((t: TodoItem) => isTodoClosed(t)).length;
+			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("accent", `📋 ${closed}/${todoItems.length}`));
 		} else if (planModeEnabled) {
 			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("warning", "⏸ plan"));
 		} else {
@@ -796,11 +886,15 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		// Widget showing todo list
 		if (executionMode && todoItems.length > 0) {
 			const lines = todoItems.map((item: TodoItem) => {
-				if (item.completed) {
+				const status = item.status ?? (item.completed ? "done" : "pending");
+				if (isTodoDone(item)) {
 					return (
 						ctx.ui.theme.fg("success", "☑ ") + ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
 					);
 				}
+				if (status === "skipped") return `${ctx.ui.theme.fg("muted", "⊘ ")}${ctx.ui.theme.strikethrough(item.text)}`;
+				if (status === "deferred") return `${ctx.ui.theme.fg("warning", "↷ ")}${item.text}`;
+				if (status === "blocked") return `${ctx.ui.theme.fg("error", "⚠ ")}${item.text}`;
 				return `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`;
 			});
 			ctx.ui.setWidget("plan-todos", lines);
@@ -882,6 +976,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			executing: executionMode,
 			lastProposedPlan: lastProposedPlan,
 			savedTools: savedTools,
+			savedPlanAbsolutePath,
+			savedPlanRelativePath,
+			savedPlanRoot,
 		});
 	}
 
@@ -927,7 +1024,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("todos", {
-		description: "Show or update current plan todo list. Usage: /todos, /todos done 1-3, /todos reset",
+		description: "Show or update current plan todo list. Usage: /todos, /todos done|skip|defer|block|open 1-3, /todos reset",
 		handler: async (args: any, ctx: ExtensionContext) => {
 			const command = String(args ?? "").trim();
 			if (todoItems.length === 0) {
@@ -935,32 +1032,44 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			if (/^(done|mark|complete)\b/i.test(command)) {
-				const steps = parseStepSpec(command.replace(/^(done|mark|complete)\b/i, ""));
+			const stateMatch = command.match(/^(done|mark|complete|skip|skipped|defer|deferred|block|blocked|open|reopen|pending)\b/i);
+			if (stateMatch) {
+				const verb = stateMatch[1].toLowerCase();
+				const status: TodoStatus = /^(done|mark|complete)$/.test(verb)
+					? "done"
+					: /^skip/.test(verb)
+						? "skipped"
+						: /^defer/.test(verb)
+							? "deferred"
+							: /^block/.test(verb)
+								? "blocked"
+								: "pending";
+				const steps = parseStepSpec(command.slice(stateMatch[0].length));
 				let changed = 0;
 				for (const step of steps) {
 					const item = todoItems.find((todo: TodoItem) => todo.step === step);
-					if (item && !item.completed) {
-						item.completed = true;
+					if (item && (item.status ?? (item.completed ? "done" : "pending")) !== status) {
+						setTodoStatus(item, status);
 						changed++;
 					}
 				}
 				persistState();
+				await updateSavedPlanProgress(ctx);
 				updateStatus(ctx);
-				ctx.ui.notify(changed > 0 ? `Marked ${changed} step(s) done.` : "No matching unfinished steps.", "info");
+				ctx.ui.notify(changed > 0 ? `Marked ${changed} step(s) ${status}.` : "No matching steps changed.", "info");
 				return;
 			}
 
 			if (/^reset\b/i.test(command)) {
-				for (const item of todoItems) item.completed = false;
+				for (const item of todoItems) setTodoStatus(item, "pending");
 				persistState();
+				await updateSavedPlanProgress(ctx);
 				updateStatus(ctx);
 				ctx.ui.notify("Reset plan progress.", "info");
 				return;
 			}
 
-			const list = todoItems.map((item: TodoItem, i: number) => `${i + 1}. ${item.completed ? "✓" : "○"} ${item.text}`).join("\n");
-			ctx.ui.notify(`Plan Progress:\n${list}`, "info");
+			ctx.ui.notify(`Plan Progress:\n${renderPlanProgressMarkdown(todoItems)}`, "info");
 		},
 	});
 
@@ -993,6 +1102,9 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 						executing: true,
 						lastProposedPlan,
 						savedTools,
+						savedPlanAbsolutePath,
+						savedPlanRelativePath,
+						savedPlanRoot,
 					});
 				},
 				withSession: async (newCtx) => {
@@ -1188,9 +1300,9 @@ If the user stays in Plan mode and asks for revisions after a prior \`<proposed_
 		}
 
 		if (executionMode && todoItems.length > 0) {
-			const remaining = todoItems.filter((t: TodoItem) => !t.completed);
+			const remaining = todoItems.filter((t: TodoItem) => isTodoOpen(t));
 			const todoList = remaining.map((t: TodoItem) => `${t.step}. ${t.text}`).join("\n");
-			const allSteps = todoItems.map((t: TodoItem) => `Step ${t.step}: ${t.text}`).join("\n");
+			const allSteps = todoItems.map((t: TodoItem) => `Step ${t.step}: ${t.text} (${t.status ?? (t.completed ? "done" : "pending")})`).join("\n");
 			return {
 				message: {
 					customType: "plan-execution-context",
@@ -1204,7 +1316,11 @@ ${allSteps}
 
 **IMPORTANT**: As you complete each step, you MUST mark it done by including a [DONE:n] tag in your response (e.g. [DONE:1] for step 1, [DONE:5] for step 5). Place the tag right after the section that completes the step, or end your response with a concise status line like \`Completed steps: 1-3\`. Multiple [DONE:n] tags can be included in one response if you complete multiple steps.
 
-If you only partially complete the plan, include exactly which step numbers are now complete. Do not omit this even if you also provide a prose summary. Without these tags or a clear completion status line, the progress tracker may not update.`,
+If the user explicitly skips or defers a step, run \`/todos skip <n>\` or \`/todos defer <n>\` instead of claiming it is done. If a step is blocked, run \`/todos block <n>\` and explain the blocker.
+
+Before saying a PR is ready, clean, or ready for human review, check both CI and review state. For GitHub PR work, inspect normal comments and inline review comments/threads (for example with \`gh pr checks\`, \`gh pr view --comments\`, \`gh api repos/:owner/:repo/pulls/:number/comments\`, and GraphQL review thread queries where needed). Resolve or respond to actionable automated-review comments before handoff.
+
+If you only partially complete the plan, include exactly which step numbers are now complete, skipped, deferred, or blocked. Do not omit this even if you also provide a prose summary. Without these tags or \`/todos\` updates, the progress tracker may not update.`,
 					display: false,
 				},
 			};
@@ -1218,7 +1334,21 @@ If you only partially complete the plan, include exactly which step numbers are 
 
 		const text = getTextContent(event.message);
 		if (markCompletedSteps(text, todoItems) > 0) {
+			await updateSavedPlanProgress(ctx);
 			updateStatus(ctx);
+		}
+		if (hasHandoffClaim(text)) {
+			const open = todoItems.filter((item: TodoItem) => isTodoOpen(item));
+			if (open.length > 0) {
+				pi.sendMessage(
+					{
+						customType: "plan-handoff-warning",
+						content: `⚠️ **Plan handoff warning:** this response sounds like a handoff, but ${open.length} plan item(s) are still open. Mark them done, skipped, deferred, or blocked with \`/todos done|skip|defer|block <n>\` before handing off.\n\n${open.map((item) => `${item.step}. ${item.text}`).join("\n")}`,
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+			}
 		}
 		persistState();
 	});
@@ -1227,8 +1357,11 @@ If you only partially complete the plan, include exactly which step numbers are 
 	pi.on("agent_end", async (event: any, ctx: ExtensionContext) => {
 		// Check if execution is complete
 		if (executionMode && todoItems.length > 0) {
-			if (todoItems.every((t: TodoItem) => t.completed)) {
-				const completedList = todoItems.map((t: TodoItem) => `~~${t.text}~~`).join("\n");
+			if (todoItems.every((t: TodoItem) => isTodoClosed(t))) {
+				await updateSavedPlanProgress(ctx);
+				const completedList = todoItems
+					.map((t: TodoItem) => `${isTodoDone(t) ? "✓" : "↷"} ${t.text} (${t.status ?? (t.completed ? "done" : "pending")})`)
+					.join("\n");
 				pi.sendMessage(
 					{ customType: "plan-complete", content: `**Plan Complete!** ✓\n\n${completedList}`, display: true },
 					{ triggerTurn: false },
@@ -1352,6 +1485,9 @@ If you only partially complete the plan, include exactly which step numbers are 
 						executing?: boolean;
 						lastProposedPlan?: string;
 						savedTools?: string[];
+						savedPlanAbsolutePath?: string;
+						savedPlanRelativePath?: string;
+						savedPlanRoot?: string;
 					};
 			  }
 			| undefined;
@@ -1364,6 +1500,9 @@ If you only partially complete the plan, include exactly which step numbers are 
 			savedTools = existingToolNames(normalizeToolNames(planModeEntry.data.savedTools ?? savedTools)).filter(
 				(name: string) => name !== PLAN_QUESTIONS_TOOL,
 			);
+			savedPlanAbsolutePath = planModeEntry.data.savedPlanAbsolutePath ?? savedPlanAbsolutePath;
+			savedPlanRelativePath = planModeEntry.data.savedPlanRelativePath ?? savedPlanRelativePath;
+			savedPlanRoot = planModeEntry.data.savedPlanRoot ?? savedPlanRoot;
 
 			// Migrate older sessions whose todos were over-extracted from every list item.
 			// Re-parse the stored proposed plan with the current robust extractor, preserving
@@ -1373,7 +1512,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 				if (reparsedTodos.length > 0 && !sameTodoTexts(todoItems, reparsedTodos)) {
 					for (const item of reparsedTodos) {
 						const previous = todoItems.find((todo: TodoItem) => todo.text.toLowerCase() === item.text.toLowerCase());
-						item.completed = previous?.completed ?? false;
+						setTodoStatus(item, previous?.status ?? (previous?.completed ? "done" : "pending"));
 					}
 					todoItems = reparsedTodos;
 					persistState();
@@ -1408,7 +1547,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 			if (markCompletedSteps(allText, todoItems) > 0) persistState();
 		}
 
-		if (executionMode && todoItems.length > 0 && todoItems.every((todo: TodoItem) => todo.completed)) {
+		if (executionMode && todoItems.length > 0 && todoItems.every((todo: TodoItem) => isTodoClosed(todo))) {
 			executionMode = false;
 			todoItems = [];
 			persistState();
