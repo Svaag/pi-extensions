@@ -83,6 +83,60 @@ test("extractTodoItemsFromProposedPlan prefers tracker-level implementation step
 	);
 });
 
+test("extractTodoItemsFromProposedPlan ignores numbered narrative headings and uses final checklist", () => {
+	const plan = `# HIP-4 Outcome Markets Paper/Shadow MVP — Production Implementation Plan
+
+## 1. Executive Decision
+
+Implement HIP-4 as an isolated bounded subsystem.
+
+## 2. What Changes From The Original Plan
+
+1. This numbered detail is not a tracker item.
+2. Neither is this correction.
+
+## 16. Open Questions Before Implementation
+
+1. Re-check API availability before coding.
+2. Confirm the SDK shape.
+
+## 17. Final Implementation Checklist
+
+1. Perform repo audit and define Hip4CapabilityProbe.
+2. Add HIP-4 settings, metrics, and read-only /info helpers.
+3. Implement read-only registry with raw payload persistence.
+4. Add tests, replay fixtures, and runbook.
+`;
+
+	assert.deepEqual(
+		extractTodoItemsFromProposedPlan(plan).map((item) => item.text),
+		[
+			"Perform repo audit and define Hip4CapabilityProbe.",
+			"Add HIP-4 settings, metrics, and read-only /info helpers.",
+			"Implement read-only registry with raw payload persistence.",
+			"Add tests, replay fixtures, and runbook.",
+		],
+	);
+});
+
+test("extractTodoItemsFromProposedPlan does not invent todos from structured narrative plans", () => {
+	const plan = `# Implementation Plan
+
+## Summary
+- Summarize the goal.
+- Summarize constraints.
+
+## Assumptions
+1. This is context, not a todo.
+2. This is also context.
+
+## Test Plan
+1. This validates the implementation later.
+`;
+
+	assert.deepEqual(extractTodoItemsFromProposedPlan(plan), []);
+});
+
 test("markCompletedSteps supports explicit tags and natural-language ranges", () => {
 	const items = todos(["First", "Second", "Third", "Fourth"]);
 	assert.equal(markCompletedSteps("[DONE:1]\nCompleted steps: 2-3", items), 3);

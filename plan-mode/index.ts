@@ -1293,7 +1293,8 @@ If you only partially complete the plan, include exactly which step numbers are 
 				// ctx.newSession is only available in ExtensionCommandContext, not event handlers.
 				// Hand off to the /plan-start-empty-context command so the replacement runs safely.
 				pendingEmptyContextPlanPath = savedPlanPath;
-				pi.sendUserMessage("/plan-start-empty-context");
+				// agent_end is still inside Pi's active processing window; queue follow-up input until idle.
+				pi.sendUserMessage("/plan-start-empty-context", { deliverAs: "followUp" });
 				return;
 			}
 
@@ -1325,7 +1326,8 @@ If you only partially complete the plan, include exactly which step numbers are 
 			} else if (choice?.startsWith("Refine the plan")) {
 				const refinement = await ctx.ui.editor("Provide feedback to refine the plan:", "");
 				if (refinement?.trim()) {
-					pi.sendUserMessage(refinement.trim());
+					// agent_end is still inside Pi's active processing window; queue the refinement until idle.
+					pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
 				}
 			} else {
 				ctx.ui.notify("Plan accepted UI dismissed; staying in Plan Mode with the proposed plan available for refinement.", "info");

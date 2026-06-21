@@ -214,6 +214,7 @@ const ACTION_SECTION_EXCLUDES = [
 	/\bdecisions?\b/i,
 	/\bassumptions?\b/i,
 	/\brequirements?\b/i,
+	/\bquestions?\b/i,
 	/\bcontext\b/i,
 	/\bbackground\b/i,
 	/\bconstraints?\b/i,
@@ -296,7 +297,7 @@ function scoreActionSection(title: string): number {
 	const hasImplementation = /\bimplementation\b|\bimplement\b/.test(normalized);
 	const hasExecution = /\bexecution\b|\bexecute\b/.test(normalized);
 	const hasAction = /\baction\b/.test(normalized);
-	const hasStepWord = /\bsteps?\b|\btasks?\b|\btodos?\b|\btodo\b|\bplan\b|\broadmap\b/.test(normalized);
+	const hasStepWord = /\bsteps?\b|\btasks?\b|\btodos?\b|\btodo\b|\bchecklists?\b|\bmilestones?\b|\bplan\b|\broadmap\b/.test(normalized);
 
 	// Sections like "Execution Prompt" describe role behavior. They are not
 	// tracker-level execution steps and frequently contain checklist bullets.
@@ -304,7 +305,7 @@ function scoreActionSection(title: string): number {
 		return 0;
 	}
 
-	if (/^(?:implementation|execution|action)\s+(?:steps?|tasks?|todos?|todo|plan)$/.test(normalized)) return 120;
+	if (/^(?:final\s+)?(?:implementation|execution|action)\s+(?:steps?|tasks?|todos?|todo|plan|checklists?|milestones?)$/.test(normalized)) return 125;
 	if (/^work\s+plan$/.test(normalized)) return 120;
 	if ((hasImplementation || hasExecution || hasAction) && hasStepWord) return 115;
 	if (/^(?:implementation|execution|action)$/.test(normalized)) return 105;
@@ -326,7 +327,12 @@ function findMarkdownHeaders(lines: string[]): MarkdownHeader[] {
 		}
 		if (inFence) continue;
 		const header = headingForLine(line);
-		if (header) headers.push({ index: i, level: header.level, title: header.title, score: scoreActionSection(header.title) });
+		if (header) {
+			// The document H1 is usually a title (for example "Foo Implementation Plan"),
+			// not the tracker section. Require actionable subsections for todo extraction.
+			const score = header.level === 1 ? 0 : scoreActionSection(header.title);
+			headers.push({ index: i, level: header.level, title: header.title, score });
+		}
 	}
 	return headers;
 }
@@ -530,7 +536,16 @@ export function extractTodoItemsFromProposedPlan(planContent: string): TodoItem[
 
 	const preferred = extractFromPreferredMarkdownSections(lines);
 	const plainPlan = preferred.length > 0 ? [] : extractFromPlainPlanBlock(lines);
-	let extracted = preferred.length > 0 ? preferred : plainPlan.length > 0 ? plainPlan : extractFallbackTopLevelItems(lines);
+	let extracted = preferred.length > 0 ? preferred : plainPlan.length > 0 ? plainPlan : [];
+
+	// Do not fall back to harvesting every top-level list item from a structured
+	// markdown document. If the model omitted an actionable Implementation/Execution/
+	// Action Plan section, broad fallback turns requirements, tests, evidence checks,
+	// and rollout notes into bogus todos. Only use whole-message fallback for simple
+	// unheaded list responses.
+	if (extracted.length === 0 && findMarkdownHeaders(lines).length === 0) {
+		extracted = extractFallbackTopLevelItems(lines);
+	}
 
 	// Last-resort safety valve: if a model emits a verbose plan shape we did not
 	// anticipate and the list explodes, prefer numbered markdown headings over
