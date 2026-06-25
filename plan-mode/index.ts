@@ -15,7 +15,7 @@ import {
 	type ExtensionContext,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, relative } from "node:path";
@@ -383,6 +383,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				let agentReviewError = "";
 				let agentReviewAbort: AbortController | null = null;
 				let cachedLines: string[] | undefined;
+				let cachedWidth: number | undefined;
 				const answers = new Map<string, PlanQuestionAnswer>();
 
 				const editorTheme: EditorTheme = {
@@ -399,6 +400,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 				function refresh(): void {
 					cachedLines = undefined;
+					cachedWidth = undefined;
 					tui.requestRender();
 				}
 
@@ -621,13 +623,39 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				}
 
 				function render(width: number): string[] {
-					if (cachedLines) return cachedLines;
+					if (cachedLines && cachedWidth === width) return cachedLines;
 					const lines: string[] = [];
+					const renderWidth = Math.max(1, width);
 					const q = currentQuestion();
 					const opts = currentOptions();
-					const add = (s: string) => lines.push(truncateToWidth(s, width));
 
-					add(theme.fg("accent", "─".repeat(width)));
+					function addWrapped(text: string): void {
+						const wrapped = wrapTextWithAnsi(text, renderWidth);
+						if (wrapped.length === 0) lines.push("");
+						else lines.push(...wrapped);
+					}
+
+					function addWrappedWithPrefix(prefix: string, text: string, continuationPrefix = " ".repeat(visibleWidth(prefix))): void {
+						const prefixWidth = visibleWidth(prefix);
+						const continuationWidth = visibleWidth(continuationPrefix);
+						const reservedWidth = Math.max(prefixWidth, continuationWidth);
+						if (reservedWidth >= renderWidth) {
+							addWrapped(prefix + text);
+							return;
+						}
+
+						const wrapped = wrapTextWithAnsi(text, renderWidth - reservedWidth);
+						if (wrapped.length === 0) {
+							lines.push(truncateToWidth(prefix, renderWidth, ""));
+							return;
+						}
+
+						for (let i = 0; i < wrapped.length; i++) {
+							lines.push(`${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`);
+						}
+					}
+
+					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 
 					if (isMulti) {
 						const tabs: string[] = ["← "];
@@ -644,7 +672,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 								? theme.bg("selectedBg", theme.fg("text", submitText))
 								: theme.fg(allAnswered() ? "success" : "dim", submitText),
 						);
-						add(` ${tabs.join(" ")} →`);
+						addWrappedWithPrefix(" ", `${tabs.join(" ")} →`);
 						lines.push("");
 					}
 
@@ -654,89 +682,107 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 							const selected = i === optionIndex;
 							const chosen = q ? answers.get(q.id)?.value === opt.value : false;
 							const prefix = selected ? theme.fg("accent", "> ") : "  ";
-							const marker = chosen ? theme.fg("success", "✓ ") : `${i + 1}. `;
-							add(prefix + theme.fg(selected ? "accent" : "text", marker + opt.label));
-							if (opt.description) add(`     ${theme.fg("muted", opt.description)}`);
+							const marker = chosen ? theme.fg("success", "✓ ") : theme.fg(selected ? "accent" : "text", `${i + 1}. `);
+							const label = theme.fg(selected ? "accent" : "text", opt.label);
+							const continuationPrefix = " ".repeat(visibleWidth(prefix) + visibleWidth(marker));
+							addWrappedWithPrefix(prefix + marker, label, continuationPrefix);
+							if (opt.description) addWrappedWithPrefix("     ", theme.fg("muted", opt.description));
 						}
 					}
 
 					function addMultiline(text: string, color: "text" | "muted" | "warning" | "error" | "success" = "text"): void {
-						for (const line of text.split("\n")) add(theme.fg(color, ` ${line}`));
+						for (const line of text.split("\n")) {
+							if (line.length === 0) lines.push("");
+							else addWrappedWithPrefix(" ", theme.fg(color, line));
+						}
 					}
 
 					if (modelSelectMode && q) {
-						add(theme.fg("text", ` ${q.prompt}`));
+						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
 						lines.push("");
-						add(theme.fg("accent", " Choose a scoped model for the plan-review agent:"));
+						addWrappedWithPrefix(" ", theme.fg("accent", "Choose a scoped model for the plan-review agent:"));
 						lines.push("");
 						if (planAgentModelOptions.length === 0) {
-							add(theme.fg("warning", " No authenticated scoped models found."));
-							add(theme.fg("muted", " Configure enabledModels in ~/.pi/agent/settings.json or .pi/settings.json."));
+							addWrappedWithPrefix(" ", theme.fg("warning", "No authenticated scoped models found."));
+							addWrappedWithPrefix(" ", theme.fg("muted", "Configure enabledModels in ~/.pi/agent/settings.json or .pi/settings.json."));
 						} else {
 							for (let i = 0; i < planAgentModelOptions.length; i++) {
 								const option = planAgentModelOptions[i];
 								const selected = i === modelSelectIndex;
 								const prefix = selected ? theme.fg("accent", "> ") : "  ";
-								add(prefix + theme.fg(selected ? "accent" : "text", `${i + 1}. ${option.label}`));
-								if (option.description) add(`     ${theme.fg("muted", option.description)}`);
+								const marker = theme.fg(selected ? "accent" : "text", `${i + 1}. `);
+								const label = theme.fg(selected ? "accent" : "text", option.label);
+								const continuationPrefix = " ".repeat(visibleWidth(prefix) + visibleWidth(marker));
+								addWrappedWithPrefix(prefix + marker, label, continuationPrefix);
+								if (option.description) addWrappedWithPrefix("     ", theme.fg("muted", option.description));
 							}
 						}
 						lines.push("");
-						add(theme.fg("dim", planAgentModelOptions.length > 0 ? " ↑↓ select • Enter ask agent • Esc back" : " Esc back"));
+						addWrappedWithPrefix(" ", theme.fg("dim", planAgentModelOptions.length > 0 ? "↑↓ select • Enter ask agent • Esc back" : "Esc back"));
 					} else if (agentReviewMode && q) {
-						add(theme.fg("text", ` ${q.prompt}`));
+						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
 						lines.push("");
 						if (agentReviewRunning) {
-							add(theme.fg("accent", " Asking the selected plan-review model..."));
+							addWrappedWithPrefix(" ", theme.fg("accent", "Asking the selected plan-review model..."));
 							lines.push("");
-							add(theme.fg("dim", " Forwarding the current planning conversation and any draft/proposed plan."));
-							add(theme.fg("dim", " Esc cancels"));
+							addWrappedWithPrefix(" ", theme.fg("dim", "Forwarding the current planning conversation and any draft/proposed plan."));
+							addWrappedWithPrefix(" ", theme.fg("dim", "Esc cancels"));
 						} else if (agentReviewError) {
-							add(theme.fg("error", " Agent review failed:"));
+							addWrappedWithPrefix(" ", theme.fg("error", "Agent review failed:"));
 							addMultiline(agentReviewError, "error");
 							lines.push("");
-							add(theme.fg("dim", " Esc back"));
+							addWrappedWithPrefix(" ", theme.fg("dim", "Esc back"));
 						} else {
-							add(theme.fg("accent", ` Agent recommendation${agentReviewModel ? ` (${agentReviewModel})` : ""}:`));
+							addWrappedWithPrefix(" ", theme.fg("accent", `Agent recommendation${agentReviewModel ? ` (${agentReviewModel})` : ""}:`));
 							lines.push("");
 							addMultiline(agentReviewText || "(empty response)");
 							lines.push("");
-							add(theme.fg("dim", " Enter use as answer • E edit before using • Esc back"));
+							addWrappedWithPrefix(" ", theme.fg("dim", "Enter use as answer • E edit before using • Esc back"));
 						}
 					} else if (inputMode && q) {
-						add(theme.fg("text", ` ${q.prompt}`));
+						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
 						lines.push("");
 						renderOptions();
 						lines.push("");
-						add(theme.fg("muted", " Your answer:"));
-						for (const line of editor.render(width - 2)) add(` ${line}`);
+						addWrappedWithPrefix(" ", theme.fg("muted", "Your answer:"));
+						for (const line of editor.render(Math.max(1, renderWidth - 2))) lines.push(` ${line}`);
 						lines.push("");
-						add(theme.fg("dim", " Enter to save • Esc back"));
+						addWrappedWithPrefix(" ", theme.fg("dim", "Enter to save • Esc back"));
 					} else if (currentTab === questions.length) {
-						add(theme.fg("accent", theme.bold(" Review answers")));
+						addWrappedWithPrefix(" ", theme.fg("accent", theme.bold("Review answers")));
 						lines.push("");
 						for (const question of questions) {
 							const answer = answers.get(question.id);
-							add(`${theme.fg("muted", ` ${question.label}: `)}${answer ? theme.fg("text", answer.label) : theme.fg("warning", "unanswered")}`);
+							const prefix = theme.fg("muted", ` ${question.label}: `);
+							const text = answer ? theme.fg("text", answer.label) : theme.fg("warning", "unanswered");
+							addWrappedWithPrefix(prefix, text);
 						}
 						lines.push("");
-						add(allAnswered() ? theme.fg("success", " Press Enter to submit") : theme.fg("warning", " Tab back to answer missing questions"));
+						addWrappedWithPrefix(" ", allAnswered() ? theme.fg("success", "Press Enter to submit") : theme.fg("warning", "Tab back to answer missing questions"));
 					} else if (q) {
-						add(theme.fg("text", ` ${q.prompt}`));
+						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
 						lines.push("");
 						renderOptions();
 					}
 
 					lines.push("");
 					if (!inputMode && !agentReviewMode && !modelSelectMode) {
-						add(theme.fg("dim", isMulti ? " Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel" : " ↑↓ select • Enter confirm • Esc cancel"));
+						addWrappedWithPrefix(" ", theme.fg("dim", isMulti ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel" : "↑↓ select • Enter confirm • Esc cancel"));
 					}
-					add(theme.fg("accent", "─".repeat(width)));
+					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
 					cachedLines = lines;
+					cachedWidth = width;
 					return lines;
 				}
 
-				return { render, invalidate: () => { cachedLines = undefined; }, handleInput };
+				return {
+					render,
+					invalidate: () => {
+						cachedLines = undefined;
+						cachedWidth = undefined;
+					},
+					handleInput,
+				};
 			}, {
 				overlay: true,
 				overlayOptions: { width: "80%", minWidth: 60, maxHeight: "80%", anchor: "center" },
