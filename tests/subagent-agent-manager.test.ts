@@ -92,6 +92,19 @@ test("AgentManager ignores too-short runtime timeouts", async () => {
 	assert.equal(backend.requests[0].timeoutMs, 30 * 60_000);
 });
 
+test("AgentManager preserves tool output tail after successful final output", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend);
+	const record = await h.manager.spawnAgent({ taskName: "demo", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	backend.events.get(record.agentId)?.onOutput?.("← bash result\n/home/svag/Dev/evm-hunter\n");
+	backend.events.get(record.agentId)?.onResult?.({ agentId: record.agentId, status: "succeeded", summary: "final", output: "final answer" });
+	const waited = await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000, returnMode: "full" });
+	assert.match(waited.agents[0].outputTail ?? "", /← bash result/);
+	assert.match(waited.agents[0].outputTail ?? "", /final answer/);
+});
+
 test("AgentManager recovers partial output when interrupting timed-out agents", async () => {
 	const backend = new FakeBackend();
 	backend.autoComplete = false;

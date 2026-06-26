@@ -411,7 +411,11 @@ export class AgentManager {
 		const status: AgentStatus = result.status;
 		const finishedAt = nowMs();
 		record.result = { ...result, metrics: { ...result.metrics, durationMs: statusDurationMs({ ...record, finishedAt }, finishedAt), outputChars: record.outputChars } };
-		if (result.output) record.outputTail = appendOutputTail("", result.output, this.limits.maxOutputCharsPerAgent);
+		if (result.output && !record.outputTail.trim()) {
+			record.outputTail = appendOutputTail("", result.output, this.limits.maxOutputCharsPerAgent);
+		} else if (result.output && !record.outputTail.includes(result.output)) {
+			record.outputTail = appendOutputTail(record.outputTail, `\n${result.output}`, this.limits.maxOutputCharsPerAgent);
+		}
 		if (status === "interrupted") this.ensureInterruptedResult(record, result.summary, finishedAt);
 		this.transition(record, status, { processState: "live_idle", controllable: this.handles.get(agentId)?.isAlive() ?? true, finishedAt, error: status === "failed" ? result.summary : undefined });
 		this.store.appendEvent(status === "succeeded" ? "agent.succeeded" : status === "interrupted" ? "agent.interrupted" : "agent.failed", {
