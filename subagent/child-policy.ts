@@ -65,10 +65,16 @@ export function isPathAllowed(candidate: string, policy: ChildPolicyConfig): boo
 	return false;
 }
 
+export function isReadPathAllowed(candidate: string, policy: ChildPolicyConfig): boolean {
+	if (isDeniedPath(candidate)) return false;
+	return isInside(candidate, policy.cwd) || policy.allowedPaths.some((allowed) => isInside(candidate, allowed));
+}
+
 export function isReadOnlyShellCommand(command: string): boolean {
 	const trimmed = command.trim();
 	if (!trimmed) return false;
 	if (/[;&|`$<>]/.test(trimmed.replace(/\|\|/g, ""))) return false;
+	if (/(^|[\s/])(?:\.env(?:\.[A-Za-z0-9_-]+)?|\.npmrc|\.pypirc)(?:\s|$)/.test(trimmed)) return false;
 	if (/\b(rm|mv|cp|chmod|chown|mkdir|touch|tee|curl|wget|python|node|perl|ruby|npm|pnpm|yarn|bun|pip|uv|cargo|go|make)\b/i.test(trimmed)) return false;
 	if (/\b(--fix|--write|--in-place|-i|commit|checkout|switch|reset|rebase|merge|pull|push|add|apply)\b/i.test(trimmed)) return false;
 
@@ -87,6 +93,12 @@ export default function subagentChildPolicy(pi: ExtensionAPI): void {
 	const policy = loadPolicy();
 
 	pi.on("tool_call", async (event: any) => {
+		if (event.toolName === "read") {
+			const candidate = normalizeCandidate(policy.cwd, toolPath(event.input));
+			if (!candidate) return blocked(`Subagent ${policy.agentId}: missing target path for read.`);
+			if (!isReadPathAllowed(candidate, policy)) return blocked(`Subagent ${policy.agentId}: read is not allowed for ${candidate}.`);
+		}
+
 		if (event.toolName === "edit" || event.toolName === "write") {
 			const candidate = normalizeCandidate(policy.cwd, toolPath(event.input));
 			if (!candidate) return blocked(`Subagent ${policy.agentId}: missing target path for ${event.toolName}.`);

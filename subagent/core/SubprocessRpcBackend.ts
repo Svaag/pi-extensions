@@ -5,9 +5,10 @@ import * as path from "node:path";
 import type { AgentBackend, AgentBackendEvents, AgentHandle, BackendSpawnRequest } from "./AgentBackend.ts";
 import type { AgentResult } from "./AgentTypes.ts";
 import { RpcClient } from "./RpcClient.ts";
-import { appendOutputTail, summarizeText } from "./utils.ts";
+import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 
 const STDERR_TAIL_CAP = 16_384;
+const TOOL_RESULT_TEXT_CAP = 4_000;
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
@@ -42,14 +43,27 @@ function cleanupTemp(temp: { dir: string; filePath: string } | undefined): void 
 	}
 }
 
-function textFromMessage(message: any): string {
-	if (!message) return "";
-	if (typeof message.content === "string") return message.content;
-	if (!Array.isArray(message.content)) return "";
-	return message.content
+function textFromContentParts(content: any): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
 		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
 		.map((part: any) => part.text)
 		.join("\n");
+}
+
+function textFromMessage(message: any): string {
+	if (!message) return "";
+	return textFromContentParts(message.content);
+}
+
+export function textFromToolResult(result: any): string {
+	const text = textFromContentParts(result?.content).trimEnd();
+	const fullOutputPath = result?.details?.fullOutputPath;
+	const suffix = typeof fullOutputPath === "string" && fullOutputPath
+		? `\n[Full output saved by child at ${fullOutputPath}]`
+		: "";
+	return `${text}${suffix}`.trimEnd();
 }
 
 function finalAssistantMessage(messages: any[]): any | undefined {
@@ -184,6 +198,12 @@ export class SubprocessRpcBackend implements AgentBackend {
 				if (event.type === "tool_execution_start") {
 					const preview = JSON.stringify(event.args ?? {});
 					events.onOutput?.(`\n→ ${event.toolName ?? "tool"} ${preview.length > 300 ? `${preview.slice(0, 300)}…` : preview}\n`);
+				}
+				if (event.type === "tool_execution_end") {
+					const toolText = textFromToolResult(event.result);
+					const status = event.isError ? " error" : " result";
+					const body = toolText ? `\n${truncateMiddle(toolText, TOOL_RESULT_TEXT_CAP)}` : "";
+					events.onOutput?.(`\n← ${event.toolName ?? "tool"}${status}${body}\n`);
 				}
 				if (event.type === "message_end" && event.message?.role === "assistant") {
 					lastAssistant = event.message;

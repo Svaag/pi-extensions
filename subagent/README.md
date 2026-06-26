@@ -12,6 +12,9 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - `followup_task` — queue or trigger additional work on an existing subagent, or spawn a follow-up child.
 - `list_agents` — list active/recent agents.
 - `list_agent_graph` — show the persistent parent/child task-path graph.
+- `spawn_agents_on_csv` / `spawn_agents_on_jsonl` — fan out one worker per structured input row.
+- `list_agent_jobs` / `wait_agent_job` / `cancel_agent_job` — inspect and control batch jobs.
+- `export_agent_job_results` — export batch results to JSONL or CSV.
 - `interrupt_agent` — abort/kill a running child and preserve partial output.
 - `close_agent` — release child process resources while preserving history.
 
@@ -19,7 +22,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 
 - Child agents default to `writeMode: "read_only"`.
 - Child subprocesses are launched with extension/resource discovery disabled, plus a controlled child policy extension.
-- Read-only children can use `read` and conservative read-only `bash` commands.
+- Read-only children can use `read` inside the child `cwd` (plus explicit `allowedPaths`) and conservative read-only `bash` commands.
 - `edit`/`write` are blocked unless `writeMode: "disjoint_scope"` and the path is under `allowedPaths`.
 - `writeMode: "git_worktree"` is reserved for a later phase and currently rejected.
 - Running agents are killed on session shutdown/reload.
@@ -42,8 +45,9 @@ The extension persists append-only lifecycle state with `pi.appendEntry()`:
 - `graph.edge_opened`
 - `graph.edge_closed`
 - `graph.edge_lost`
+- batch job state and events such as `batch.started`, `batch.worker_started`, `batch.worker_result`, `batch.completed`, `batch.failed`, `batch.cancelled`, and `batch.exported`
 
-It also persists latest agent records and parent/child graph edge records. This is enough to reconstruct historical state and display a graph after reload, but does not reattach to old subprocesses.
+It also persists latest agent records, parent/child graph edge records, and batch job records. This is enough to reconstruct historical state and display a graph after reload, but does not reattach to old subprocesses or resume in-flight batch workers.
 
 ## Agent definitions
 
@@ -103,11 +107,31 @@ With `contextMode: "summary"`, the extension includes a capped, sanitized excerp
 
 If the original subprocess is no longer live, use `mode: "spawn_followup"`.
 
+### CSV batch fan-out
+
+```json
+{
+  "csvPath": "tasks.csv",
+  "idColumn": "id",
+  "promptTemplate": "For row {{id}}, inspect {{path}} and answer: {{question}}",
+  "maxConcurrency": 4,
+  "writeMode": "read_only"
+}
+```
+
+Then use:
+
+```json
+{ "jobId": "job_...", "timeoutMs": 300000 }
+{ "jobId": "job_...", "format": "jsonl", "outputPath": "batch-results.jsonl" }
+```
+
 ## Current limitations
 
 - Backend is subprocess RPC, not SDK in-process sessions.
 - No true process reattachment after `/reload` or session restart.
-- Batch CSV/JSONL swarm jobs are not implemented yet.
+- Batch job state is restored after reload, but in-flight queued/running workers are conservatively marked lost/failed rather than resumed.
+- `report_agent_job_result` and output-schema validation are not implemented yet; the MVP records each worker's final summary/output/error.
 - Worktree isolation and merge workflows are not implemented yet.
 - `last_n_turns` and `full_sanitized` context modes are intentionally rejected until a stronger sanitizer/summarizer exists.
 
