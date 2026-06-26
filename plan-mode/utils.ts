@@ -25,6 +25,7 @@ const DESTRUCTIVE_PATTERNS = [
 	/\byarn\s+(add|remove|install|publish)/i,
 	/\bpnpm\s+(add|remove|install|publish)/i,
 	/\bpip\s+(install|uninstall)/i,
+	/\bruff\b[^\n;|&]*\s--(?:fix|fix-only|unsafe-fixes)\b/i,
 	/\bapt(-get)?\s+(install|remove|purge|update|upgrade)/i,
 	/\bbrew\s+(install|uninstall|upgrade)/i,
 	/\bgit\s+(add|am|apply|bisect|checkout|cherry-pick|clean|clone|commit|fetch|gc|init|merge|mv|notes|pull|push|rebase|reset|restore|revert|rm|stash|switch)/i,
@@ -92,6 +93,9 @@ const SAFE_PATTERNS = [
 	/^\s*yarn\s+(list|info|why|audit)/i,
 	/^\s*node\s+--version/i,
 	/^\s*python\s+--version/i,
+	/^\s*(?:(?:timeout\s+(?:--preserve-status\s+)?(?:-k\s+\S+\s+)?\S+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+))\s+)*(?:[~./\w-]+\/)*pytest(?:\s|$)/i,
+	/^\s*(?:(?:timeout\s+(?:--preserve-status\s+)?(?:-k\s+\S+\s+)?\S+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+))\s+)*(?:[~./\w-]+\/)*python(?:3(?:\.\d+)?)?\s+-m\s+pytest(?:\s|$)/i,
+	/^\s*(?:(?:timeout\s+(?:--preserve-status\s+)?(?:-k\s+\S+\s+)?\S+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+))\s+)*(?:[~./\w-]+\/)*ruff\s+check(?:\s|$)/i,
 	/^\s*curl\s/i,
 	/^\s*wget\s+-O\s*-/i,
 	/^\s*jq\b/,
@@ -186,10 +190,97 @@ export function isSafeCommand(command: string): boolean {
 	return !isDestructive && isSafe;
 }
 
+export type TodoStatus = "pending" | "done" | "skipped" | "deferred" | "blocked";
+
 export interface TodoItem {
 	step: number;
 	text: string;
 	completed: boolean;
+	status?: TodoStatus;
+}
+
+export function getTodoStatus(item: TodoItem): TodoStatus {
+	if (item.status) return item.status;
+	return item.completed ? "done" : "pending";
+}
+
+export function setTodoStatus(item: TodoItem, status: TodoStatus): void {
+	item.status = status;
+	item.completed = status === "done";
+}
+
+export function isTodoDone(item: TodoItem): boolean {
+	return getTodoStatus(item) === "done";
+}
+
+export function isTodoClosed(item: TodoItem): boolean {
+	const status = getTodoStatus(item);
+	return status === "done" || status === "skipped" || status === "deferred";
+}
+
+export function isTodoOpen(item: TodoItem): boolean {
+	return !isTodoClosed(item);
+}
+
+function statusLabel(status: TodoStatus): string {
+	switch (status) {
+		case "done":
+			return "done";
+		case "skipped":
+			return "skipped";
+		case "deferred":
+			return "deferred";
+		case "blocked":
+			return "blocked";
+		default:
+			return "pending";
+	}
+}
+
+function statusCheckbox(status: TodoStatus): string {
+	switch (status) {
+		case "done":
+			return "[x]";
+		case "skipped":
+			return "[-]";
+		case "deferred":
+			return "[>]";
+		case "blocked":
+			return "[!]";
+		default:
+			return "[ ]";
+	}
+}
+
+export function renderPlanProgressMarkdown(items: TodoItem[]): string {
+	const lines = [
+		"<!-- pi-plan-progress:start -->",
+		"## Progress",
+		"",
+		"Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` pending.",
+		"",
+	];
+	for (const item of items) {
+		const status = getTodoStatus(item);
+		lines.push(`- ${statusCheckbox(status)} ${item.step}. ${item.text} _(${statusLabel(status)})_`);
+	}
+	lines.push("", "<!-- pi-plan-progress:end -->", "");
+	return lines.join("\n");
+}
+
+export function upsertPlanProgressSection(planMarkdown: string, items: TodoItem[]): string {
+	const section = renderPlanProgressMarkdown(items).trimEnd();
+	const pattern = /\n?<!-- pi-plan-progress:start -->[\s\S]*?<!-- pi-plan-progress:end -->\n?/;
+	if (pattern.test(planMarkdown)) {
+		return `${planMarkdown.replace(pattern, `\n\n${section}\n`)}`;
+	}
+	return `${planMarkdown.trimEnd()}\n\n${section}\n`;
+}
+
+export function hasHandoffClaim(text: string): boolean {
+	const normalized = stripMarkdownInline(text).replace(/\s+/g, " ").trim();
+	if (!normalized) return false;
+	return /\b(?:ready\s+for\s+(?:human\s+)?review|ready\s+to\s+(?:merge|review)|handoff|hand\s+off|leav(?:e|ing)\s+(?:it\s+)?for\s+(?:human\s+)?review|ci\s+(?:is\s+)?clean|checks?\s+(?:are\s+)?green|pr\s+(?:is\s+)?clean)\b/i.test(normalized);
 }
 
 interface MarkdownHeader {
@@ -234,26 +325,15 @@ function stripMarkdownInline(text: string): string {
 }
 
 export function cleanStepText(text: string): string {
-	let cleaned = stripMarkdownInline(text)
+	const cleaned = stripMarkdownInline(text)
 		.replace(/^\s*\[[ xX]\]\s+/, "")
 		.replace(/^\s*(?:step\s*)?\d+\s*[:.)-]\s*/i, "")
 		.replace(/^\s*[-*+]\s+/, "")
 		.replace(/\s+/g, " ")
 		.trim();
 
-	// Remove trailing explanation separators on very long list entries. This keeps the widget usable.
-	if (cleaned.length > 90) {
-		const split = cleaned.match(/^(.{25,90}?)(?:\s+[—–-]\s+|:\s+)/);
-		if (split?.[1]) cleaned = split[1].trim();
-	}
-
-	if (cleaned.length > 0) {
-		cleaned = cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
-	}
-	if (cleaned.length > 60) {
-		cleaned = `${cleaned.slice(0, 57)}...`;
-	}
-	return cleaned;
+	if (cleaned.length === 0) return cleaned;
+	return cleaned.charAt(0).toUpperCase() + cleaned.slice(1);
 }
 
 function dedentMarkdown(content: string): string {
@@ -559,6 +639,7 @@ export function extractTodoItemsFromProposedPlan(planContent: string): TodoItem[
 		step: index + 1,
 		text,
 		completed: false,
+		status: "pending" as const,
 	}));
 }
 
@@ -600,6 +681,73 @@ export function extractDoneSteps(message: string): number[] {
 	}
 
 	return [...steps].filter((step) => Number.isFinite(step));
+}
+
+function explicitDoneStatus(rest: string): boolean {
+	return /(?:✅|✓|✔|☑|\[x\]|\[DONE\]|\b(?:complete|completed|done|finished|resolved|implemented|verified)\b)/i.test(rest);
+}
+
+function explicitNonDoneStatus(rest: string): TodoStatus | undefined {
+	if (/\bskipped\b|\[-\]/i.test(rest)) return "skipped";
+	if (/\bdeferred\b|\[>\]/i.test(rest)) return "deferred";
+	if (/\bblocked\b|\[!\]/i.test(rest)) return "blocked";
+	const nonDoneWords = /\b(?:pending|partial|partially|in[ -]?progress|remaining|todo|to do|not done|not complete|incomplete|still pending|still required|still requires)\b/i;
+	const nonDoneMarkers = /(?:🟨|🟧|⚠️?|⏳|⌛|☐|□|⬜|\[ \])/i;
+	if (nonDoneMarkers.test(rest) || nonDoneWords.test(rest)) return "pending";
+	return undefined;
+}
+
+function extractExplicitNonDoneStepStatuses(message: string): Map<number, TodoStatus> {
+	const steps = new Map<number, TodoStatus>();
+	for (const rawLine of message.split("\n")) {
+		const line = rawLine.trim();
+		if (!line) continue;
+
+		for (const doneStep of extractDoneSteps(line)) steps.delete(doneStep);
+
+		const numbered = line.match(/^(?:[-*+]\s*)?(\d+)\s*[.)|-]?\s*(.*)$/);
+		if (numbered) {
+			const step = Number(numbered[1]);
+			const rest = numbered[2] ?? "";
+			const status = explicitNonDoneStatus(rest);
+			if (Number.isFinite(step) && status) {
+				steps.set(step, status);
+				continue;
+			}
+			if (Number.isFinite(step) && explicitDoneStatus(rest)) steps.delete(step);
+			continue;
+		}
+
+		const named = line.match(/(?:step|phase|task|item)\s*(\d+)\b(.*)$/i);
+		if (named) {
+			const step = Number(named[1]);
+			const rest = named[2] ?? "";
+			const status = explicitNonDoneStatus(rest);
+			if (Number.isFinite(step) && status) {
+				steps.set(step, status);
+				continue;
+			}
+			if (Number.isFinite(step) && explicitDoneStatus(rest)) steps.delete(step);
+		}
+	}
+	return steps;
+}
+
+function extractExplicitNonDoneSteps(message: string): Set<number> {
+	return new Set(extractExplicitNonDoneStepStatuses(message).keys());
+}
+
+export function markExplicitNonDoneSteps(text: string, items: TodoItem[]): number {
+	let marked = 0;
+	const statuses = extractExplicitNonDoneStepStatuses(text);
+	for (const [step, status] of statuses) {
+		const item = items.find((t) => t.step === step);
+		if (item && getTodoStatus(item) !== status) {
+			setTodoStatus(item, status);
+			marked++;
+		}
+	}
+	return marked;
 }
 
 /**
@@ -685,7 +833,7 @@ function primaryActionKeyword(text: string): string | undefined {
 }
 
 function completedPortion(text: string): string {
-	const split = text.split(/\n\s*#{1,6}\s+(?:still\s+requires|remaining|not\s+executed|to\s+do|todo|next\s+steps?|follow-?ups?)\b/i);
+	const split = text.split(/\n\s*#{1,6}\s+(?:current\s+status|status|still\s+requires|remaining|not\s+executed|to\s+do|todo|next\s+steps?|follow-?ups?)\b/i);
 	return split[0] ?? text;
 }
 
@@ -697,7 +845,7 @@ function fuzzyCompletedSteps(text: string, items: TodoItem[]): number[] {
 	}
 
 	for (const item of items) {
-		if (item.completed) continue;
+		if (!isTodoOpen(item)) continue;
 		const action = primaryActionKeyword(item.text);
 		if (action && !normalizedText.includes(action)) continue;
 		const keywords = progressKeywords(item.text);
@@ -715,7 +863,7 @@ export function heuristicCompletedSteps(text: string, items: TodoItem[]): number
 	const lines = text.split("\n");
 
 	for (const item of items) {
-		if (item.completed) continue; // already marked
+		if (!isTodoOpen(item)) continue; // already closed
 
 		for (const line of lines) {
 			const l = line.trim();
@@ -792,7 +940,8 @@ function indicatesWholePlanCompleted(text: string): boolean {
 	}
 
 	return (
-		/\b(?:all|every)\s+(?:plan\s+)?(?:steps?|tasks?|items?|phases?)\b.{0,90}\b(?:complete|completed|done|finished|implemented|verified)\b/i.test(normalized) ||
+		/\b(?:all|every)\s+(?:\d+\s+)?(?:plan\s+)?(?:steps?|tasks?|items?|phases?)\b.{0,90}\b(?:complete|completed|done|finished|implemented|verified)\b/i.test(normalized) ||
+		/\b(?:implemented|completed|finished|delivered|verified)\s+(?:all|every)\s+(?:\d+\s+)?(?:plan\s+)?(?:steps?|tasks?|items?|phases?)\b/i.test(normalized) ||
 		/\b(?:implemented|completed|finished|delivered)\b.{0,90}\b(?:plan|implementation|work|task)\b.{0,90}\b(?:end-to-end|fully|successfully|complete)\b/i.test(normalized) ||
 		/\b(?:plan|implementation|task|work)\s+(?:is\s+|now\s+)?(?:complete|completed|done|finished|delivered)\b/i.test(normalized)
 	);
@@ -800,11 +949,12 @@ function indicatesWholePlanCompleted(text: string): boolean {
 
 export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	let marked = 0;
+	const explicitNonDone = extractExplicitNonDoneSteps(text);
 
 	if (items.length > 0 && indicatesWholePlanCompleted(text)) {
 		for (const item of items) {
-			if (!item.completed) {
-				item.completed = true;
+			if (isTodoOpen(item) && !explicitNonDone.has(item.step)) {
+				setTodoStatus(item, "done");
 				marked++;
 			}
 		}
@@ -814,18 +964,18 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 	const doneSteps = extractDoneSteps(text);
 	for (const step of doneSteps) {
 		const item = items.find((t) => t.step === step);
-		if (item && !item.completed) {
-			item.completed = true;
+		if (item && !isTodoDone(item) && !explicitNonDone.has(step)) {
+			setTodoStatus(item, "done");
 			marked++;
 		}
 	}
 
-	// Fallback: heuristic detection
+	// Fallback: heuristic detection. Explicit pending/partial/blocked lines win over fuzzy matches.
 	const heuristicSteps = [...heuristicCompletedSteps(text, items), ...fuzzyCompletedSteps(text, items)];
 	for (const step of heuristicSteps) {
 		const item = items.find((t) => t.step === step);
-		if (item && !item.completed) {
-			item.completed = true;
+		if (item && !isTodoDone(item) && !explicitNonDone.has(step)) {
+			setTodoStatus(item, "done");
 			marked++;
 		}
 	}

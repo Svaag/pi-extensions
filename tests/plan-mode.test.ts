@@ -6,6 +6,7 @@ import {
 	extractTodoItemsFromProposedPlan,
 	isSafeCommand,
 	markCompletedSteps,
+	markExplicitNonDoneSteps,
 	type TodoItem,
 } from "../plan-mode/utils.ts";
 
@@ -30,6 +31,32 @@ test("plan mode allows read-only git and gh commands", () => {
 
 	for (const command of allowed) {
 		assert.equal(isSafeCommand(command), true, command);
+	}
+});
+
+test("plan mode allows pytest and ruff validation commands", () => {
+	const allowed = [
+		".venv/bin/pytest -q tests/test_hip4_*.py",
+		"PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q tests",
+		"timeout 120s python -m pytest tests/test_hip4_*.py",
+		".venv/bin/ruff check hyperliquid_trading_agent/app/hip4 tests/test_hip4_*.py",
+		"RUFF_CACHE_DIR=/tmp/pi-ruff-cache .venv/bin/ruff check .",
+	];
+
+	for (const command of allowed) {
+		assert.equal(isSafeCommand(command), true, command);
+	}
+});
+
+test("plan mode blocks mutating ruff validation commands", () => {
+	const blocked = [
+		"ruff check --fix .",
+		".venv/bin/ruff check --fix-only .",
+		"ruff check --unsafe-fixes .",
+	];
+
+	for (const command of blocked) {
+		assert.equal(isSafeCommand(command), false, command);
 	}
 });
 
@@ -80,6 +107,25 @@ test("extractTodoItemsFromProposedPlan prefers tracker-level implementation step
 	assert.deepEqual(
 		extractTodoItemsFromProposedPlan(plan).map((item) => item.text),
 		["Update the config loader.", "Refactor runtime paths.", "Add tests."],
+	);
+});
+
+test("extractTodoItemsFromProposedPlan preserves full tracker text", () => {
+	const plan = `# Plan
+
+## Implementation Steps
+1. Add config, storage schemas, migrations, and persistence helpers.
+2. Add Pi extension handoff, command aliases, docs, runbooks, and SKILL/README updates.
+3. Add full test/backtest/migration coverage and verify final acceptance criteria.
+`;
+
+	assert.deepEqual(
+		extractTodoItemsFromProposedPlan(plan).map((item) => item.text),
+		[
+			"Add config, storage schemas, migrations, and persistence helpers.",
+			"Add Pi extension handoff, command aliases, docs, runbooks, and SKILL/README updates.",
+			"Add full test/backtest/migration coverage and verify final acceptance criteria.",
+		],
 	);
 });
 
@@ -181,6 +227,45 @@ Hardened daemon rollout: default daemon repo scope is now the seven core repos, 
 
 	assert.equal(markCompletedSteps(summary, items), 3);
 	assert.deepEqual(items.map((item) => item.completed), [true, true, true, false, false]);
+});
+
+test("markCompletedSteps respects explicit partial and pending status lines", () => {
+	const items = todos([
+		"Run preflight checklist and lock current repo state.",
+		"Add config, storage schemas, migrations, and persistence helpers.",
+		"Add BufferOfThought, focal contexts, compaction, export/import, sanitization, and quality checks.",
+		"Add Pi extension handoff, command aliases, docs, runbooks, and SKILL/README updates.",
+	]);
+
+	const summary = `Implemented initial execution through the vertical-slice foundation.
+
+## Current status
+
+Completed steps: 1-2
+1. ✅ Preflight
+2. ✅ Storage/config/migration foundation
+3. 🟨 BufferOfThought foundation added; import persistence/debug retention still pending
+4. ☐ Pi extension/docs/SKILL updates pending
+`;
+
+	assert.equal(markExplicitNonDoneSteps(summary, items), 0);
+	assert.equal(markCompletedSteps(summary, items), 2);
+	assert.deepEqual(items.map((item) => item.status ?? (item.completed ? "done" : "pending")), ["done", "done", "pending", "pending"]);
+});
+
+test("markExplicitNonDoneSteps can repair previously false-completed steps", () => {
+	const items = todos(["First", "Second", "Third"]);
+	for (const item of items) {
+		item.completed = true;
+		item.status = "done";
+	}
+
+	const summary = `1. ✅ First
+2. 🟨 Second partial
+3. ☐ Third pending`;
+
+	assert.equal(markExplicitNonDoneSteps(summary, items), 2);
+	assert.deepEqual(items.map((item) => item.status ?? (item.completed ? "done" : "pending")), ["done", "pending", "pending"]);
 });
 
 test("extractDoneSteps parses multiple tag and phrase formats", () => {

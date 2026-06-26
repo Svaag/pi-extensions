@@ -16,22 +16,33 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { Type } from "typebox";
 import {
 	extractProposedPlan,
 	extractTodoItemsFromProposedPlan,
+	hasHandoffClaim,
 	isSafeCommand,
+	isTodoClosed,
+	isTodoDone,
+	isTodoOpen,
 	markCompletedSteps,
+	markExplicitNonDoneSteps,
+	renderPlanProgressMarkdown,
+	setTodoStatus,
+	upsertPlanProgressSection,
 	type TodoItem,
+	type TodoStatus,
 } from "./utils.js";
 
 const DEFAULT_NORMAL_TOOLS = ["read", "bash", "edit", "write"];
 const PLAN_QUESTIONS_TOOL = "plan_questions";
 const MUTATING_TOOLS_IN_PLAN_MODE = new Set(["edit", "write"]);
 const PLAN_AGENT_CONTEXT_CAP = 120_000;
+const MAX_PLAN_ROOT_CHOICES = 6;
+const PLAN_ROOT_SCORE_THRESHOLD = 60;
 
 // Type guard for assistant messages
 function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
@@ -292,7 +303,12 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let lastProposedPlan = "";
 	let todoItems: TodoItem[] = [];
 	let savedTools: string[] = [];
+	let savedPlanAbsolutePath: string | undefined;
+	let savedPlanRelativePath: string | undefined;
+	let savedPlanRoot: string | undefined;
 	let pendingEmptyContextPlanPath: string | undefined;
+	let contextResetActive = false;
+	const PLAN_CONTEXT_RESET_CUSTOM_TYPE = "plan-empty-context-execute";
 
 	pi.registerFlag("plan", {
 		description: "Start in plan mode (read-only planning and exploration)",
@@ -300,32 +316,179 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		default: false,
 	});
 
-	async function projectRoot(ctx: ExtensionContext): Promise<string> {
-		const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], {
+	async function gitRootForPath(path: string, ctx: ExtensionContext): Promise<string | undefined> {
+		const result = await pi.exec("git", ["-C", path, "rev-parse", "--show-toplevel"], {
 			cwd: ctx.cwd,
 			timeout: 5000,
 			signal: ctx.signal,
 		});
-		if (result.code === 0) {
-			const root = result.stdout.trim().split("\n").pop()?.trim();
-			if (root) return root;
+		if (result.code === 0) return result.stdout.trim().split("\n").pop()?.trim() || undefined;
+		return undefined;
+	}
+
+	async function projectRoot(ctx: ExtensionContext): Promise<string> {
+		return (await gitRootForPath(ctx.cwd, ctx)) ?? ctx.cwd;
+	}
+
+	async function hasGitMetadata(path: string): Promise<boolean> {
+		try {
+			await stat(join(path, ".git"));
+			return true;
+		} catch {
+			return false;
 		}
-		return ctx.cwd;
+	}
+
+	function pathBaseName(path: string): string {
+		return path.split(/[\\/]+/).filter(Boolean).pop() ?? path;
+	}
+
+	function shouldSkipRepoSearchDir(name: string): boolean {
+		return name.startsWith(".") || ["node_modules", "vendor", "dist", "build", "target", "__pycache__"].includes(name);
+	}
+
+	async function discoverGitRootsUnder(searchRoot: string, ctx: ExtensionContext, maxDepth = 3): Promise<string[]> {
+		const roots = new Set<string>();
+		const visited = new Set<string>();
+
+		async function walk(dir: string, depth: number): Promise<void> {
+			if (depth >= maxDepth || visited.has(dir)) return;
+			visited.add(dir);
+
+			let entries: { name: string; isDirectory(): boolean }[];
+			try {
+				entries = await readdir(dir, { withFileTypes: true });
+			} catch {
+				return;
+			}
+
+			for (const entry of entries) {
+				if (!entry.isDirectory() || shouldSkipRepoSearchDir(entry.name)) continue;
+				const child = join(dir, entry.name);
+
+				if (await hasGitMetadata(child)) {
+					const gitRoot = await gitRootForPath(child, ctx);
+					if (gitRoot) {
+						roots.add(gitRoot);
+						continue;
+					}
+				}
+
+				await walk(child, depth + 1);
+			}
+		}
+
+		await walk(searchRoot, 0);
+		return [...roots];
+	}
+
+	function addParentSearchRoot(searchRoots: Set<string>, path: string): void {
+		const parent = dirname(path);
+		if (parent !== path && parent !== homedir()) searchRoots.add(parent);
+	}
+
+	async function discoverPlanRootCandidates(ctx: ExtensionContext, defaultRoot: string): Promise<string[]> {
+		const candidates = new Set<string>([defaultRoot]);
+		const searchRoots = new Set<string>([defaultRoot, ctx.cwd]);
+		addParentSearchRoot(searchRoots, defaultRoot);
+		addParentSearchRoot(searchRoots, ctx.cwd);
+
+		const cwdRoot = await gitRootForPath(ctx.cwd, ctx);
+		if (cwdRoot) candidates.add(cwdRoot);
+
+		for (const searchRoot of searchRoots) {
+			for (const root of await discoverGitRootsUnder(searchRoot, ctx)) candidates.add(root);
+		}
+
+		return [...candidates];
+	}
+
+	function scorePlanRootCandidate(root: string, plan: string): number {
+		const base = pathBaseName(root).toLowerCase();
+		if (base.length < 3) return 0;
+
+		const normalizedPlan = plan.toLowerCase();
+		let score = 0;
+		if (normalizedPlan.includes(`/${base}`)) score += 120;
+		if (normalizedPlan.includes(` ${base}`)) score += 80;
+		if (normalizedPlan.includes(`\`${base}\``)) score += 100;
+		if (new RegExp(`\\b${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(plan)) score += 60;
+		return score;
+	}
+
+	function planRootOptionLabel(root: string, defaultRoot: string, detectedRoot: string | undefined, score: number): string {
+		const display = `${pathBaseName(root)} — ${root}`;
+		if (root === detectedRoot && score > 0 && root === defaultRoot) return `Use current project root (matched plan): ${display}`;
+		if (root === detectedRoot && score > 0) return `Use best matched repo: ${display}`;
+		if (root === defaultRoot) return `Use current project root: ${display}`;
+		if (score > 0) return `Use matched repo: ${display}`;
+		return `Use repo: ${display}`;
+	}
+
+	async function choosePlanRoot(ctx: ExtensionContext, defaultRoot: string): Promise<string> {
+		const candidates = await discoverPlanRootCandidates(ctx, defaultRoot);
+		const scored = candidates
+			.map((root) => ({ root, score: scorePlanRootCandidate(root, lastProposedPlan) }))
+			.sort((a, b) => b.score - a.score || a.root.localeCompare(b.root));
+		const detected = scored.find((candidate) => candidate.score >= PLAN_ROOT_SCORE_THRESHOLD);
+
+		if (!ctx.hasUI) return detected?.root ?? defaultRoot;
+
+		const sortedForUi = scored
+			.filter((candidate) => candidate.root === defaultRoot || candidate.score >= PLAN_ROOT_SCORE_THRESHOLD)
+			.sort((a, b) => {
+				const rank = (candidate: { root: string; score: number }) =>
+					candidate.root === detected?.root && candidate.score >= PLAN_ROOT_SCORE_THRESHOLD ? 0 : candidate.root === defaultRoot ? 1 : 2;
+				const rankDiff = rank(a) - rank(b);
+				if (rankDiff !== 0) return rankDiff;
+				return b.score - a.score || pathBaseName(a.root).localeCompare(pathBaseName(b.root)) || a.root.localeCompare(b.root);
+			});
+
+		if (!sortedForUi.some((candidate) => candidate.root === defaultRoot)) {
+			sortedForUi.push({ root: defaultRoot, score: 0 });
+		}
+
+		const limitedForUi = sortedForUi.slice(0, MAX_PLAN_ROOT_CHOICES);
+		if (limitedForUi.length <= 1) return defaultRoot;
+
+		const hiddenCount = sortedForUi.length - limitedForUi.length;
+		if (hiddenCount > 0) {
+			ctx.ui.notify(`Plan save repo picker narrowed to ${limitedForUi.length} likely choices; ${hiddenCount} lower-ranked matches hidden.`, "info");
+		}
+
+		const labels: string[] = [];
+		const rootsByLabel = new Map<string, string>();
+		for (const candidate of limitedForUi) {
+			const label = planRootOptionLabel(candidate.root, defaultRoot, detected?.root, candidate.score);
+			labels.push(label);
+			rootsByLabel.set(label, candidate.root);
+		}
+		labels.push("Cancel execution");
+
+		const choice = await ctx.ui.select("Save accepted plan under which project?", labels);
+		const selectedRoot = choice ? rootsByLabel.get(choice) : undefined;
+		if (selectedRoot) return selectedRoot;
+		throw new Error("Plan execution cancelled before saving because no project root was selected.");
 	}
 
 	async function savePlanForExecution(ctx: ExtensionContext): Promise<string> {
 		if (!lastProposedPlan.trim()) throw new Error("No proposed plan is available to save.");
 
-		const root = await projectRoot(ctx);
+		const defaultRoot = await projectRoot(ctx);
+		const root = await choosePlanRoot(ctx, defaultRoot);
 		const plansDir = join(root, "docs", "plans");
 		await mkdir(plansDir, { recursive: true });
 
 		const title = planTitle(lastProposedPlan);
 		const filename = `${timestampForFilename()}-${slugifyPlanTitle(title)}.md`;
 		const absolutePath = join(plansDir, filename);
-		await writeFile(absolutePath, buildSavedPlanMarkdown(lastProposedPlan), "utf8");
+		await writeFile(absolutePath, upsertPlanProgressSection(buildSavedPlanMarkdown(lastProposedPlan), todoItems), "utf8");
 
 		const relativePath = relative(root, absolutePath) || absolutePath;
+		const displayPath = relative(ctx.cwd, absolutePath) || absolutePath;
+		savedPlanAbsolutePath = absolutePath;
+		savedPlanRelativePath = relativePath;
+		savedPlanRoot = root;
 		pi.appendEntry("plan-mode-saved-plan", {
 			path: absolutePath,
 			relativePath,
@@ -333,7 +496,29 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			title,
 			savedAt: new Date().toISOString(),
 		});
-		return relativePath;
+		return displayPath;
+	}
+
+	async function updateSavedPlanProgress(ctx: ExtensionContext): Promise<void> {
+		if (!savedPlanAbsolutePath || todoItems.length === 0) return;
+		try {
+			const existing = await readFile(savedPlanAbsolutePath, "utf8");
+			await writeFile(savedPlanAbsolutePath, upsertPlanProgressSection(existing, todoItems), "utf8");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Could not update saved plan progress in ${savedPlanRelativePath ?? savedPlanAbsolutePath}: ${message}`, "warning");
+		}
+	}
+
+	function buildPlanOnlyExecutionPrompt(savedPlanPath: string): string {
+		const firstStep = todoItems[0]?.text ?? "the first implementation step";
+		return `Implement the plan saved at ${savedPlanPath}.
+
+<proposed_plan>
+${lastProposedPlan}
+</proposed_plan>
+
+Start with step 1: ${firstStep}`;
 	}
 
 	pi.registerTool({
@@ -831,8 +1016,8 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	function updateStatus(ctx: ExtensionContext): void {
 		// Footer status
 		if (executionMode && todoItems.length > 0) {
-			const completed = todoItems.filter((t: TodoItem) => t.completed).length;
-			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("accent", `📋 ${completed}/${todoItems.length}`));
+			const closed = todoItems.filter((t: TodoItem) => isTodoClosed(t)).length;
+			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("accent", `📋 ${closed}/${todoItems.length}`));
 		} else if (planModeEnabled) {
 			ctx.ui.setStatus("plan-mode", ctx.ui.theme.fg("warning", "⏸ plan"));
 		} else {
@@ -842,17 +1027,43 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		// Widget showing todo list
 		if (executionMode && todoItems.length > 0) {
 			const lines = todoItems.map((item: TodoItem) => {
-				if (item.completed) {
+				const status = item.status ?? (item.completed ? "done" : "pending");
+				if (isTodoDone(item)) {
 					return (
 						ctx.ui.theme.fg("success", "☑ ") + ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
 					);
 				}
+				if (status === "skipped") return `${ctx.ui.theme.fg("muted", "⊘ ")}${ctx.ui.theme.strikethrough(item.text)}`;
+				if (status === "deferred") return `${ctx.ui.theme.fg("warning", "↷ ")}${item.text}`;
+				if (status === "blocked") return `${ctx.ui.theme.fg("error", "⚠ ")}${item.text}`;
 				return `${ctx.ui.theme.fg("muted", "☐ ")}${item.text}`;
 			});
 			ctx.ui.setWidget("plan-todos", lines);
 		} else {
 			ctx.ui.setWidget("plan-todos", undefined);
 		}
+	}
+
+	async function finishPlanExecutionIfComplete(ctx: ExtensionContext): Promise<boolean> {
+		if (!executionMode || todoItems.length === 0 || !todoItems.every((todo: TodoItem) => isTodoClosed(todo))) {
+			return false;
+		}
+
+		await updateSavedPlanProgress(ctx);
+		const completedList = todoItems
+			.map((todo: TodoItem) => `${isTodoDone(todo) ? "✓" : "↷"} ${todo.text} (${todo.status ?? (todo.completed ? "done" : "pending")})`)
+			.join("\n");
+		pi.sendMessage(
+			{ customType: "plan-complete", content: `**Plan Complete!** ✓\n\n${completedList}`, display: true },
+			{ triggerTurn: false },
+		);
+		executionMode = false;
+		contextResetActive = false;
+		todoItems = [];
+		restoreSavedTools();
+		updateStatus(ctx);
+		persistState();
+		return true;
 	}
 
 	function normalizeToolNames(tools: unknown): string[] {
@@ -912,8 +1123,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			pi.setActiveTools(planModeToolNames(savedTools));
 			lastProposedPlan = "";
 			todoItems = [];
+			contextResetActive = false;
 			ctx.ui.notify(`Plan mode enabled. Mutating tools (edit/write) disabled.`);
 		} else {
+			contextResetActive = false;
 			restoreSavedTools();
 			ctx.ui.notify("Plan mode disabled. Full access restored.");
 		}
@@ -928,11 +1141,36 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			executing: executionMode,
 			lastProposedPlan: lastProposedPlan,
 			savedTools: savedTools,
+			savedPlanAbsolutePath,
+			savedPlanRelativePath,
+			savedPlanRoot,
+			contextResetActive,
 		});
 	}
 
 	function sameTodoTexts(a: TodoItem[], b: TodoItem[]): boolean {
 		return a.length === b.length && a.every((item, index) => item.text.toLowerCase() === b[index]?.text.toLowerCase());
+	}
+
+	function normalizeTodoTextForMigration(text: string): string {
+		return text
+			.toLowerCase()
+			.replace(/\.\.\.$/, "")
+			.replace(/[^a-z0-9]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim();
+	}
+
+	function findPreviousTodoForReparsed(item: TodoItem, previousItems: TodoItem[], sameLength: boolean): TodoItem | undefined {
+		const normalized = normalizeTodoTextForMigration(item.text);
+		const exact = previousItems.find((todo: TodoItem) => normalizeTodoTextForMigration(todo.text) === normalized);
+		if (exact) return exact;
+		const prefix = previousItems.find((todo: TodoItem) => {
+			const previous = normalizeTodoTextForMigration(todo.text);
+			return previous.length >= 20 && normalized.startsWith(previous);
+		});
+		if (prefix) return prefix;
+		return sameLength ? previousItems.find((todo: TodoItem) => todo.step === item.step) : undefined;
 	}
 
 	function parseStepSpec(spec: string): number[] {
@@ -961,6 +1199,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 			if (/^(cancel|stop|clear|reset)\b/i.test(command)) {
 				planModeEnabled = false;
 				executionMode = false;
+				contextResetActive = false;
 				todoItems = [];
 				restoreSavedTools();
 				persistState();
@@ -973,7 +1212,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("todos", {
-		description: "Show or update current plan todo list. Usage: /todos, /todos done 1-3, /todos reset",
+		description: "Show or update current plan todo list. Usage: /todos, /todos done|skip|defer|block|open 1-3, /todos reset",
 		handler: async (args: any, ctx: ExtensionContext) => {
 			const command = String(args ?? "").trim();
 			if (todoItems.length === 0) {
@@ -981,68 +1220,95 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				return;
 			}
 
-			if (/^(done|mark|complete)\b/i.test(command)) {
-				const steps = parseStepSpec(command.replace(/^(done|mark|complete)\b/i, ""));
+			const stateMatch = command.match(/^(done|mark|complete|skip|skipped|defer|deferred|block|blocked|open|reopen|pending)\b/i);
+			if (stateMatch) {
+				const verb = stateMatch[1].toLowerCase();
+				const status: TodoStatus = /^(done|mark|complete)$/.test(verb)
+					? "done"
+					: /^skip/.test(verb)
+						? "skipped"
+						: /^defer/.test(verb)
+							? "deferred"
+							: /^block/.test(verb)
+								? "blocked"
+								: "pending";
+				const steps = parseStepSpec(command.slice(stateMatch[0].length));
 				let changed = 0;
 				for (const step of steps) {
 					const item = todoItems.find((todo: TodoItem) => todo.step === step);
-					if (item && !item.completed) {
-						item.completed = true;
+					if (item && (item.status ?? (item.completed ? "done" : "pending")) !== status) {
+						setTodoStatus(item, status);
 						changed++;
 					}
 				}
 				persistState();
-				updateStatus(ctx);
-				ctx.ui.notify(changed > 0 ? `Marked ${changed} step(s) done.` : "No matching unfinished steps.", "info");
+				const completedPlan = await finishPlanExecutionIfComplete(ctx);
+				if (!completedPlan) {
+					await updateSavedPlanProgress(ctx);
+					updateStatus(ctx);
+				}
+				ctx.ui.notify(changed > 0 ? `Marked ${changed} step(s) ${status}.` : "No matching steps changed.", "info");
 				return;
 			}
 
 			if (/^reset\b/i.test(command)) {
-				for (const item of todoItems) item.completed = false;
+				for (const item of todoItems) setTodoStatus(item, "pending");
 				persistState();
+				await updateSavedPlanProgress(ctx);
 				updateStatus(ctx);
 				ctx.ui.notify("Reset plan progress.", "info");
 				return;
 			}
 
-			const list = todoItems.map((item: TodoItem, i: number) => `${i + 1}. ${item.completed ? "✓" : "○"} ${item.text}`).join("\n");
-			ctx.ui.notify(`Plan Progress:\n${list}`, "info");
+			ctx.ui.notify(`Plan Progress:\n${renderPlanProgressMarkdown(todoItems)}`, "info");
 		},
 	});
 
 	pi.registerCommand("plan-start-empty-context", {
-		description: "Start implementing the accepted plan in a fresh session with only the plan as context",
+		description: "Advanced: start implementing the accepted plan in a fresh session with only the plan as context",
 		handler: async (_args: any, ctx: ExtensionCommandContext) => {
-			const savedPlanPath = pendingEmptyContextPlanPath;
+			let savedPlanPath = pendingEmptyContextPlanPath ?? savedPlanRelativePath ?? savedPlanAbsolutePath;
 			pendingEmptyContextPlanPath = undefined;
 
-			if (!savedPlanPath || !lastProposedPlan.trim() || todoItems.length === 0) {
-				ctx.ui.notify("No pending empty-context plan. Propose and accept a plan first.", "error");
+			if (!lastProposedPlan.trim() || todoItems.length === 0) {
+				ctx.ui.notify("No accepted plan is available. Propose and accept a plan first.", "error");
 				return;
 			}
 
-			const planOnlyPrompt = `Implement the plan saved at ${savedPlanPath}.\n\n<proposed_plan>\n${lastProposedPlan}\n</proposed_plan>\n\nStart with step 1: ${todoItems[0].text}`;
+			if (!savedPlanPath) {
+				try {
+					savedPlanPath = await savePlanForExecution(ctx);
+					ctx.ui.notify(`Saved accepted plan to ${savedPlanPath}`, "info");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Could not save the accepted plan; fresh-session start cancelled.\n${message}`, "error");
+					return;
+				}
+			}
+
+			const planOnlyPrompt = buildPlanOnlyExecutionPrompt(savedPlanPath);
+			const executionTodos = todoItems.map((item) => ({ ...item }));
 
 			const result = await ctx.newSession({
 				parentSession: ctx.sessionManager.getSessionFile(),
 				setup: async (sm) => {
-					// Seed the new session with the plan as the only context message
-					sm.appendMessage({
-						role: "user",
-						content: [{ type: "text" as const, text: planOnlyPrompt }],
-						timestamp: Date.now(),
-					});
-					// Persist plan-mode state so the new session shows the todo widget and tracks progress
+					// Persist plan-mode state so the new session shows the todo widget and tracks progress.
+					// The actual user prompt is sent in withSession so it triggers the first implementation turn.
 					sm.appendCustomEntry("plan-mode", {
 						enabled: false,
-						todos: todoItems,
+						todos: executionTodos,
 						executing: true,
 						lastProposedPlan,
 						savedTools,
+						savedPlanAbsolutePath,
+						savedPlanRelativePath,
+						savedPlanRoot,
+						contextResetActive: false,
 					});
 				},
 				withSession: async (newCtx) => {
 					newCtx.ui.notify("Started implementation in a fresh session with the plan only.", "info");
+					await newCtx.sendUserMessage(planOnlyPrompt);
 				},
 			});
 
@@ -1070,18 +1336,28 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Filter out stale plan mode context when not in plan mode
+	// Filter context for Plan Mode bookkeeping and optional reset-context execution.
 	pi.on("context", async (event: any) => {
-		if (planModeEnabled) return;
+		let messages = [...event.messages];
 
-		return {
-			messages: event.messages.filter((m: any) => {
+		if (contextResetActive) {
+			let resetIndex = -1;
+			for (let i = messages.length - 1; i >= 0; i--) {
+				if ((messages[i] as AgentMessage & { customType?: string }).customType === PLAN_CONTEXT_RESET_CUSTOM_TYPE) {
+					resetIndex = i;
+					break;
+				}
+			}
+			if (resetIndex >= 0) messages = messages.slice(resetIndex);
+		}
+
+		if (!planModeEnabled) {
+			messages = messages.filter((m: any) => {
 				const msg = m as AgentMessage & { customType?: string };
-				if (
-					msg.customType === "plan-mode-context" ||
-					msg.customType === "plan-refinement-context" ||
-					msg.customType === "plan-execution-context"
-				) {
+				if (msg.customType === "plan-mode-context" || msg.customType === "plan-refinement-context") {
+					return false;
+				}
+				if (msg.customType === "plan-execution-context" && !executionMode) {
 					return false;
 				}
 				if (msg.role !== "user") return true;
@@ -1096,8 +1372,10 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 					);
 				}
 				return true;
-			}),
-		};
+			});
+		}
+
+		return { messages };
 	});
 
 	// Inject plan/execution context before agent starts
@@ -1144,7 +1422,7 @@ You may explore and execute **non-mutating** actions that improve the plan. You 
 Actions that gather truth, reduce ambiguity, or validate feasibility without changing repo-tracked state. Examples:
 * Reading or searching files, configs, schemas, types, manifests, and docs
 * Static analysis, inspection, and repo exploration
-* Read-only Git and GitHub CLI queries such as `git status`, `git log`, `git diff`, `gh pr view`, and `gh issue list`
+* Read-only Git and GitHub CLI queries such as \`git status\`, \`git log\`, \`git diff\`, \`gh pr view\`, and \`gh issue list\`
 * Dry-run style commands when they do not edit repo-tracked files
 * Tests, builds, or checks that do not edit repo-tracked files
 
@@ -1234,9 +1512,9 @@ If the user stays in Plan mode and asks for revisions after a prior \`<proposed_
 		}
 
 		if (executionMode && todoItems.length > 0) {
-			const remaining = todoItems.filter((t: TodoItem) => !t.completed);
+			const remaining = todoItems.filter((t: TodoItem) => isTodoOpen(t));
 			const todoList = remaining.map((t: TodoItem) => `${t.step}. ${t.text}`).join("\n");
-			const allSteps = todoItems.map((t: TodoItem) => `Step ${t.step}: ${t.text}`).join("\n");
+			const allSteps = todoItems.map((t: TodoItem) => `Step ${t.step}: ${t.text} (${t.status ?? (t.completed ? "done" : "pending")})`).join("\n");
 			return {
 				message: {
 					customType: "plan-execution-context",
@@ -1250,7 +1528,11 @@ ${allSteps}
 
 **IMPORTANT**: As you complete each step, you MUST mark it done by including a [DONE:n] tag in your response (e.g. [DONE:1] for step 1, [DONE:5] for step 5). Place the tag right after the section that completes the step, or end your response with a concise status line like \`Completed steps: 1-3\`. Multiple [DONE:n] tags can be included in one response if you complete multiple steps.
 
-If you only partially complete the plan, include exactly which step numbers are now complete. Do not omit this even if you also provide a prose summary. Without these tags or a clear completion status line, the progress tracker may not update.`,
+If the user explicitly skips or defers a step, run \`/todos skip <n>\` or \`/todos defer <n>\` instead of claiming it is done. If a step is blocked, run \`/todos block <n>\` and explain the blocker.
+
+Before saying a PR is ready, clean, or ready for human review, check both CI and review state. For GitHub PR work, inspect normal comments and inline review comments/threads (for example with \`gh pr checks\`, \`gh pr view --comments\`, \`gh api repos/:owner/:repo/pulls/:number/comments\`, and GraphQL review thread queries where needed). Resolve or respond to actionable automated-review comments before handoff.
+
+If you only partially complete the plan, include exactly which step numbers are now complete, skipped, deferred, or blocked. Do not omit this even if you also provide a prose summary. Without these tags or \`/todos\` updates, the progress tracker may not update.`,
 					display: false,
 				},
 			};
@@ -1263,8 +1545,22 @@ If you only partially complete the plan, include exactly which step numbers are 
 		if (!isAssistantMessage(event.message)) return;
 
 		const text = getTextContent(event.message);
-		if (markCompletedSteps(text, todoItems) > 0) {
+		if (markExplicitNonDoneSteps(text, todoItems) + markCompletedSteps(text, todoItems) > 0) {
+			await updateSavedPlanProgress(ctx);
 			updateStatus(ctx);
+		}
+		if (hasHandoffClaim(text)) {
+			const open = todoItems.filter((item: TodoItem) => isTodoOpen(item));
+			if (open.length > 0) {
+				pi.sendMessage(
+					{
+						customType: "plan-handoff-warning",
+						content: `⚠️ **Plan handoff warning:** this response sounds like a handoff, but ${open.length} plan item(s) are still open. Mark them done, skipped, deferred, or blocked with \`/todos done|skip|defer|block <n>\` before handing off.\n\n${open.map((item) => `${item.step}. ${item.text}`).join("\n")}`,
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+			}
 		}
 		persistState();
 	});
@@ -1273,18 +1569,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 	pi.on("agent_end", async (event: any, ctx: ExtensionContext) => {
 		// Check if execution is complete
 		if (executionMode && todoItems.length > 0) {
-			if (todoItems.every((t: TodoItem) => t.completed)) {
-				const completedList = todoItems.map((t: TodoItem) => `~~${t.text}~~`).join("\n");
-				pi.sendMessage(
-					{ customType: "plan-complete", content: `**Plan Complete!** ✓\n\n${completedList}`, display: true },
-					{ triggerTurn: false },
-				);
-				executionMode = false;
-				todoItems = [];
-				restoreSavedTools();
-				updateStatus(ctx);
-				persistState();
-			}
+			await finishPlanExecutionIfComplete(ctx);
 			return;
 		}
 
@@ -1305,12 +1590,28 @@ If you only partially complete the plan, include exactly which step numbers are 
 		}
 
 		// Prompt user if a proposed plan was found in this turn
+		if (hasNewPlan && todoItems.length === 0) {
+			pi.sendMessage(
+				{
+					customType: "plan-format-warning",
+					content:
+						"⚠️ **Plan format warning:** found a `<proposed_plan>` block, but could not find a dedicated `## Implementation Steps`, `## Execution Steps`, or `## Action Plan` section with tracker-level items. Ask for a revised plan with only executable work items in that section; requirements, checks, tests, and rollout details should stay in separate sections.",
+					display: true,
+				},
+				{ triggerTurn: false },
+			);
+			ctx.ui.notify("Proposed plan needs a dedicated implementation/action steps section before execution can start.", "warning");
+			updateStatus(ctx);
+			return;
+		}
+
 		if (hasNewPlan && todoItems.length > 0) {
 			const todoListText = todoItems.map((t: TodoItem, i: number) => `${i + 1}. ☐ ${t.text}`).join("\n");
+			const title = planTitle(lastProposedPlan);
 			pi.sendMessage(
 				{
 					customType: "plan-todo-list",
-					content: `**Proposed Implementation Steps (${todoItems.length}):**\n\n${todoListText}`,
+					content: `**Tracked Implementation Steps (${todoItems.length}) — ${title}:**\n\n${todoListText}\n\n_This replaces any earlier proposed implementation-step list in this session._`,
 					display: true,
 				},
 				{ triggerTurn: false },
@@ -1318,12 +1619,12 @@ If you only partially complete the plan, include exactly which step numbers are 
 
 			const choice = await ctx.ui.select("Plan proposed - what next?", [
 				"Start Implementation in current session",
-				"Start Implementation in fresh session with empty context",
+				"Start Implementation with reset model context",
 				"Refine the plan (provide feedback)",
 				"Stay in plan mode",
 			]);
 
-			if (choice?.startsWith("Start Implementation in fresh session")) {
+			if (choice?.startsWith("Start Implementation with reset model context")) {
 				let savedPlanPath: string;
 				try {
 					savedPlanPath = await savePlanForExecution(ctx);
@@ -1336,11 +1637,19 @@ If you only partially complete the plan, include exactly which step numbers are 
 					return;
 				}
 
-				// ctx.newSession is only available in ExtensionCommandContext, not event handlers.
-				// Hand off to the /plan-start-empty-context command so the replacement runs safely.
-				pendingEmptyContextPlanPath = savedPlanPath;
-				// agent_end is still inside Pi's active processing window; queue follow-up input until idle.
-				pi.sendUserMessage("/plan-start-empty-context", { deliverAs: "followUp" });
+				planModeEnabled = false;
+				executionMode = true;
+				contextResetActive = true;
+				restoreSavedTools();
+				updateStatus(ctx);
+				persistState();
+
+				const planOnlyPrompt = `[PLAN CONTEXT RESET]\n\n${buildPlanOnlyExecutionPrompt(savedPlanPath)}\n\nThe model context for this execution turn is intentionally reset to this marker plus later messages; previous planning conversation is excluded by the Plan Mode extension.`;
+				pi.sendMessage(
+					{ customType: PLAN_CONTEXT_RESET_CUSTOM_TYPE, content: planOnlyPrompt, display: true },
+					{ triggerTurn: true },
+				);
+				ctx.ui.notify("Started implementation with reset model context. The old transcript remains visible, but is excluded from model context from this marker onward.", "info");
 				return;
 			}
 
@@ -1359,6 +1668,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 
 				planModeEnabled = false;
 				executionMode = true;
+				contextResetActive = false;
 				restoreSavedTools();
 				updateStatus(ctx);
 				persistState();
@@ -1400,9 +1710,15 @@ If you only partially complete the plan, include exactly which step numbers are 
 						executing?: boolean;
 						lastProposedPlan?: string;
 						savedTools?: string[];
+						savedPlanAbsolutePath?: string;
+						savedPlanRelativePath?: string;
+						savedPlanRoot?: string;
+						contextResetActive?: boolean;
 					};
 			  }
 			| undefined;
+
+		let restoredPlanProgressNeedsWrite = false;
 
 		if (planModeEntry?.data) {
 			planModeEnabled = planModeEntry.data.enabled ?? planModeEnabled;
@@ -1412,6 +1728,10 @@ If you only partially complete the plan, include exactly which step numbers are 
 			savedTools = existingToolNames(normalizeToolNames(planModeEntry.data.savedTools ?? savedTools)).filter(
 				(name: string) => name !== PLAN_QUESTIONS_TOOL,
 			);
+			savedPlanAbsolutePath = planModeEntry.data.savedPlanAbsolutePath ?? savedPlanAbsolutePath;
+			savedPlanRelativePath = planModeEntry.data.savedPlanRelativePath ?? savedPlanRelativePath;
+			savedPlanRoot = planModeEntry.data.savedPlanRoot ?? savedPlanRoot;
+			contextResetActive = planModeEntry.data.contextResetActive ?? contextResetActive;
 
 			// Migrate older sessions whose todos were over-extracted from every list item.
 			// Re-parse the stored proposed plan with the current robust extractor, preserving
@@ -1419,12 +1739,27 @@ If you only partially complete the plan, include exactly which step numbers are 
 			if (lastProposedPlan) {
 				const reparsedTodos = extractTodoItemsFromProposedPlan(lastProposedPlan);
 				if (reparsedTodos.length > 0 && !sameTodoTexts(todoItems, reparsedTodos)) {
+					const previousItems = todoItems;
+					const sameLength = previousItems.length === reparsedTodos.length;
 					for (const item of reparsedTodos) {
-						const previous = todoItems.find((todo: TodoItem) => todo.text.toLowerCase() === item.text.toLowerCase());
-						item.completed = previous?.completed ?? false;
+						const previous = findPreviousTodoForReparsed(item, previousItems, sameLength);
+						setTodoStatus(item, previous?.status ?? (previous?.completed ? "done" : "pending"));
 					}
 					todoItems = reparsedTodos;
+					restoredPlanProgressNeedsWrite = true;
 					persistState();
+				} else if (reparsedTodos.length === 0 && todoItems.length > 0) {
+					// Current extraction rules reject structured plans that lack a dedicated
+					// implementation/action steps section. Clear stale trackers created by
+					// older broad fallback extraction rather than continuing bogus execution.
+					todoItems = [];
+					executionMode = false;
+					contextResetActive = false;
+					persistState();
+					ctx.ui.notify(
+						"Cleared stale plan todos: the saved proposed plan has no dedicated implementation/action steps section.",
+						"warning",
+					);
 				}
 			}
 		}
@@ -1435,7 +1770,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 			let executeIndex = -1;
 			for (let i = entries.length - 1; i >= 0; i--) {
 				const entry = entries[i] as { type: string; customType?: string };
-				if (entry.customType === "plan-mode-execute") {
+				if (entry.customType === "plan-mode-execute" || entry.customType === PLAN_CONTEXT_RESET_CUSTOM_TYPE) {
 					executeIndex = i;
 					break;
 				}
@@ -1453,14 +1788,19 @@ If you only partially complete the plan, include exactly which step numbers are 
 				}
 			}
 			const allText = messages.map(getTextContent).join("\n");
-			if (markCompletedSteps(allText, todoItems) > 0) persistState();
+			if (markExplicitNonDoneSteps(allText, todoItems) + markCompletedSteps(allText, todoItems) > 0) {
+				restoredPlanProgressNeedsWrite = true;
+				persistState();
+			}
 		}
 
-		if (executionMode && todoItems.length > 0 && todoItems.every((todo: TodoItem) => todo.completed)) {
+		if (executionMode && todoItems.length > 0 && todoItems.every((todo: TodoItem) => isTodoClosed(todo))) {
 			executionMode = false;
+			contextResetActive = false;
 			todoItems = [];
 			persistState();
 		}
+		if (!executionMode) contextResetActive = false;
 
 		if (planModeEnabled) {
 			const currentActive = currentActiveToolNames();
@@ -1469,6 +1809,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 		} else if (planModeEntry?.data) {
 			restoreSavedTools();
 		}
+		if (restoredPlanProgressNeedsWrite) await updateSavedPlanProgress(ctx);
 		updateStatus(ctx);
 	});
 }
