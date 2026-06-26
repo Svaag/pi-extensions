@@ -1,7 +1,5 @@
 # Upstream bug report: Assistant message Markdown rendering
 
-> Exported from the (unexecuted) plan at
-> `docs/plans/2026-06-15T10-14-58Z-fix-and-improve-pi-tui-rendering-in-pi-extensions.md`.
 > File against `earendil-works/pi-mono` (or the current monorepo URL) when ready.
 
 ## Filing command
@@ -75,7 +73,6 @@ lists, quotes) is shown as plain text.
 ### Related
 
 The `tool-highlight` extension (in `Svaag/pi-extensions`) overrides
-`renderResult` for `read`/`edit`/`write` and (optionally, with
-`PI_TOOL_HIGHLIGHT_BASH=1`) `bash`, and works correctly because
+`renderResult` for `read`/`edit`/`write` and works correctly because
 `pi.registerTool({ name, renderResult })` is a per-slot override. There is no
 equivalent hook for the assistant message renderer.
