@@ -56,6 +56,6 @@ test("buildPlanModeCoordinationPrompt points to the first unfinished plan step",
 	assert.match(prompt, /1\. \[x\] Create worktrees/);
 	assert.match(prompt, /2\. \[ \] Implement feature/);
 	assert.match(prompt, /Next unfinished step: 2\. Implement feature/);
-	assert.match(prompt, /\[DONE:n\]/);
+	assert.match(prompt, /update_plan/);
 	assert.match(prompt, /Only emit \[GOAL COMPLETE\]/);
 });

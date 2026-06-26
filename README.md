@@ -6,6 +6,7 @@ Personal extensions for the [Pi coding agent](https://github.com/earendil-works/
 
 - `plan-mode/` — read-only planning mode with proposed-plan extraction, interactive planning questions, and execution progress tracking.
 - `goal-mode/` — autonomous goal/execute mode inspired by Codex collaboration style.
+- `subagent/` — Codex-inspired subagent / agent swarm tools backed by isolated Pi RPC subprocesses, persistent lifecycle state, and conservative read-only defaults.
 - `tool-highlight/` — overrides `renderResult` for `read`/`edit`/`write` so the TUI renders syntax-highlighted file content using the active theme. Truecolor auto-detected, safe fallback to plain text.
 
 ## Install
@@ -17,6 +18,7 @@ git clone git@github.com:Svaag/pi-extensions.git
 mkdir -p ~/.pi/agent/extensions
 ln -s "$PWD/pi-extensions/plan-mode" ~/.pi/agent/extensions/plan-mode
 ln -s "$PWD/pi-extensions/goal-mode" ~/.pi/agent/extensions/goal-mode
+ln -s "$PWD/pi-extensions/subagent" ~/.pi/agent/extensions/subagent
 ln -s "$PWD/pi-extensions/tool-highlight" ~/.pi/agent/extensions/tool-highlight
 ```
 

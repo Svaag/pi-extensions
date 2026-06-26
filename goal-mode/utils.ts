@@ -36,8 +36,8 @@ export function buildPlanModeCoordinationPrompt(state: PlanModeState): string {
 			? `Next unfinished step: ${remaining[0].step}. ${remaining[0].text}`
 			: "All plan steps appear complete.",
 		"",
-		"Whenever you finish a plan step, mark it with [DONE:n] where n is the step number (e.g. [DONE:2]). You may also say \"Completed step N\", \"Completed phase N\", or \"Completed steps 1-3\".",
-		"Only emit [GOAL COMPLETE] after every unfinished plan step above is marked done. Once you emit [GOAL COMPLETE], goal mode will exit automatically.",
+		"When the update_plan tool is available, use it to update the full Plan Mode checklist instead of relying on [DONE:n] prose markers. Mark exactly one active step in_progress and completed/skipped/deferred/blocked as work changes.",
+		"Only emit [GOAL COMPLETE] after every unfinished plan step above is closed in the Plan Mode checklist. Once you emit [GOAL COMPLETE], goal mode will exit automatically.",
 	].join("\n");
 }
 

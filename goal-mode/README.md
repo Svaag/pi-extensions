@@ -57,10 +57,10 @@ If a Plan Mode execution is active when you run `/goal`, goal mode appends a
 coordination section to the system prompt that:
 
 - Lists the active plan steps and the next unfinished step.
-- Instructs the agent to keep marking completed plan steps with `[DONE:n]`
-  (e.g. `[DONE:2]`) or phrases like "Completed step N" / "Completed phase N".
+- Instructs the agent to use `update_plan` when available to keep the full
+  Plan Mode checklist current.
 - Prevents the agent from declaring `[GOAL COMPLETE]` until every unfinished
-  plan step is marked done.
+  plan step is closed in the checklist.
 
 This keeps the Plan Mode todo widget (`/todos`) and footer counter advancing
 while the agent works autonomously in goal mode.
