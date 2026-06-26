@@ -7,6 +7,7 @@ import {
 	isSafeCommand,
 	markCompletedSteps,
 	markExplicitNonDoneSteps,
+	shouldUsePlanRefinementContext,
 	type TodoItem,
 } from "../plan-mode/utils.ts";
 
@@ -86,6 +87,32 @@ test("extractProposedPlan returns the markdown inside proposed_plan tags", () =>
 		extractProposedPlan("before\n<proposed_plan>\n# Title\n\nBody\n</proposed_plan>\nafter"),
 		"# Title\n\nBody",
 	);
+});
+
+test("shouldUsePlanRefinementContext does not hijack pasted plans for evaluation", () => {
+	assert.equal(
+		shouldUsePlanRefinementContext(
+			"Check whether this is implemented:\n<proposed_plan>\n# Plan\n</proposed_plan>",
+			true,
+		),
+		false,
+	);
+	assert.equal(
+		shouldUsePlanRefinementContext("<proposed_plan>\n# Plan\n</proposed_plan>", true),
+		false,
+	);
+});
+
+test("shouldUsePlanRefinementContext still handles explicit refinement feedback", () => {
+	assert.equal(shouldUsePlanRefinementContext("Please tighten point 3 and keep the rest.", true), true);
+	assert.equal(
+		shouldUsePlanRefinementContext(
+			"Refine this plan before implementation:\n<proposed_plan>\n# Plan\n</proposed_plan>",
+			true,
+		),
+		true,
+	);
+	assert.equal(shouldUsePlanRefinementContext("Please tighten point 3.", false), false);
 });
 
 test("extractTodoItemsFromProposedPlan prefers tracker-level implementation steps", () => {

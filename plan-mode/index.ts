@@ -31,6 +31,7 @@ import {
 	markCompletedSteps,
 	markExplicitNonDoneSteps,
 	renderPlanProgressMarkdown,
+	shouldUsePlanRefinementContext,
 	setTodoStatus,
 	upsertPlanProgressSection,
 	type TodoItem,
@@ -1379,9 +1380,10 @@ Start with step 1: ${firstStep}`;
 	});
 
 	// Inject plan/execution context before agent starts
-	pi.on("before_agent_start", async () => {
+	pi.on("before_agent_start", async (event: any) => {
 		if (planModeEnabled) {
-			if (lastProposedPlan) {
+			const promptText = typeof event?.prompt === "string" ? event.prompt : "";
+			if (lastProposedPlan && shouldUsePlanRefinementContext(promptText, true)) {
 				// We have a proposed plan, so the user is refining it!
 				return {
 					message: {
@@ -1404,7 +1406,9 @@ Please carefully read the user's feedback/request, and produce an updated, compl
 				};
 			}
 
-			// No proposed plan yet - output full Codex plan.md mode rules
+			// No active refinement this turn - output full Codex plan.md mode rules.
+			// If the user pasted a full <proposed_plan>, treat it as fresh user input
+			// unless they explicitly asked to revise the previous stored plan.
 			return {
 				message: {
 					customType: "plan-mode-context",

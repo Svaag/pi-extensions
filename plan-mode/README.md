@@ -8,6 +8,7 @@ Read-only exploration mode for safe code analysis.
 - **Bash allowlist**: Only read-only bash commands are allowed, including read-only `git` and `gh` queries
 - **Plan extraction**: Prefers `Implementation Steps`, `Execution Steps`, or `Action Plan` sections and extracts only numbered subheadings/top-level list items while preserving full tracker text
 - **Interactive questions**: `plan_questions` tool gives a tabbed TUI wizard for implementation-detail questions instead of long A/B/C chat questionnaires
+- **Feedback mode guard**: once a plan exists, normal feedback refines it, but a newly pasted `<proposed_plan>` is treated as fresh user input unless the prompt explicitly asks to refine/revise the stored plan
 - **Agent-assisted answers**: Each custom-answer question can ask a user-selected Pi scoped model for a recommendation, with the current planning conversation and any draft/proposed plan forwarded as context
 - **Plan archival**: Accepted plans are saved to `docs/plans/` in the selected project repository before execution starts; when planning from a multi-repo workspace, Plan Mode lists discovered repos so you can choose the target (with the detected best match first)
 - **Reset-context execution**: The execution menu can start from a context-reset marker so the model sees only the accepted plan and later messages while the visible transcript remains available

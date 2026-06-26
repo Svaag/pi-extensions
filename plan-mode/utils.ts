@@ -283,6 +283,28 @@ export function hasHandoffClaim(text: string): boolean {
 	return /\b(?:ready\s+for\s+(?:human\s+)?review|ready\s+to\s+(?:merge|review)|handoff|hand\s+off|leav(?:e|ing)\s+(?:it\s+)?for\s+(?:human\s+)?review|ci\s+(?:is\s+)?clean|checks?\s+(?:are\s+)?green|pr\s+(?:is\s+)?clean)\b/i.test(normalized);
 }
 
+export function promptContainsProposedPlan(text: string): boolean {
+	return /<proposed_plan\b/i.test(text);
+}
+
+export function shouldUsePlanRefinementContext(prompt: string, hasExistingPlan: boolean): boolean {
+	if (!hasExistingPlan) return false;
+	const normalized = stripMarkdownInline(prompt).replace(/\s+/g, " ").trim();
+	if (!promptContainsProposedPlan(prompt)) return true;
+
+	// A pasted complete <proposed_plan> is often a fresh plan/evaluation prompt, not
+	// feedback on the previous stored plan. Only enter refinement mode when the user
+	// explicitly asks to revise/refine, and let implementation/evaluation requests win.
+	const asksForEvaluation = /\b(?:check|inspect|evaluate|compare|audit|status|implemented|implementation\s+status|complete|completion|done|remaining|what\s+is\s+left|how\s+much\s+is\s+left|is\s+this\s+(?:done|implemented|complete))\b/i.test(
+		normalized,
+	);
+	if (asksForEvaluation) return false;
+
+	return /\b(?:refine|revise|update|modify|edit|tighten|incorporate|feedback|replacement\s+plan|complete\s+replacement\s+plan|return\s+(?:a\s+)?revised\s+plan)\b/i.test(
+		normalized,
+	);
+}
+
 interface MarkdownHeader {
 	index: number;
 	level: number;
