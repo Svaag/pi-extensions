@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import { Type } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "../agents.ts";
 import type { ContextMode, WriteMode } from "../core/AgentTypes.ts";
+import { sanitizeContextText } from "../core/ContextSanitizer.ts";
 import { renderAgentSummary } from "../render/renderAgent.ts";
 import { type ManagerGetter, preview, textResult } from "./common.ts";
 
@@ -29,6 +30,33 @@ const SpawnAgentParams = Type.Object({
 	maxOutputChars: Type.Optional(Type.Number({ description: "Maximum retained output characters for this agent." })),
 	model: Type.Optional(Type.String({ description: "Optional model override for the child process." })),
 });
+
+function textFromMessageContent(content: any): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+		.map((part: any) => part.text)
+		.join("\n");
+}
+
+function buildVisibleSessionSummary(ctx: any, maxChars = 16_000): string {
+	const entries = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
+	const lines: string[] = [];
+	for (const entry of entries.slice(-24)) {
+		const message = entry?.message;
+		if (!message) continue;
+		if (message.role === "user") {
+			const text = textFromMessageContent(message.content);
+			if (text.trim()) lines.push(`User: ${text.trim()}`);
+		} else if (message.role === "assistant") {
+			const text = textFromMessageContent(message.content);
+			if (text.trim()) lines.push(`Assistant: ${text.trim()}`);
+		}
+	}
+	if (lines.length === 0) return "";
+	return sanitizeContextText(`Recent visible parent conversation excerpt (not hidden reasoning, not tool results):\n\n${lines.join("\n\n")}`, maxChars);
+}
 
 async function resolveAgentDefinition(ctx: any, params: any): Promise<{ definition?: string; agent?: AgentConfig }> {
 	let definition = params.agentDefinition?.trim() || "";
@@ -75,6 +103,8 @@ export function registerSpawnAgentTool(pi: ExtensionAPI, getManager: ManagerGett
 				if (!ok) throw new Error("Write-capable subagent was not approved.");
 			}
 			const { definition, agent } = await resolveAgentDefinition(ctx, params);
+			const contextMode = (params.contextMode ?? "fresh") as ContextMode;
+			const contextSummary = params.contextSummary ?? (contextMode === "summary" ? buildVisibleSessionSummary(ctx) : undefined);
 			onUpdate?.(textResult(`Spawning subagent ${params.taskName}...`));
 			const record = await manager.spawnAgent({
 				taskName: params.taskName,
@@ -85,9 +115,9 @@ export function registerSpawnAgentTool(pi: ExtensionAPI, getManager: ManagerGett
 				agentName: agent?.name ?? params.agentName,
 				agentSource: agent?.source ?? (definition ? "inline" : "none"),
 				agentDefinition: definition,
-				contextMode: (params.contextMode ?? "fresh") as ContextMode,
+				contextMode,
 				contextTurns: params.contextTurns,
-				contextSummary: params.contextSummary,
+				contextSummary,
 				writeMode,
 				allowedPaths: params.allowedPaths,
 				timeoutMs: params.timeoutMs,

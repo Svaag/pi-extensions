@@ -87,10 +87,12 @@ export type SubagentEventType =
 	| "agent.failed"
 	| "agent.interrupted"
 	| "agent.closed"
+	| "agent.lost"
 	| "agent.message"
 	| "agent.followup"
 	| "graph.edge_opened"
-	| "graph.edge_closed";
+	| "graph.edge_closed"
+	| "graph.edge_lost";
 
 export interface SubagentEvent {
 	eventId: string;

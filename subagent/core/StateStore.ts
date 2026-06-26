@@ -19,6 +19,7 @@ export interface RestoredSubagentState {
 	records: AgentRecord[];
 	edges: AgentGraphEdge[];
 	events: SubagentEvent[];
+	lostAgentIds: string[];
 }
 
 function cloneEdge(edge: AgentGraphEdge): AgentGraphEdge {
@@ -67,11 +68,16 @@ export class StateStore {
 		const records = new Map<string, AgentRecord>();
 		const edges = new Map<string, AgentGraphEdge>();
 		const events: SubagentEvent[] = [];
+		const reconciledLostIds = new Set<string>();
 
 		for (const entry of entries) {
 			if (entry.type !== "custom") continue;
 			if (entry.customType === SUBAGENT_AGENT_STATE_ENTRY && entry.data?.record?.agentId) {
-				records.set(entry.data.record.agentId, reconcileRecordOnRestore(entry.data.record as AgentRecord));
+				const rawRecord = entry.data.record as AgentRecord;
+				const restored = reconcileRecordOnRestore(rawRecord);
+				records.set(rawRecord.agentId, restored);
+				if (rawRecord.status === "running" || rawRecord.status === "queued") reconciledLostIds.add(rawRecord.agentId);
+				else reconciledLostIds.delete(rawRecord.agentId);
 			} else if (entry.customType === SUBAGENT_EDGE_STATE_ENTRY && entry.data?.edge?.childAgentId) {
 				const edge = cloneEdge(entry.data.edge as AgentGraphEdge);
 				const record = records.get(edge.childAgentId);
@@ -96,6 +102,7 @@ export class StateStore {
 			records: [...records.values()].sort((a, b) => a.createdAt - b.createdAt),
 			edges: [...edges.values()].sort((a, b) => a.createdAt - b.createdAt),
 			events: events.sort((a, b) => a.createdAt - b.createdAt),
+			lostAgentIds: [...reconciledLostIds].filter((id) => records.get(id)?.status === "lost").sort(),
 		};
 	}
 }

@@ -43,4 +43,15 @@ test("StateStore restore marks previously running agents as lost", () => {
 	assert.equal(restored.records[0].status, "lost");
 	assert.equal(restored.records[0].controllable, false);
 	assert.equal(restored.edges[0].status, "lost");
+	assert.deepEqual(restored.lostAgentIds, ["agent_1"]);
+});
+
+test("StateStore restore does not re-emit already persisted lost records", () => {
+	const r = { ...record("running"), status: "lost" as const, processState: "unknown" as const, controllable: false };
+	const restored = StateStore.restore([
+		{ type: "custom", customType: SUBAGENT_AGENT_STATE_ENTRY, data: { record: r } },
+		{ type: "custom", customType: SUBAGENT_EDGE_STATE_ENTRY, data: { edge: { parentAgentId: null, childAgentId: r.agentId, taskName: r.taskName, taskPath: r.taskPath, status: "lost", createdAt: 1, updatedAt: 2 } } },
+	]);
+	assert.equal(restored.records[0].status, "lost");
+	assert.deepEqual(restored.lostAgentIds, []);
 });

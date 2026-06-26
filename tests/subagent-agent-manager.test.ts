@@ -34,6 +34,27 @@ class FakeBackend implements AgentBackend {
 	}
 }
 
+function makeRecord(status: "queued" | "running" | "succeeded" | "failed" | "interrupted" | "closed" | "lost" = "running") {
+	return {
+		agentId: "agent_restored",
+		taskName: "restored",
+		taskPath: "/root/restored",
+		parentAgentId: null,
+		status,
+		processState: status === "running" ? "live_running" as const : "unknown" as const,
+		cwd: "/tmp",
+		prompt: "do work",
+		createdAt: 1,
+		updatedAt: 2,
+		contextMode: "fresh" as const,
+		writeMode: "read_only" as const,
+		allowedPaths: [],
+		outputTail: "",
+		outputChars: 0,
+		controllable: status === "running",
+	};
+}
+
 function manager(backend = new FakeBackend()) {
 	const entries: any[] = [];
 	return {
@@ -82,4 +103,25 @@ test("AgentManager interrupt marks agent interrupted", async () => {
 	const interrupted = await h.manager.interruptAgent(record.agentId, "stop");
 	assert.equal(interrupted.status, "interrupted");
 	assert.equal(interrupted.controllable, false);
+});
+
+test("AgentManager persists restored lost agents once", () => {
+	const entries: any[] = [];
+	const r = {
+		...makeRecord("lost"),
+		processState: "unknown" as const,
+		controllable: false,
+		error: "lost during reload",
+	};
+	new AgentManager({
+		backend: new FakeBackend(),
+		store: new StateStore({ appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }) }),
+		rootCwd: "/tmp",
+		restoredRecords: [r],
+		restoredEdges: [{ parentAgentId: null, childAgentId: r.agentId, taskName: r.taskName, taskPath: r.taskPath, status: "lost", createdAt: 1, updatedAt: 2 }],
+		restoredLostAgentIds: [r.agentId],
+	});
+	const eventTypes = entries.map((entry) => entry.data?.type).filter(Boolean);
+	assert(eventTypes.includes("agent.lost"));
+	assert(eventTypes.includes("graph.edge_lost"));
 });

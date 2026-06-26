@@ -7,6 +7,7 @@ import { formatDuration, statusColor, statusIcon } from "./render/renderAgent.ts
 import { registerCloseAgentTool } from "./tools/closeAgent.ts";
 import { registerFollowupTaskTool } from "./tools/followupTask.ts";
 import { registerInterruptAgentTool } from "./tools/interruptAgent.ts";
+import { registerListAgentGraphTool } from "./tools/listAgentGraph.ts";
 import { registerListAgentsTool } from "./tools/listAgents.ts";
 import { registerSendMessageTool } from "./tools/sendMessage.ts";
 import { registerSpawnAgentTool } from "./tools/spawnAgent.ts";
@@ -48,6 +49,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			rootCwd: ctx.cwd,
 			restoredRecords: restored.records,
 			restoredEdges: restored.edges,
+			restoredLostAgentIds: restored.lostAgentIds,
 			onChange: (current) => {
 				if (activeContext) renderWidget(activeContext, current);
 			},
@@ -67,14 +69,22 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	registerSendMessageTool(pi, getManager);
 	registerFollowupTaskTool(pi, getManager);
 	registerListAgentsTool(pi, getManager);
+	registerListAgentGraphTool(pi, getManager);
 	registerInterruptAgentTool(pi, getManager);
 	registerCloseAgentTool(pi, getManager);
 
 	pi.registerCommand("subagents", {
-		description: "Show subagent status",
-		handler: async (_args, ctx) => {
+		description: "Show subagent status. Use /subagents graph for the persistent tree.",
+		handler: async (args, ctx) => {
 			const current = getManager(ctx);
 			renderWidget(ctx, current);
+			if (args.trim() === "graph") {
+				const records = current.listRecords({ includeClosed: true });
+				const edges = current.listEdges();
+				if (records.length === 0) ctx.ui.notify("No subagent graph in this session.", "info");
+				else ctx.ui.notify(edges.map((edge) => `${edge.taskPath}: ${edge.status} parent=${edge.parentAgentId ?? "root"}`).join("\n") || "No graph edges.", "info");
+				return;
+			}
 			const agents = current.summaries({ includeClosed: true });
 			if (agents.length === 0) ctx.ui.notify("No subagents in this session.", "info");
 			else ctx.ui.notify(agents.map((agent) => `${agent.taskPath}: ${agent.status}${agent.summary ? ` — ${agent.summary}` : ""}`).join("\n"), "info");

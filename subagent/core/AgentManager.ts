@@ -46,6 +46,7 @@ export interface AgentManagerOptions {
 	limits?: Partial<SubagentLimits>;
 	restoredRecords?: AgentRecord[];
 	restoredEdges?: AgentGraphEdge[];
+	restoredLostAgentIds?: string[];
 	onChange?: (manager: AgentManager) => void;
 }
 
@@ -88,6 +89,7 @@ export class AgentManager {
 		this.graph = new AgentGraph(options.restoredEdges ?? []);
 		for (const record of options.restoredRecords ?? []) this.records.set(record.agentId, shallowCloneRecord(record));
 		this.onChange = options.onChange;
+		this.persistRestoredLostAgents(options.restoredLostAgentIds ?? []);
 	}
 
 	listRecords(opts: { includeClosed?: boolean; parentAgentId?: string; jobId?: string } = {}): AgentRecord[] {
@@ -299,6 +301,20 @@ export class AgentManager {
 
 	summaries(opts: { includeClosed?: boolean; parentAgentId?: string; jobId?: string; returnMode?: "summary" | "full" | "events" } = {}): AgentSummary[] {
 		return this.listRecords(opts).map((record) => this.summaryFor(record, opts.returnMode ?? "summary"));
+	}
+
+	private persistRestoredLostAgents(agentIds: string[]): void {
+		for (const agentId of agentIds) {
+			const record = this.records.get(agentId);
+			if (!record || record.status !== "lost") continue;
+			this.store.appendEvent("agent.lost", { agentId, taskPath: record.taskPath, data: { error: record.error, restored: true } });
+			this.store.appendAgentState(record);
+			const edge = this.graph.closeEdge(agentId, "lost");
+			if (edge) {
+				this.store.appendEvent("graph.edge_lost", { agentId, parentAgentId: record.parentAgentId, childAgentId: agentId, taskPath: record.taskPath, data: { edge, restored: true } });
+				this.store.appendEdgeState(edge);
+			}
+		}
 	}
 
 	private async startQueued(signal?: AbortSignal): Promise<void> {
