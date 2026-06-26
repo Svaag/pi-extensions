@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
 	extractDoneSteps,
@@ -15,6 +16,13 @@ import {
 function todos(texts: string[]): TodoItem[] {
 	return texts.map((text, index) => ({ step: index + 1, text, completed: false }));
 }
+
+test("plan execution progress is controlled by update_plan, not prose parsing", () => {
+	const source = readFileSync(new URL("../plan-mode/index.ts", import.meta.url), "utf8");
+	assert.doesNotMatch(source, /\bmarkCompletedSteps\b/);
+	assert.doesNotMatch(source, /\bmarkExplicitNonDoneSteps\b/);
+	assert.match(source, /name:\s*UPDATE_PLAN_TOOL/);
+});
 
 test("plan mode allows read-only git and gh commands", () => {
 	const allowed = [

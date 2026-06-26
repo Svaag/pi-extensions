@@ -675,6 +675,8 @@ export function extractTodoItemsFromProposedPlan(planContent: string): TodoItem[
 	}));
 }
 
+// Legacy prose-progress parser helpers. The Plan Mode extension must not use these
+// for execution progress; active progress is controlled by update_plan and /todos.
 function addStepRange(steps: Set<number>, start: number, end: number): void {
 	const lo = Math.min(start, end);
 	const hi = Math.max(start, end);

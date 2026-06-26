@@ -1867,13 +1867,17 @@ Start with step 1: ${firstStep}`;
 		updateStatus(ctx);
 	}
 
+	function todoSnapshot(items = todoItems): TodoItem[] {
+		return items.map((item) => ({ ...item }));
+	}
+
 	function persistState(): void {
 		pi.appendEntry("plan-mode", {
 			enabled: planModeEnabled,
-			todos: todoItems,
+			todos: todoSnapshot(),
 			executing: executionMode,
 			lastProposedPlan: lastProposedPlan,
-			savedTools: savedTools,
+			savedTools: [...savedTools],
 			savedThinkingLevel,
 			savedPlanAbsolutePath,
 			savedPlanRelativePath,
@@ -2044,7 +2048,7 @@ Start with step 1: ${firstStep}`;
 			}
 
 			const planOnlyPrompt = buildPlanOnlyExecutionPrompt(savedPlanPath);
-			const executionTodos = todoItems.map((item) => ({ ...item }));
+			const executionTodos = todoSnapshot();
 
 			const result = await ctx.newSession({
 				parentSession: ctx.sessionManager.getSessionFile(),
@@ -2138,29 +2142,40 @@ Start with step 1: ${firstStep}`;
 			if (resetIndex >= 0) messages = messages.slice(resetIndex);
 		}
 
-		if (!planModeEnabled) {
-			messages = messages.filter((m: any) => {
-				const msg = m as AgentMessage & { customType?: string };
-				if (msg.customType === "plan-mode-context" || msg.customType === "plan-refinement-context") {
-					return false;
-				}
-				if (msg.customType === "plan-execution-context" && !executionMode) {
-					return false;
-				}
-				if (msg.role !== "user") return true;
-
-				const content = msg.content;
-				if (typeof content === "string") {
-					return !content.includes("[PLAN MODE ACTIVE]");
-				}
-				if (Array.isArray(content)) {
-					return !content.some(
-						(c: any) => c.type === "text" && (c as TextContent).text?.includes("[PLAN MODE ACTIVE]"),
-					);
-				}
-				return true;
-			});
+		function lastCustomMessageIndex(types: string[]): number {
+			for (let i = messages.length - 1; i >= 0; i--) {
+				const msg = messages[i] as AgentMessage & { customType?: string };
+				if (msg.customType && types.includes(msg.customType)) return i;
+			}
+			return -1;
 		}
+
+		const latestPlanningContextIndex = planModeEnabled
+			? lastCustomMessageIndex(["plan-mode-context", "plan-refinement-context"])
+			: -1;
+		const latestExecutionContextIndex = executionMode ? lastCustomMessageIndex(["plan-execution-context"]) : -1;
+
+		messages = messages.filter((m: any, index: number) => {
+			const msg = m as AgentMessage & { customType?: string };
+			if (msg.customType === "plan-mode-context" || msg.customType === "plan-refinement-context") {
+				return index === latestPlanningContextIndex;
+			}
+			if (msg.customType === "plan-execution-context") {
+				return index === latestExecutionContextIndex;
+			}
+			if (planModeEnabled || msg.role !== "user") return true;
+
+			const content = msg.content;
+			if (typeof content === "string") {
+				return !content.includes("[PLAN MODE ACTIVE]");
+			}
+			if (Array.isArray(content)) {
+				return !content.some(
+					(c: any) => c.type === "text" && (c as TextContent).text?.includes("[PLAN MODE ACTIVE]"),
+				);
+			}
+			return true;
+		});
 
 		return { messages };
 	});
@@ -2527,7 +2542,8 @@ Finish with all items completed, skipped, or deferred before ending the turn. If
 
 		if (planModeEntry?.data) {
 			planModeEnabled = planModeEntry.data.enabled ?? planModeEnabled;
-			todoItems = planModeEntry.data.todos ?? todoItems;
+			const restoredTodos = normalizeStoredTodoItems(planModeEntry.data.todos);
+			todoItems = restoredTodos.length > 0 ? restoredTodos : todoItems;
 			executionMode = planModeEntry.data.executing ?? executionMode;
 			lastProposedPlan = planModeEntry.data.lastProposedPlan ?? lastProposedPlan;
 			savedTools = existingToolNames(normalizeToolNames(planModeEntry.data.savedTools ?? savedTools)).filter((name: string) => !isPlanOwnedTool(name));
