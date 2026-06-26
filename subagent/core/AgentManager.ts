@@ -11,7 +11,7 @@ import type {
 	WaitAgentResult,
 } from "./AgentTypes.ts";
 import { buildInheritedContext } from "./ContextSanitizer.ts";
-import { DEFAULT_SUBAGENT_LIMITS, normalizeLimits, type SubagentLimits } from "./Limits.ts";
+import { DEFAULT_SUBAGENT_LIMITS, normalizeLimits, normalizeRuntimeTimeoutMs, type SubagentLimits } from "./Limits.ts";
 import { buildChildSystemPrompt, buildChildUserPrompt } from "./prompt.ts";
 import { StateStore } from "./StateStore.ts";
 import {
@@ -78,6 +78,7 @@ export class AgentManager {
 	private readonly pendingStart = new Map<string, PendingStartConfig>();
 	private readonly waiters = new Set<() => void>();
 	private readonly timeoutHandles = new Map<string, NodeJS.Timeout>();
+	private readonly timeoutRecoveryHandles = new Map<string, NodeJS.Timeout>();
 	private readonly lastOutputPersistAt = new Map<string, number>();
 	private readonly onChange?: (manager: AgentManager) => void;
 
@@ -128,6 +129,7 @@ export class AgentManager {
 		const allowedPaths = resolvePathList(cwd, request.allowedPaths);
 		let tools = request.tools ? [...request.tools] : undefined;
 		if (writeMode === "read_only" && tools) tools = tools.filter((tool) => tool !== "edit" && tool !== "write");
+		const timeoutMs = normalizeRuntimeTimeoutMs(request.timeoutMs, this.limits);
 		const agentId = createId("agent");
 		const record: AgentRecord = {
 			agentId,
@@ -141,6 +143,7 @@ export class AgentManager {
 			prompt: request.prompt,
 			model: request.model,
 			tools,
+			timeoutMs,
 			createdAt: now,
 			updatedAt: now,
 			contextMode: request.contextMode ?? "fresh",
@@ -156,7 +159,7 @@ export class AgentManager {
 		this.pendingStart.set(agentId, {
 			agentDefinition: request.agentDefinition,
 			contextSummary: request.contextSummary,
-			timeoutMs: request.timeoutMs ?? this.limits.maxRuntimeMsPerAgent,
+			timeoutMs,
 			maxOutputChars: request.maxOutputChars ?? this.limits.maxOutputCharsPerAgent,
 			maxPersistedOutputTailChars: this.limits.maxPersistedOutputTailChars,
 		});
@@ -239,9 +242,11 @@ export class AgentManager {
 		if (handle?.isAlive()) await handle.interrupt(reason);
 		this.clearAgentTimeout(agentId);
 		this.handles.delete(agentId);
-		this.transition(record, "interrupted", { processState: "killed", controllable: false, finishedAt: nowMs(), error: reason ?? "Interrupted by parent agent." });
+		const finishedAt = nowMs();
+		this.ensureInterruptedResult(record, reason, finishedAt);
+		this.transition(record, "interrupted", { processState: "killed", controllable: false, finishedAt, error: reason ?? "Interrupted by parent agent." });
 		const edge = this.graph.closeEdge(agentId, "interrupted");
-		this.store.appendEvent("agent.interrupted", { agentId, taskPath: record.taskPath, data: { reason } });
+		this.store.appendEvent("agent.interrupted", { agentId, taskPath: record.taskPath, data: { reason, result: record.result, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
 		if (edge) {
 			this.store.appendEvent("graph.edge_closed", { agentId, parentAgentId: record.parentAgentId, childAgentId: agentId, taskPath: record.taskPath, data: { edge } });
 			this.store.appendEdgeState(edge);
@@ -277,6 +282,8 @@ export class AgentManager {
 		this.handles.clear();
 		for (const timeout of this.timeoutHandles.values()) clearTimeout(timeout);
 		this.timeoutHandles.clear();
+		for (const timeout of this.timeoutRecoveryHandles.values()) clearTimeout(timeout);
+		this.timeoutRecoveryHandles.clear();
 	}
 
 	async wait(options: WaitAgentOptions): Promise<WaitAgentResult> {
@@ -405,6 +412,7 @@ export class AgentManager {
 		const finishedAt = nowMs();
 		record.result = { ...result, metrics: { ...result.metrics, durationMs: statusDurationMs({ ...record, finishedAt }, finishedAt), outputChars: record.outputChars } };
 		if (result.output) record.outputTail = appendOutputTail("", result.output, this.limits.maxOutputCharsPerAgent);
+		if (status === "interrupted") this.ensureInterruptedResult(record, result.summary, finishedAt);
 		this.transition(record, status, { processState: "live_idle", controllable: this.handles.get(agentId)?.isAlive() ?? true, finishedAt, error: status === "failed" ? result.summary : undefined });
 		this.store.appendEvent(status === "succeeded" ? "agent.succeeded" : status === "interrupted" ? "agent.interrupted" : "agent.failed", {
 			agentId,
@@ -419,6 +427,25 @@ export class AgentManager {
 			}
 		}
 		void this.startQueued();
+	}
+
+	private ensureInterruptedResult(record: AgentRecord, reason: string | undefined, finishedAt: number): void {
+		const existing = record.result;
+		const abortLike = !existing || !existing.output || /^Request was aborted\.?$/i.test(existing.summary.trim());
+		if (!abortLike) return;
+		const output = existing?.output || record.outputTail;
+		const recovered = output.trim().length > 0;
+		const timedOut = reason?.toLowerCase().includes("timed out") ?? false;
+		const summary = recovered
+			? `${timedOut ? "Timed out" : "Interrupted"}; recovered ${record.outputChars} chars of partial output in output/outputTail.`
+			: reason ?? "Interrupted before a final answer was produced.";
+		record.result = {
+			agentId: record.agentId,
+			status: "interrupted",
+			summary,
+			output,
+			metrics: { ...existing?.metrics, durationMs: statusDurationMs({ ...record, finishedAt }, finishedAt), outputChars: record.outputChars },
+		};
 	}
 
 	private failBeforeStart(record: AgentRecord, message: string): void {
@@ -461,16 +488,51 @@ export class AgentManager {
 	private installAgentTimeout(agentId: string, timeoutMs: number): void {
 		this.clearAgentTimeout(agentId);
 		const timeout = setTimeout(() => {
-			void this.interruptAgent(agentId, `Timed out after ${timeoutMs} ms`);
+			void this.requestTimeoutRecovery(agentId, timeoutMs);
 		}, timeoutMs);
 		timeout.unref?.();
 		this.timeoutHandles.set(agentId, timeout);
+	}
+
+	private async requestTimeoutRecovery(agentId: string, timeoutMs: number): Promise<void> {
+		this.timeoutHandles.delete(agentId);
+		const record = this.records.get(agentId);
+		if (!record || record.status !== "running") return;
+		const graceMs = Math.max(0, this.limits.timeoutRecoveryGraceMs);
+		const reason = `Timed out after ${timeoutMs} ms`;
+		record.error = graceMs > 0 ? `${reason}; requested a final partial summary before hard abort.` : reason;
+		record.updatedAt = nowMs();
+		this.store.appendEvent("agent.timeout_recovery", { agentId, taskPath: record.taskPath, data: { timeoutMs, graceMs, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
+		this.store.appendAgentState(record);
+		this.notifyChange();
+
+		if (graceMs <= 0) {
+			void this.interruptAgent(agentId, reason);
+			return;
+		}
+		const hardTimeout = setTimeout(() => {
+			void this.interruptAgent(agentId, `${reason}; recovery grace ${graceMs} ms expired`);
+		}, graceMs);
+		hardTimeout.unref?.();
+		this.timeoutRecoveryHandles.set(agentId, hardTimeout);
+
+		const handle = this.handles.get(agentId);
+		if (handle?.isAlive()) {
+			try {
+				await handle.sendMessage("TIME BUDGET EXPIRED. Stop running tools now. Return a concise final answer using only what you already inspected. Include partial findings, useful file paths, commands/results seen, uncertainty, and next recommended checks. Do not call any more tools.");
+			} catch {
+				// Hard timeout above still preserves outputTail if steering cannot be delivered.
+			}
+		}
 	}
 
 	private clearAgentTimeout(agentId: string): void {
 		const timeout = this.timeoutHandles.get(agentId);
 		if (timeout) clearTimeout(timeout);
 		this.timeoutHandles.delete(agentId);
+		const recoveryTimeout = this.timeoutRecoveryHandles.get(agentId);
+		if (recoveryTimeout) clearTimeout(recoveryTimeout);
+		this.timeoutRecoveryHandles.delete(agentId);
 	}
 
 	private transition(record: AgentRecord, status: AgentStatus, patch: Partial<AgentRecord> = {}): void {

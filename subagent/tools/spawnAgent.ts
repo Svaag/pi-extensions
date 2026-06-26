@@ -26,7 +26,7 @@ const SpawnAgentParams = Type.Object({
 	contextSummary: Type.Optional(Type.String({ description: "Explicit inherited summary when contextMode=summary." })),
 	writeMode: Type.Optional(StringEnum(["read_only", "disjoint_scope", "git_worktree"] as const, { description: "Child write policy. Defaults to read_only." })),
 	allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "Allowed paths for disjoint_scope write mode." })),
-	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task." })),
+	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task. Values below 300000ms are ignored and use the default 30-minute runtime." })),
 	maxOutputChars: Type.Optional(Type.Number({ description: "Maximum retained output characters for this agent." })),
 	model: Type.Optional(Type.String({ description: "Optional model override for the child process." })),
 });

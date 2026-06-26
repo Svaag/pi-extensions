@@ -6,7 +6,9 @@ export interface SubagentLimits {
 	maxOutputCharsPerAgent: number;
 	maxPersistedOutputTailChars: number;
 	maxTaskPromptChars: number;
+	minRuntimeMsPerAgent: number;
 	maxRuntimeMsPerAgent: number;
+	timeoutRecoveryGraceMs: number;
 	maxQueuedMessages: number;
 	allowedCwdRoots: string[];
 	requireConfirmationForProjectAgents: boolean;
@@ -22,7 +24,9 @@ export const DEFAULT_SUBAGENT_LIMITS: SubagentLimits = {
 	maxOutputCharsPerAgent: 64_000,
 	maxPersistedOutputTailChars: 8_192,
 	maxTaskPromptChars: 40_000,
+	minRuntimeMsPerAgent: 5 * 60_000,
 	maxRuntimeMsPerAgent: 30 * 60_000,
+	timeoutRecoveryGraceMs: 60_000,
 	maxQueuedMessages: 50,
 	allowedCwdRoots: [],
 	requireConfirmationForProjectAgents: true,
@@ -36,4 +40,12 @@ export function normalizeLimits(overrides: Partial<SubagentLimits> = {}): Subage
 		...overrides,
 		allowedCwdRoots: overrides.allowedCwdRoots ? [...overrides.allowedCwdRoots] : [...DEFAULT_SUBAGENT_LIMITS.allowedCwdRoots],
 	};
+}
+
+export function normalizeRuntimeTimeoutMs(requested: number | undefined, limits: SubagentLimits): number {
+	const defaultTimeout = limits.maxRuntimeMsPerAgent;
+	if (requested === undefined || !Number.isFinite(requested) || requested <= 0) return defaultTimeout;
+	const normalized = Math.floor(requested);
+	if (normalized < limits.minRuntimeMsPerAgent) return defaultTimeout;
+	return Math.min(normalized, limits.maxRuntimeMsPerAgent);
 }

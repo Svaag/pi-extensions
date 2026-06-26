@@ -11,7 +11,7 @@ export const BatchCommonParams = {
 	maxConcurrency: Type.Optional(Type.Number({ description: "Maximum workers to run for this job. Defaults to 4, capped at 16." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for workers." })),
 	model: Type.Optional(Type.String({ description: "Optional model override for worker subagents." })),
-	timeoutMs: Type.Optional(Type.Number({ description: "Per-worker timeout in milliseconds." })),
+	timeoutMs: Type.Optional(Type.Number({ description: "Per-worker timeout in milliseconds. Values below 300000ms are ignored and use the default 30-minute runtime." })),
 	writeMode: Type.Optional(StringEnum(["read_only", "disjoint_scope", "git_worktree"] as const, { description: "Worker write policy. Defaults to read_only." })),
 	allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "Allowed paths for disjoint_scope workers." })),
 	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Worker context mode. Defaults to fresh." })),

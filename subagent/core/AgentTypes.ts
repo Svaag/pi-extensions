@@ -50,6 +50,7 @@ export interface AgentRecord {
 	prompt: string;
 	model?: string;
 	tools?: string[];
+	timeoutMs?: number;
 	createdAt: number;
 	startedAt?: number;
 	finishedAt?: number;
@@ -86,6 +87,7 @@ export type SubagentEventType =
 	| "agent.succeeded"
 	| "agent.failed"
 	| "agent.interrupted"
+	| "agent.timeout_recovery"
 	| "agent.closed"
 	| "agent.lost"
 	| "agent.message"

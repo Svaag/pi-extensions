@@ -26,6 +26,8 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - `edit`/`write` are blocked unless `writeMode: "disjoint_scope"` and the path is under `allowedPaths`.
 - `writeMode: "git_worktree"` is reserved for a later phase and currently rejected.
 - Running agents are killed on session shutdown/reload.
+- Explicit per-agent `timeoutMs` values below 5 minutes are ignored and normalized to the default 30-minute runtime to avoid accidental 120s cutoffs.
+- On runtime timeout, the manager first asks the child to stop tools and emit a partial final summary, then hard-aborts after a bounded recovery grace period while preserving output tails.
 - After restart/reload, previously running agents are reconstructed as `lost`, persisted with explicit `agent.lost` / `graph.edge_lost` events, and not claimed as controllable.
 
 ## Persistence
@@ -38,6 +40,7 @@ The extension persists append-only lifecycle state with `pi.appendEntry()`:
 - `agent.succeeded`
 - `agent.failed`
 - `agent.interrupted`
+- `agent.timeout_recovery`
 - `agent.closed`
 - `agent.lost`
 - `agent.message`

@@ -8,12 +8,13 @@ import { StateStore } from "../subagent/core/StateStore.ts";
 class FakeHandle implements AgentHandle {
 	readonly agentId: string;
 	closed = false;
+	messages: string[] = [];
 	constructor(agentId: string) {
 		this.agentId = agentId;
 	}
-	prompt(_message: string): Promise<void> { return Promise.resolve(); }
-	sendMessage(_message: string): Promise<void> { return Promise.resolve(); }
-	followupTask(_message: string): Promise<void> { return Promise.resolve(); }
+	prompt(message: string): Promise<void> { this.messages.push(message); return Promise.resolve(); }
+	sendMessage(message: string): Promise<void> { this.messages.push(message); return Promise.resolve(); }
+	followupTask(message: string): Promise<void> { this.messages.push(message); return Promise.resolve(); }
 	interrupt(_reason?: string): Promise<void> { this.closed = true; return Promise.resolve(); }
 	close(_reason?: string): Promise<void> { this.closed = true; return Promise.resolve(); }
 	isAlive(): boolean { return !this.closed; }
@@ -22,6 +23,7 @@ class FakeHandle implements AgentHandle {
 class FakeBackend implements AgentBackend {
 	requests: BackendSpawnRequest[] = [];
 	events = new Map<string, AgentBackendEvents>();
+	handles = new Map<string, FakeHandle>();
 	autoComplete = true;
 	async spawn(request: BackendSpawnRequest, events: AgentBackendEvents): Promise<AgentHandle> {
 		this.requests.push(request);
@@ -30,7 +32,9 @@ class FakeBackend implements AgentBackend {
 		if (this.autoComplete) {
 			queueMicrotask(() => events.onResult?.({ agentId: request.record.agentId, status: "succeeded", summary: "done", output: "done" } satisfies AgentResult));
 		}
-		return new FakeHandle(request.record.agentId);
+		const handle = new FakeHandle(request.record.agentId);
+		this.handles.set(request.record.agentId, handle);
+		return handle;
 	}
 }
 
@@ -55,7 +59,7 @@ function makeRecord(status: "queued" | "running" | "succeeded" | "failed" | "int
 	};
 }
 
-function manager(backend = new FakeBackend()) {
+function manager(backend = new FakeBackend(), limits: any = {}) {
 	const entries: any[] = [];
 	return {
 		backend,
@@ -64,7 +68,7 @@ function manager(backend = new FakeBackend()) {
 			backend,
 			store: new StateStore({ appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }) }),
 			rootCwd: "/tmp",
-			limits: { maxAgentsRunning: 1, maxAgentsTotal: 4, maxOpenAgents: 4 },
+			limits: { maxAgentsRunning: 1, maxAgentsTotal: 4, maxOpenAgents: 4, ...limits },
 		}),
 	};
 }
@@ -77,6 +81,28 @@ test("AgentManager lifecycle: spawn -> running -> succeeded", async () => {
 	assert.equal(waited.timedOut, false);
 	assert.equal(waited.agents[0].status, "succeeded");
 	assert.equal(waited.agents[0].summary, "done");
+});
+
+test("AgentManager ignores too-short runtime timeouts", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend);
+	await h.manager.spawnAgent({ taskName: "demo", prompt: "do it", timeoutMs: 120_000 });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.equal(backend.requests[0].timeoutMs, 30 * 60_000);
+});
+
+test("AgentManager recovers partial output when interrupting timed-out agents", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend);
+	const record = await h.manager.spawnAgent({ taskName: "demo", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	backend.events.get(record.agentId)?.onOutput?.("partial finding: inspect storage/models.py");
+	const interrupted = await h.manager.interruptAgent(record.agentId, "Timed out after 300000 ms");
+	assert.equal(interrupted.status, "interrupted");
+	assert.match(interrupted.result?.summary ?? "", /recovered/);
+	assert.equal(interrupted.result?.output, "partial finding: inspect storage/models.py");
 });
 
 test("AgentManager enforces max running by queueing", async () => {
