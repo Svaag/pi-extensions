@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { complete, type AssistantMessage, type Message, type TextContent } from "@earendil-works/pi-ai";
+import { complete, StringEnum, type AssistantMessage, type Message, type TextContent } from "@earendil-works/pi-ai";
 import {
 	convertToLlm,
 	serializeConversation,
@@ -18,7 +18,7 @@ import {
 import { Editor, type EditorTheme, Key, matchesKey, Text, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { Type } from "typebox";
 import {
 	extractProposedPlan,
@@ -28,8 +28,6 @@ import {
 	isTodoClosed,
 	isTodoDone,
 	isTodoOpen,
-	markCompletedSteps,
-	markExplicitNonDoneSteps,
 	renderPlanProgressMarkdown,
 	shouldUsePlanRefinementContext,
 	setTodoStatus,
@@ -40,7 +38,16 @@ import {
 
 const DEFAULT_NORMAL_TOOLS = ["read", "bash", "edit", "write"];
 const PLAN_QUESTIONS_TOOL = "plan_questions";
+const UPDATE_PLAN_TOOL = "update_plan";
+const PLAN_REPO_OVERVIEW_TOOL = "plan_repo_overview";
+const PLAN_FILES_TOOL = "plan_files";
+const PLAN_SEARCH_TOOL = "plan_search";
+const PLAN_READ_MANY_TOOL = "plan_read_many";
+const PLAN_EXPLORATION_TOOLS = [PLAN_REPO_OVERVIEW_TOOL, PLAN_FILES_TOOL, PLAN_SEARCH_TOOL, PLAN_READ_MANY_TOOL];
+const REQUIRED_PLAN_TOOLS = ["read", "bash", PLAN_QUESTIONS_TOOL, ...PLAN_EXPLORATION_TOOLS];
+const PLAN_MODE_OWNED_TOOLS = new Set([PLAN_QUESTIONS_TOOL, UPDATE_PLAN_TOOL, ...PLAN_EXPLORATION_TOOLS]);
 const MUTATING_TOOLS_IN_PLAN_MODE = new Set(["edit", "write"]);
+const PLAN_MODE_THINKING_LEVEL = "xhigh";
 const PLAN_AGENT_CONTEXT_CAP = 120_000;
 const MAX_PLAN_ROOT_CHOICES = 6;
 const PLAN_ROOT_SCORE_THRESHOLD = 60;
@@ -198,6 +205,59 @@ const PlanQuestionsParams = Type.Object({
 	questions: Type.Array(PlanQuestionSchema, { description: "Planning questions to ask the user in one TUI flow" }),
 });
 
+type UpdatePlanToolStatus = "pending" | "in_progress" | "completed" | "skipped" | "deferred" | "blocked";
+
+interface UpdatePlanToolItem {
+	step: string;
+	status: UpdatePlanToolStatus;
+}
+
+interface UpdatePlanToolResult {
+	explanation?: string;
+	todos: TodoItem[];
+	closed: number;
+	total: number;
+	currentStep?: string;
+}
+
+const UpdatePlanItemSchema = Type.Object({
+	step: Type.String({ description: "Task step text" }),
+	status: StringEnum(["pending", "in_progress", "completed", "skipped", "deferred", "blocked"] as const, {
+		description: "Step status",
+	}),
+});
+
+const UpdatePlanParams = Type.Object({
+	explanation: Type.Optional(Type.String({ description: "Optional short explanation for why the plan changed" })),
+	plan: Type.Array(UpdatePlanItemSchema, { description: "The full current ordered plan" }),
+});
+
+const PlanRepoOverviewParams = Type.Object({
+	maxFiles: Type.Optional(Type.Number({ description: "Maximum number of sample tracked files to include (default 80, max 200)" })),
+});
+
+const PlanFilesParams = Type.Object({
+	pattern: Type.Optional(Type.String({ description: "Optional substring or glob-like pattern to filter paths" })),
+	maxResults: Type.Optional(Type.Number({ description: "Maximum paths to return (default 200, max 1000)" })),
+});
+
+const PlanSearchParams = Type.Object({
+	query: Type.String({ description: "Search query or regular expression" }),
+	regex: Type.Optional(Type.Boolean({ description: "Treat query as a regex. Defaults to false, which searches literal text." })),
+	paths: Type.Optional(Type.Array(Type.String(), { description: "Optional relative paths/directories to search" })),
+	maxResults: Type.Optional(Type.Number({ description: "Maximum matches to return (default 80, max 300)" })),
+});
+
+const PlanReadManyFileSchema = Type.Object({
+	path: Type.String({ description: "File path to read" }),
+	offset: Type.Optional(Type.Number({ description: "1-indexed line number to start reading" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});
+
+const PlanReadManyParams = Type.Object({
+	files: Type.Array(PlanReadManyFileSchema, { description: "Files to read in one batch (max 12)" }),
+});
+
 function planQuestionsError(message: string, questions: PlanQuestion[] = []) {
 	return {
 		content: [{ type: "text" as const, text: message }],
@@ -211,6 +271,20 @@ You are not implementing the plan and you cannot ask the user follow-up question
 Use the forwarded planning conversation, any partial/current proposed plan, and the available choices to recommend the best answer.
 If the information is incomplete, choose the safest high-quality default and state the assumption.
 Return a concise answer that can be used directly as the user's planning answer: start with "Recommendation:" and include brief reasoning.`;
+
+const PLAN_MODE_SYSTEM_OVERLAY = `Pi Plan Mode is active as a strict developer-level mode.
+- Highest reasoning effort is selected for this mode by default.
+- Planning may use read-only exploration tools: read, bash, plan_repo_overview, plan_files, plan_search, plan_read_many, and plan_questions.
+- Use plan_repo_overview, plan_files, plan_search, plan_read_many, or read-only bash (rg/fd/find/git grep/git ls-files/git status/git diff/git log/etc.) to inspect the repo before asking user questions that can be answered from files.
+- Do not claim grep/find/search are unavailable; use the Plan Mode exploration tools or read-only bash.
+- Do not edit, write, apply patches, run fixers/formatters, or intentionally mutate repo-tracked files while in Plan Mode.
+- Only use plan_questions for implementation-detail decisions that cannot be resolved through non-mutating exploration.
+- Final plans must be wrapped in exactly one <proposed_plan> block and include dedicated tracker-level Implementation/Execution/Action steps.`;
+
+function withPlanModeSystemPrompt(event: any, suffix = ""): string {
+	const base = typeof event?.systemPrompt === "string" ? event.systemPrompt : "";
+	return `${base}\n\n${PLAN_MODE_SYSTEM_OVERLAY}${suffix ? `\n\n${suffix}` : ""}`;
+}
 
 function formatExistingAnswers(questions: PlanQuestion[], answers: Map<string, PlanQuestionAnswer>): string {
 	const lines: string[] = [];
@@ -304,11 +378,13 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 	let lastProposedPlan = "";
 	let todoItems: TodoItem[] = [];
 	let savedTools: string[] = [];
+	let savedThinkingLevel: string | undefined;
 	let savedPlanAbsolutePath: string | undefined;
 	let savedPlanRelativePath: string | undefined;
 	let savedPlanRoot: string | undefined;
 	let pendingEmptyContextPlanPath: string | undefined;
 	let contextResetActive = false;
+	const planModeBashSnapshots = new Map<string, { root: string; status: string }>();
 	const PLAN_CONTEXT_RESET_CUSTOM_TYPE = "plan-empty-context-execute";
 
 	pi.registerFlag("plan", {
@@ -522,6 +598,360 @@ ${lastProposedPlan}
 Start with step 1: ${firstStep}`;
 	}
 
+	function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+		const numberValue = typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : fallback;
+		return Math.max(min, Math.min(max, numberValue));
+	}
+
+	function isPlanOwnedTool(name: string): boolean {
+		return PLAN_MODE_OWNED_TOOLS.has(name);
+	}
+
+	function planToolResult(text: string, details: Record<string, unknown> = {}) {
+		return { content: [{ type: "text" as const, text }], details };
+	}
+
+	function shouldSkipRepoWalkDir(name: string): boolean {
+		return [".git", "node_modules", "vendor", "dist", "build", "target", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"].includes(name);
+	}
+
+	function hasGlobSyntax(pattern: string): boolean {
+		return /[*?[\]{}]/.test(pattern);
+	}
+
+	function globLikeToRegExp(pattern: string): RegExp {
+		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+		return new RegExp(escaped, "i");
+	}
+
+	function pathMatchesPattern(path: string, pattern: string | undefined): boolean {
+		const trimmed = pattern?.trim();
+		if (!trimmed) return true;
+		if (hasGlobSyntax(trimmed)) return globLikeToRegExp(trimmed).test(path);
+		return path.toLowerCase().includes(trimmed.toLowerCase());
+	}
+
+	async function resolveToolPath(path: string, ctx: ExtensionContext, root?: string): Promise<string> {
+		if (isAbsolute(path)) return path;
+		const cwdPath = join(ctx.cwd, path);
+		try {
+			await stat(cwdPath);
+			return cwdPath;
+		} catch {
+			return root && root !== ctx.cwd ? join(root, path) : cwdPath;
+		}
+	}
+
+	async function walkRepoFiles(root: string, maxFiles: number): Promise<string[]> {
+		const files: string[] = [];
+		async function walk(dir: string): Promise<void> {
+			if (files.length >= maxFiles) return;
+			let entries: { name: string; isDirectory(): boolean; isFile(): boolean }[];
+			try {
+				entries = await readdir(dir, { withFileTypes: true });
+			} catch {
+				return;
+			}
+
+			entries.sort((a, b) => a.name.localeCompare(b.name));
+			for (const entry of entries) {
+				if (files.length >= maxFiles) return;
+				const absolute = join(dir, entry.name);
+				if (entry.isDirectory()) {
+					if (!shouldSkipRepoWalkDir(entry.name)) await walk(absolute);
+					continue;
+				}
+				if (!entry.isFile()) continue;
+				const rel = relative(root, absolute);
+				if (rel && !rel.startsWith("..")) files.push(rel);
+			}
+		}
+		await walk(root);
+		return files;
+	}
+
+	async function listRepoFiles(ctx: ExtensionContext, root: string, maxFiles = 5000): Promise<{ files: string[]; source: "git" | "walk" }> {
+		const git = await pi.exec("git", ["-C", root, "ls-files"], { cwd: ctx.cwd, timeout: 10000, signal: ctx.signal });
+		if (git.code === 0) {
+			const files = git.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, maxFiles);
+			if (files.length > 0) return { files, source: "git" };
+		}
+		return { files: await walkRepoFiles(root, maxFiles), source: "walk" };
+	}
+
+	async function runGitLine(ctx: ExtensionContext, root: string, args: string[]): Promise<string | undefined> {
+		const result = await pi.exec("git", ["-C", root, ...args], { cwd: ctx.cwd, timeout: 5000, signal: ctx.signal });
+		if (result.code !== 0) return undefined;
+		return result.stdout.trim().split("\n").find((line) => line.trim().length > 0)?.trim();
+	}
+
+	function firstSegments(files: string[], take = 30): string[] {
+		const segments = new Set<string>();
+		for (const file of files) {
+			const first = file.split(/[\\/]/)[0];
+			if (first) segments.add(first);
+			if (segments.size >= take) break;
+		}
+		return [...segments];
+	}
+
+	function detectManifests(files: string[]): string[] {
+		const manifestPatterns = [
+			/(^|\/)package\.json$/,
+			/(^|\/)pnpm-workspace\.yaml$/,
+			/(^|\/)yarn\.lock$/,
+			/(^|\/)pyproject\.toml$/,
+			/(^|\/)requirements[^/]*\.txt$/,
+			/(^|\/)Cargo\.toml$/,
+			/(^|\/)go\.mod$/,
+			/(^|\/)pom\.xml$/,
+			/(^|\/)build\.gradle(?:\.kts)?$/,
+			/(^|\/)Makefile$/,
+			/(^|\/)justfile$/,
+			/(^|\/)AGENTS\.md$/,
+			/(^|\/)CLAUDE\.md$/,
+		];
+		return files.filter((file) => manifestPatterns.some((pattern) => pattern.test(file))).slice(0, 80);
+	}
+
+	function detectTestPaths(files: string[]): string[] {
+		return files.filter((file) => /(^|\/)(tests?|spec|__tests__)(\/|$)|\.(test|spec)\.[cm]?[jt]sx?$|_test\.(go|py)$/i.test(file)).slice(0, 80);
+	}
+
+	function formatPathList(paths: string[], empty = "(none found)"): string {
+		return paths.length > 0 ? paths.map((path) => `- ${path}`).join("\n") : empty;
+	}
+
+	function parseRgLine(line: string): { path: string; lineNumber: number; text: string } | undefined {
+		const match = line.match(/^(.*?):(\d+):(.*)$/);
+		if (!match) return undefined;
+		return { path: match[1], lineNumber: Number(match[2]), text: match[3] };
+	}
+
+	function fileIsWithinSearchPaths(file: string, paths: string[] | undefined): boolean {
+		if (!paths || paths.length === 0) return true;
+		return paths.some((raw) => {
+			const path = raw.replace(/^\.\//, "").replace(/\/$/, "");
+			return path === "." || file === path || file.startsWith(`${path}/`);
+		});
+	}
+
+	function escapeRegExp(text: string): string {
+		return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	}
+
+	async function fallbackSearch(ctx: ExtensionContext, root: string, query: string, regex: boolean, paths: string[] | undefined, maxResults: number) {
+		const matcher = regex ? new RegExp(query) : new RegExp(escapeRegExp(query));
+		const { files } = await listRepoFiles(ctx, root, 5000);
+		const matches: Array<{ path: string; lineNumber: number; text: string }> = [];
+
+		for (const file of files) {
+			if (matches.length >= maxResults) break;
+			if (!fileIsWithinSearchPaths(file, paths)) continue;
+			const absolute = join(root, file);
+			try {
+				const info = await stat(absolute);
+				if (info.size > 1_500_000) continue;
+				const text = await readFile(absolute, "utf8");
+				if (text.includes("\0")) continue;
+				const lines = text.split(/\r?\n/);
+				for (let i = 0; i < lines.length && matches.length < maxResults; i++) {
+					if (matcher.test(lines[i])) matches.push({ path: file, lineNumber: i + 1, text: lines[i] });
+				}
+			} catch {
+				// Ignore unreadable files during planning search.
+			}
+		}
+		return matches;
+	}
+
+	function renderSearchMatches(matches: Array<{ path: string; lineNumber: number; text: string }>, maxResults: number): string {
+		if (matches.length === 0) return "No matches found.";
+		const lines = matches.slice(0, maxResults).map((match) => `${match.path}:${match.lineNumber}: ${match.text}`);
+		return lines.join("\n");
+	}
+
+	pi.registerTool({
+		name: PLAN_REPO_OVERVIEW_TOOL,
+		label: "Plan Repo Overview",
+		description: "Get a concise read-only overview of the current repository/workspace for planning.",
+		promptSnippet: "Inspect repo layout, git status, manifests, and likely test paths for planning",
+		promptGuidelines: [
+			"Use plan_repo_overview at the start of Plan Mode when the repo shape is unknown; it is read-only and summarizes files, manifests, tests, and git state.",
+		],
+		parameters: PlanRepoOverviewParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const gitRoot = await gitRootForPath(ctx.cwd, ctx);
+			const root = gitRoot ?? ctx.cwd;
+			const maxFiles = clampInt((params as any).maxFiles, 80, 10, 200);
+			const { files, source } = await listRepoFiles(ctx, root, Math.max(1000, maxFiles));
+			const branch = gitRoot ? await runGitLine(ctx, root, ["branch", "--show-current"]) : undefined;
+			const statusResult = gitRoot
+				? await pi.exec("git", ["-C", root, "status", "--short"], { cwd: ctx.cwd, timeout: 5000, signal: ctx.signal })
+				: undefined;
+			const status = statusResult?.code === 0 && statusResult.stdout.trim() ? statusResult.stdout.trim().split(/\r?\n/).slice(0, 80) : [];
+			const manifests = detectManifests(files);
+			const tests = detectTestPaths(files);
+			const topLevel = firstSegments(files);
+			const sampleFiles = files.slice(0, maxFiles);
+
+			const text = [
+				"# Repository Overview",
+				`- cwd: ${ctx.cwd}`,
+				`- root: ${root}${gitRoot ? " (git)" : " (filesystem)"}`,
+				`- branch: ${branch || "(unknown)"}`,
+				`- file inventory source: ${source}`,
+				`- tracked/discovered files shown: ${sampleFiles.length}${files.length > sampleFiles.length ? ` of at least ${files.length}` : ""}`,
+				"",
+				"## Git Status",
+				status.length > 0 ? status.map((line) => `- ${line}`).join("\n") : "- clean or unavailable",
+				"",
+				"## Top-level Paths",
+				formatPathList(topLevel),
+				"",
+				"## Manifests / Context Files",
+				formatPathList(manifests),
+				"",
+				"## Likely Test Paths",
+				formatPathList(tests.slice(0, 30)),
+				"",
+				"## Sample Files",
+				formatPathList(sampleFiles),
+			].join("\n");
+
+			return planToolResult(text, { root, gitRoot, branch, source, status, manifests, tests, sampleFiles });
+		},
+		renderCall(args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold(`${PLAN_REPO_OVERVIEW_TOOL} `)) + theme.fg("muted", `${args.maxFiles ?? 80} files`), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: PLAN_FILES_TOOL,
+		label: "Plan Files",
+		description: "List repository files using git ls-files or a read-only filesystem walk. Supports optional pattern filtering.",
+		promptSnippet: "List repository files with optional pattern filtering for planning",
+		promptGuidelines: ["Use plan_files instead of guessing paths when you need to discover relevant files in Plan Mode."],
+		parameters: PlanFilesParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const root = await projectRoot(ctx);
+			const maxResults = clampInt((params as any).maxResults, 200, 1, 1000);
+			const pattern = typeof (params as any).pattern === "string" ? (params as any).pattern : undefined;
+			const { files, source } = await listRepoFiles(ctx, root, Math.max(5000, maxResults));
+			const matches = files.filter((file) => pathMatchesPattern(file, pattern));
+			const shown = matches.slice(0, maxResults);
+			const text = [`Found ${matches.length} matching file(s) via ${source}${matches.length > shown.length ? `; showing ${shown.length}.` : "."}`, "", formatPathList(shown)].join("\n");
+			return planToolResult(text, { root, source, pattern, totalMatches: matches.length, files: shown });
+		},
+		renderCall(args, theme) {
+			const pattern = args.pattern ? ` ${String(args.pattern)}` : "";
+			return new Text(theme.fg("toolTitle", theme.bold(`${PLAN_FILES_TOOL}${pattern}`)), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: PLAN_SEARCH_TOOL,
+		label: "Plan Search",
+		description: "Search repository text read-only using ripgrep when available, with a JavaScript fallback.",
+		promptSnippet: "Search code and docs read-only for planning",
+		promptGuidelines: [
+			"Use plan_search for repo-wide code search in Plan Mode; do not claim grep/find/search are unavailable.",
+			"Prefer plan_search before asking the user questions that can be answered from files, symbols, manifests, or docs.",
+		],
+		parameters: PlanSearchParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const query = String((params as any).query ?? "");
+			if (!query.trim()) return planToolResult("Error: query is required", { matches: [] });
+			const root = await projectRoot(ctx);
+			const maxResults = clampInt((params as any).maxResults, 80, 1, 300);
+			const regex = Boolean((params as any).regex);
+			const paths = Array.isArray((params as any).paths) ? (params as any).paths.filter((path: unknown): path is string => typeof path === "string" && path.trim()) : undefined;
+
+			const rgArgs = [
+				"--line-number",
+				"--no-heading",
+				"--color",
+				"never",
+				"--hidden",
+				"--glob",
+				"!.git/**",
+				"--glob",
+				"!node_modules/**",
+				"--glob",
+				"!dist/**",
+				"--glob",
+				"!build/**",
+				"--glob",
+				"!target/**",
+				"--max-count",
+				String(maxResults),
+			];
+			if (!regex) rgArgs.push("--fixed-strings");
+			rgArgs.push(query, ...(paths && paths.length > 0 ? paths : ["."]));
+
+			const rg = await pi.exec("rg", rgArgs, { cwd: root, timeout: 15000, signal: ctx.signal });
+			if (rg.code === 0 || rg.code === 1) {
+				const matches = rg.stdout.split(/\r?\n/).filter(Boolean).map(parseRgLine).filter((match): match is { path: string; lineNumber: number; text: string } => Boolean(match)).slice(0, maxResults);
+				return planToolResult(renderSearchMatches(matches, maxResults), { root, engine: "rg", query, regex, paths, matches });
+			}
+
+			let matches: Array<{ path: string; lineNumber: number; text: string }>;
+			try {
+				matches = await fallbackSearch(ctx, root, query, regex, paths, maxResults);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				return planToolResult(`Search failed. ripgrep error: ${rg.stderr.trim() || rg.stdout.trim() || `exit ${rg.code}`}\nFallback error: ${message}`, { root, engine: "error", query, regex, paths });
+			}
+			return planToolResult(renderSearchMatches(matches, maxResults), { root, engine: "fallback", query, regex, paths, matches, rgError: rg.stderr.trim() });
+		},
+		renderCall(args, theme) {
+			return new Text(theme.fg("toolTitle", theme.bold(`${PLAN_SEARCH_TOOL} `)) + theme.fg("muted", truncateToWidth(String(args.query ?? ""), 80)), 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: PLAN_READ_MANY_TOOL,
+		label: "Plan Read Many",
+		description: "Read multiple files in one read-only batch for planning. Useful after plan_search or plan_files.",
+		promptSnippet: "Read multiple files or line ranges in one batch for planning",
+		promptGuidelines: ["Use plan_read_many after plan_search or plan_files when multiple files must be inspected before producing a plan."],
+		parameters: PlanReadManyParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const files = Array.isArray((params as any).files) ? (params as any).files.slice(0, 12) : [];
+			if (files.length === 0) return planToolResult("Error: provide at least one file to read", { files: [] });
+
+			const root = await projectRoot(ctx);
+			const blocks: string[] = [];
+			const details: Array<{ path: string; start: number; end: number; totalLines: number; error?: string }> = [];
+			for (const request of files) {
+				const path = String(request?.path ?? "").trim();
+				if (!path) continue;
+				const absolute = await resolveToolPath(path, ctx, root);
+				try {
+					const raw = await readFile(absolute, "utf8");
+					if (raw.includes("\0")) throw new Error("appears to be binary");
+					const allLines = raw.split(/\r?\n/);
+					const start = clampInt(request?.offset, 1, 1, Math.max(1, allLines.length));
+					const limit = clampInt(request?.limit, 160, 1, 300);
+					const slice = allLines.slice(start - 1, start - 1 + limit);
+					const end = start + slice.length - 1;
+					blocks.push([`## ${path} (${start}-${end} of ${allLines.length})`, "~~~", slice.join("\n"), "~~~"].join("\n"));
+					details.push({ path, start, end, totalLines: allLines.length });
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					blocks.push(`## ${path}\nError: ${message}`);
+					details.push({ path, start: 0, end: 0, totalLines: 0, error: message });
+				}
+			}
+
+			return planToolResult(blocks.join("\n\n"), { files: details });
+		},
+		renderCall(args, theme) {
+			const count = Array.isArray(args.files) ? args.files.length : 0;
+			return new Text(theme.fg("toolTitle", theme.bold(`${PLAN_READ_MANY_TOOL} `)) + theme.fg("muted", `${count} file${count === 1 ? "" : "s"}`), 0, 0);
+		},
+	});
+
 	pi.registerTool({
 		name: PLAN_QUESTIONS_TOOL,
 		label: "Plan Questions",
@@ -570,6 +1000,11 @@ Start with step 1: ${firstStep}`;
 				let agentReviewAbort: AbortController | null = null;
 				let cachedLines: string[] | undefined;
 				let cachedWidth: number | undefined;
+				let cachedMaxLines: number | undefined;
+				let scrollOffset = 0;
+				let maxScrollOffset = 0;
+				let lastBodyHeight = 0;
+				let lastRenderedViewKey = "";
 				const answers = new Map<string, PlanQuestionAnswer>();
 
 				const editorTheme: EditorTheme = {
@@ -587,7 +1022,38 @@ Start with step 1: ${firstStep}`;
 				function refresh(): void {
 					cachedLines = undefined;
 					cachedWidth = undefined;
+					cachedMaxLines = undefined;
 					tui.requestRender();
+				}
+
+				function resetScroll(): void {
+					scrollOffset = 0;
+				}
+
+				function maxDialogLines(): number {
+					const rows = typeof process !== "undefined" && process.stdout?.rows ? process.stdout.rows : 24;
+					return Math.max(6, Math.floor(rows * 0.8) - 1);
+				}
+
+				function scrollBy(delta: number): boolean {
+					if (maxScrollOffset <= 0) return false;
+					const next = Math.max(0, Math.min(maxScrollOffset, scrollOffset + delta));
+					if (next === scrollOffset) return false;
+					scrollOffset = next;
+					refresh();
+					return true;
+				}
+
+				function scrollPage(direction: 1 | -1): boolean {
+					return scrollBy(direction * Math.max(1, lastBodyHeight - 1));
+				}
+
+				function handleScrollInput(data: string, allowArrowKeys = false): boolean {
+					if (matchesKey(data, "pageUp")) return scrollPage(-1);
+					if (matchesKey(data, "pageDown")) return scrollPage(1);
+					if (allowArrowKeys && matchesKey(data, Key.up)) return scrollBy(-1);
+					if (allowArrowKeys && matchesKey(data, Key.down)) return scrollBy(1);
+					return false;
 				}
 
 				function submit(cancelled: boolean): void {
@@ -669,6 +1135,7 @@ Start with step 1: ${firstStep}`;
 
 				function handleInput(data: string): void {
 					if (modelSelectMode) {
+						if (handleScrollInput(data)) return;
 						if (matchesKey(data, Key.up)) {
 							modelSelectIndex = Math.max(0, modelSelectIndex - 1);
 							refresh();
@@ -706,6 +1173,8 @@ Start with step 1: ${firstStep}`;
 							}
 							return;
 						}
+
+						if (handleScrollInput(data, true)) return;
 
 						if (matchesKey(data, Key.enter) && agentReviewText.trim() && agentReviewQuestionId) {
 							const answer = agentReviewText.trim();
@@ -750,6 +1219,8 @@ Start with step 1: ${firstStep}`;
 					const q = currentQuestion();
 					const opts = currentOptions();
 
+					if (handleScrollInput(data)) return;
+
 					if (isMulti) {
 						if (matchesKey(data, Key.tab) || matchesKey(data, Key.right)) {
 							currentTab = (currentTab + 1) % totalTabs;
@@ -766,6 +1237,7 @@ Start with step 1: ${firstStep}`;
 					}
 
 					if (currentTab === questions.length) {
+						if (handleScrollInput(data, true)) return;
 						if (matchesKey(data, Key.enter) && allAnswered()) submit(false);
 						else if (matchesKey(data, Key.escape)) submit(true);
 						return;
@@ -809,39 +1281,72 @@ Start with step 1: ${firstStep}`;
 				}
 
 				function render(width: number): string[] {
-					if (cachedLines && cachedWidth === width) return cachedLines;
-					const lines: string[] = [];
+					const maxLines = maxDialogLines();
+					const viewKey = [
+						currentTab,
+						inputMode ? `input:${inputQuestionId ?? ""}` : "",
+						modelSelectMode ? `model:${modelSelectQuestionId ?? ""}` : "",
+						agentReviewMode
+							? `agent:${agentReviewQuestionId ?? ""}:${agentReviewRunning ? "running" : agentReviewError ? "error" : "done"}`
+							: "",
+					].join("|");
+					if (viewKey !== lastRenderedViewKey) {
+						resetScroll();
+						lastRenderedViewKey = viewKey;
+						cachedLines = undefined;
+						cachedWidth = undefined;
+						cachedMaxLines = undefined;
+					}
+					if (cachedLines && cachedWidth === width && cachedMaxLines === maxLines) return cachedLines;
+
 					const renderWidth = Math.max(1, width);
 					const q = currentQuestion();
 					const opts = currentOptions();
+					const headerLines: string[] = [];
+					const bodyLines: string[] = [];
+					const borderLine = theme.fg("accent", "─".repeat(renderWidth));
+					let footerHelp: string | undefined;
 
-					function addWrapped(text: string): void {
+					function addWrappedTo(target: string[], text: string): void {
 						const wrapped = wrapTextWithAnsi(text, renderWidth);
-						if (wrapped.length === 0) lines.push("");
-						else lines.push(...wrapped);
+						if (wrapped.length === 0) target.push("");
+						else target.push(...wrapped);
 					}
 
-					function addWrappedWithPrefix(prefix: string, text: string, continuationPrefix = " ".repeat(visibleWidth(prefix))): void {
+					function addWrappedWithPrefixTo(
+						target: string[],
+						prefix: string,
+						text: string,
+						continuationPrefix = " ".repeat(visibleWidth(prefix)),
+					): void {
 						const prefixWidth = visibleWidth(prefix);
 						const continuationWidth = visibleWidth(continuationPrefix);
 						const reservedWidth = Math.max(prefixWidth, continuationWidth);
 						if (reservedWidth >= renderWidth) {
-							addWrapped(prefix + text);
+							addWrappedTo(target, prefix + text);
 							return;
 						}
 
 						const wrapped = wrapTextWithAnsi(text, renderWidth - reservedWidth);
 						if (wrapped.length === 0) {
-							lines.push(truncateToWidth(prefix, renderWidth, ""));
+							target.push(truncateToWidth(prefix, renderWidth, ""));
 							return;
 						}
 
 						for (let i = 0; i < wrapped.length; i++) {
-							lines.push(`${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`);
+							target.push(`${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`);
 						}
 					}
 
-					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+					function addWrapped(text: string): void {
+						addWrappedTo(bodyLines, text);
+					}
+
+					function addWrappedWithPrefix(prefix: string, text: string, continuationPrefix = " ".repeat(visibleWidth(prefix))): void {
+						addWrappedWithPrefixTo(bodyLines, prefix, text, continuationPrefix);
+					}
+
+					headerLines.push(borderLine);
 
 					if (isMulti) {
 						const tabs: string[] = ["← "];
@@ -858,8 +1363,8 @@ Start with step 1: ${firstStep}`;
 								? theme.bg("selectedBg", theme.fg("text", submitText))
 								: theme.fg(allAnswered() ? "success" : "dim", submitText),
 						);
-						addWrappedWithPrefix(" ", `${tabs.join(" ")} →`);
-						lines.push("");
+						addWrappedWithPrefixTo(headerLines, " ", `${tabs.join(" ")} →`);
+						headerLines.push("");
 					}
 
 					function renderOptions(): void {
@@ -878,16 +1383,16 @@ Start with step 1: ${firstStep}`;
 
 					function addMultiline(text: string, color: "text" | "muted" | "warning" | "error" | "success" = "text"): void {
 						for (const line of text.split("\n")) {
-							if (line.length === 0) lines.push("");
+							if (line.length === 0) bodyLines.push("");
 							else addWrappedWithPrefix(" ", theme.fg(color, line));
 						}
 					}
 
 					if (modelSelectMode && q) {
 						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
-						lines.push("");
+						bodyLines.push("");
 						addWrappedWithPrefix(" ", theme.fg("accent", "Choose a scoped model for the plan-review agent:"));
-						lines.push("");
+						bodyLines.push("");
 						if (planAgentModelOptions.length === 0) {
 							addWrappedWithPrefix(" ", theme.fg("warning", "No authenticated scoped models found."));
 							addWrappedWithPrefix(" ", theme.fg("muted", "Configure enabledModels in ~/.pi/agent/settings.json or .pi/settings.json."));
@@ -903,61 +1408,91 @@ Start with step 1: ${firstStep}`;
 								if (option.description) addWrappedWithPrefix("     ", theme.fg("muted", option.description));
 							}
 						}
-						lines.push("");
-						addWrappedWithPrefix(" ", theme.fg("dim", planAgentModelOptions.length > 0 ? "↑↓ select • Enter ask agent • Esc back" : "Esc back"));
+						footerHelp = theme.fg("dim", planAgentModelOptions.length > 0 ? "↑↓ select • Enter ask agent • Esc back" : "Esc back");
 					} else if (agentReviewMode && q) {
 						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
-						lines.push("");
+						bodyLines.push("");
 						if (agentReviewRunning) {
 							addWrappedWithPrefix(" ", theme.fg("accent", "Asking the selected plan-review model..."));
-							lines.push("");
+							bodyLines.push("");
 							addWrappedWithPrefix(" ", theme.fg("dim", "Forwarding the current planning conversation and any draft/proposed plan."));
-							addWrappedWithPrefix(" ", theme.fg("dim", "Esc cancels"));
+							footerHelp = theme.fg("dim", "Esc cancels");
 						} else if (agentReviewError) {
 							addWrappedWithPrefix(" ", theme.fg("error", "Agent review failed:"));
 							addMultiline(agentReviewError, "error");
-							lines.push("");
-							addWrappedWithPrefix(" ", theme.fg("dim", "Esc back"));
+							footerHelp = theme.fg("dim", "Esc back");
 						} else {
 							addWrappedWithPrefix(" ", theme.fg("accent", `Agent recommendation${agentReviewModel ? ` (${agentReviewModel})` : ""}:`));
-							lines.push("");
+							bodyLines.push("");
 							addMultiline(agentReviewText || "(empty response)");
-							lines.push("");
-							addWrappedWithPrefix(" ", theme.fg("dim", "Enter use as answer • E edit before using • Esc back"));
+							footerHelp = theme.fg("dim", "Enter use as answer • E edit before using • Esc back");
 						}
 					} else if (inputMode && q) {
 						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
-						lines.push("");
+						bodyLines.push("");
 						renderOptions();
-						lines.push("");
+						bodyLines.push("");
 						addWrappedWithPrefix(" ", theme.fg("muted", "Your answer:"));
-						for (const line of editor.render(Math.max(1, renderWidth - 2))) lines.push(` ${line}`);
-						lines.push("");
-						addWrappedWithPrefix(" ", theme.fg("dim", "Enter to save • Esc back"));
+						for (const line of editor.render(Math.max(1, renderWidth - 2))) bodyLines.push(` ${line}`);
+						footerHelp = theme.fg("dim", "Enter to save • Esc back");
 					} else if (currentTab === questions.length) {
 						addWrappedWithPrefix(" ", theme.fg("accent", theme.bold("Review answers")));
-						lines.push("");
+						bodyLines.push("");
 						for (const question of questions) {
 							const answer = answers.get(question.id);
 							const prefix = theme.fg("muted", ` ${question.label}: `);
 							const text = answer ? theme.fg("text", answer.label) : theme.fg("warning", "unanswered");
 							addWrappedWithPrefix(prefix, text);
 						}
-						lines.push("");
-						addWrappedWithPrefix(" ", allAnswered() ? theme.fg("success", "Press Enter to submit") : theme.fg("warning", "Tab back to answer missing questions"));
+						footerHelp = allAnswered() ? theme.fg("success", "Enter submit") : theme.fg("warning", "Tab back to answer missing questions");
 					} else if (q) {
 						addWrappedWithPrefix(" ", theme.fg("text", q.prompt));
-						lines.push("");
+						bodyLines.push("");
 						renderOptions();
 					}
 
-					lines.push("");
-					if (!inputMode && !agentReviewMode && !modelSelectMode) {
-						addWrappedWithPrefix(" ", theme.fg("dim", isMulti ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel" : "↑↓ select • Enter confirm • Esc cancel"));
+					if (!footerHelp && !inputMode && !agentReviewMode && !modelSelectMode) {
+						footerHelp = theme.fg("dim", isMulti ? "Tab/←→ navigate • ↑↓ select • Enter confirm • Esc cancel" : "↑↓ select • Enter confirm • Esc cancel");
 					}
-					lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+
+					function buildFooter(scrollable: boolean, visibleRows: number): string[] {
+						const footerLines: string[] = [];
+						const parts: string[] = [];
+						if (scrollable) {
+							const visibleCount = Math.max(1, visibleRows);
+							const hintOffset = Math.min(scrollOffset, Math.max(0, bodyLines.length - visibleCount));
+							const from = bodyLines.length === 0 ? 0 : hintOffset + 1;
+							const to = Math.min(bodyLines.length, hintOffset + visibleCount);
+							const scrollKeys = currentTab === questions.length || (agentReviewMode && !agentReviewRunning) ? "↑↓/PgUp/PgDn scroll" : "PgUp/PgDn scroll";
+							parts.push(theme.fg("dim", `${scrollKeys} (${from}-${to}/${bodyLines.length})`));
+						}
+						if (footerHelp) parts.push(footerHelp);
+						if (parts.length > 0) {
+							footerLines.push("");
+							addWrappedWithPrefixTo(footerLines, " ", parts.join(theme.fg("dim", " • ")));
+						}
+						footerLines.push(borderLine);
+						return footerLines;
+					}
+
+					let footerLines = buildFooter(false, 0);
+					let bodyHeight = Math.max(0, maxLines - headerLines.length - footerLines.length);
+					let scrollable = bodyLines.length > bodyHeight;
+					footerLines = buildFooter(scrollable, bodyHeight);
+					bodyHeight = Math.max(0, maxLines - headerLines.length - footerLines.length);
+					scrollable = bodyLines.length > bodyHeight;
+					footerLines = buildFooter(scrollable, bodyHeight);
+					bodyHeight = Math.max(0, maxLines - headerLines.length - footerLines.length);
+
+					lastBodyHeight = bodyHeight;
+					maxScrollOffset = Math.max(0, bodyLines.length - bodyHeight);
+					scrollOffset = Math.min(scrollOffset, maxScrollOffset);
+
+					const visibleBody = bodyHeight > 0 ? bodyLines.slice(scrollOffset, scrollOffset + bodyHeight) : [];
+					const lines = [...headerLines, ...visibleBody, ...footerLines];
 					cachedLines = lines;
 					cachedWidth = width;
+					cachedMaxLines = maxLines;
 					return lines;
 				}
 
@@ -966,6 +1501,7 @@ Start with step 1: ${firstStep}`;
 					invalidate: () => {
 						cachedLines = undefined;
 						cachedWidth = undefined;
+						cachedMaxLines = undefined;
 					},
 					handleInput,
 				};
@@ -1014,6 +1550,184 @@ Start with step 1: ${firstStep}`;
 		},
 	});
 
+	pi.registerTool({
+		name: UPDATE_PLAN_TOOL,
+		label: "Update Plan",
+		description:
+			"Update the active Plan Mode execution checklist. Provide the full ordered plan with each step status. At most one step may be in_progress.",
+		promptSnippet: "Update the active Plan Mode execution checklist with structured step statuses",
+		promptGuidelines: [
+			"Use update_plan during Plan Mode execution to keep the todo list current; do not use prose markers like [DONE:n] as the primary progress mechanism.",
+			"Call update_plan before starting a new step, marking exactly one step in_progress, and call it again when that step becomes completed, skipped, deferred, or blocked.",
+			"Every update_plan call must include the full ordered checklist, not just the changed step.",
+		],
+		parameters: UpdatePlanParams,
+		prepareArguments(args: any) {
+			if (!args || typeof args !== "object" || !Array.isArray(args.plan)) return args;
+			return {
+				...args,
+				plan: args.plan.map((item: any) => {
+					if (!item || typeof item !== "object") return item;
+					const raw = typeof item.status === "string" ? item.status : "";
+					const status = raw
+						.replace(/-/g, "_")
+						.replace(/^inProgress$/i, "in_progress")
+						.replace(/^complete$/i, "completed")
+						.replace(/^done$/i, "completed")
+						.toLowerCase();
+					return { ...item, status };
+				}),
+			};
+		},
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			if (planModeEnabled) {
+				throw new Error("update_plan is a TODO/checklist tool for implementation progress and is not allowed while still planning.");
+			}
+			if (!executionMode || todoItems.length === 0) {
+				throw new Error("No active Plan Mode execution checklist. Accept a proposed plan before using update_plan.");
+			}
+
+			todoItems = normalizeUpdatePlanItems(params.plan as UpdatePlanToolItem[]);
+			const details = buildUpdatePlanToolResult(params.explanation, todoItems);
+			persistState();
+			const finished = await finishPlanExecutionIfComplete(ctx);
+			if (!finished) {
+				await updateSavedPlanProgress(ctx);
+				updateStatus(ctx);
+			}
+
+			return {
+				content: [{ type: "text" as const, text: updatePlanToolResultText(details) }],
+				details,
+			};
+		},
+
+		renderCall(args, theme) {
+			const count = Array.isArray(args.plan) ? args.plan.length : 0;
+			let text = theme.fg("toolTitle", theme.bold("update_plan "));
+			text += theme.fg("muted", `${count} step${count === 1 ? "" : "s"}`);
+			if (args.explanation) text += theme.fg("dim", ` — ${truncateToWidth(String(args.explanation), 60)}`);
+			return new Text(text, 0, 0);
+		},
+
+		renderResult(result, { expanded }, theme) {
+			const details = result.details as UpdatePlanToolResult | undefined;
+			if (!details) {
+				const text = result.content[0];
+				return new Text(text?.type === "text" ? text.text : "", 0, 0);
+			}
+
+			const lines: string[] = [];
+			if (details.explanation?.trim()) lines.push(theme.fg("dim", details.explanation.trim()));
+			lines.push(theme.fg("muted", `${details.closed}/${details.total} closed`));
+			const display = expanded ? details.todos : details.todos.slice(0, 8);
+			for (const todo of display) {
+				const status = todo.status ?? (todo.completed ? "done" : "pending");
+				const icon = statusIcon(status);
+				const color = status === "done" ? "success" : status === "in_progress" ? "accent" : status === "blocked" ? "error" : status === "deferred" ? "warning" : "muted";
+				const text = status === "done" || status === "skipped" ? theme.strikethrough(todo.text) : todo.text;
+				lines.push(`${theme.fg(color, icon)} ${theme.fg(status === "pending" ? "muted" : color, text)}`);
+			}
+			if (!expanded && details.todos.length > display.length) {
+				lines.push(theme.fg("dim", `... ${details.todos.length - display.length} more`));
+			}
+			return new Text(lines.join("\n"), 0, 0);
+		},
+	});
+
+	function todoStatusFromUpdatePlanStatus(status: UpdatePlanToolStatus): TodoStatus {
+		switch (status) {
+			case "completed":
+				return "done";
+			case "in_progress":
+				return "in_progress";
+			case "skipped":
+				return "skipped";
+			case "deferred":
+				return "deferred";
+			case "blocked":
+				return "blocked";
+			default:
+				return "pending";
+		}
+	}
+
+	function normalizeUpdatePlanItems(plan: UpdatePlanToolItem[]): TodoItem[] {
+		if (plan.length === 0) throw new Error("update_plan requires at least one plan item.");
+		const inProgressCount = plan.filter((item) => item.status === "in_progress").length;
+		if (inProgressCount > 1) throw new Error("update_plan accepts at most one in_progress step.");
+
+		return plan.map((item, index) => {
+			const text = item.step.trim();
+			if (!text) throw new Error(`update_plan step ${index + 1} has empty text.`);
+			const status = todoStatusFromUpdatePlanStatus(item.status);
+			const todo: TodoItem = { step: index + 1, text, completed: false, status };
+			setTodoStatus(todo, status);
+			return todo;
+		});
+	}
+
+	function statusIcon(status: TodoStatus): string {
+		switch (status) {
+			case "done":
+				return "✓";
+			case "in_progress":
+				return "▶";
+			case "skipped":
+				return "⊘";
+			case "deferred":
+				return "↷";
+			case "blocked":
+				return "⚠";
+			default:
+				return "○";
+		}
+	}
+
+	function buildUpdatePlanToolResult(explanation: string | undefined, todos: TodoItem[]): UpdatePlanToolResult {
+		const closed = todos.filter((todo) => isTodoClosed(todo)).length;
+		const currentStep = todos.find((todo) => (todo.status ?? (todo.completed ? "done" : "pending")) === "in_progress")?.text;
+		return { explanation, todos: todos.map((todo) => ({ ...todo })), closed, total: todos.length, currentStep };
+	}
+
+	function updatePlanToolResultText(details: UpdatePlanToolResult): string {
+		const current = details.currentStep ? ` Current: ${details.currentStep}` : "";
+		const explanation = details.explanation?.trim() ? `\n${details.explanation.trim()}` : "";
+		return `Plan updated: ${details.closed}/${details.total} closed.${current}${explanation}`;
+	}
+
+	function coerceTodoStatus(status: unknown, completed = false): TodoStatus {
+		switch (status) {
+			case "completed":
+			case "done":
+				return "done";
+			case "in_progress":
+				return "in_progress";
+			case "skipped":
+				return "skipped";
+			case "deferred":
+				return "deferred";
+			case "blocked":
+				return "blocked";
+			default:
+				return completed ? "done" : "pending";
+		}
+	}
+
+	function normalizeStoredTodoItems(raw: unknown): TodoItem[] {
+		if (!Array.isArray(raw)) return [];
+		return raw.flatMap((item, index): TodoItem[] => {
+			if (!item || typeof item !== "object") return [];
+			const text = typeof (item as any).text === "string" ? (item as any).text.trim() : "";
+			if (!text) return [];
+			const status = coerceTodoStatus((item as any).status, Boolean((item as any).completed));
+			const todo: TodoItem = { step: index + 1, text, completed: false, status };
+			setTodoStatus(todo, status);
+			return [todo];
+		});
+	}
+
 	function updateStatus(ctx: ExtensionContext): void {
 		// Footer status
 		if (executionMode && todoItems.length > 0) {
@@ -1034,6 +1748,7 @@ Start with step 1: ${firstStep}`;
 						ctx.ui.theme.fg("success", "☑ ") + ctx.ui.theme.fg("muted", ctx.ui.theme.strikethrough(item.text))
 					);
 				}
+				if (status === "in_progress") return `${ctx.ui.theme.fg("accent", "▶ ")}${item.text}`;
 				if (status === "skipped") return `${ctx.ui.theme.fg("muted", "⊘ ")}${ctx.ui.theme.strikethrough(item.text)}`;
 				if (status === "deferred") return `${ctx.ui.theme.fg("warning", "↷ ")}${item.text}`;
 				if (status === "blocked") return `${ctx.ui.theme.fg("error", "⚠ ")}${item.text}`;
@@ -1084,10 +1799,8 @@ Start with step 1: ${firstStep}`;
 	}
 
 	function planModeToolNames(names: string[]): string[] {
-		const safeTools = names.filter(
-			(name: string) => !MUTATING_TOOLS_IN_PLAN_MODE.has(name) && name !== PLAN_QUESTIONS_TOOL,
-		);
-		return existingToolNames([...safeTools, PLAN_QUESTIONS_TOOL]);
+		const safeTools = names.filter((name: string) => !MUTATING_TOOLS_IN_PLAN_MODE.has(name) && !isPlanOwnedTool(name));
+		return existingToolNames([...new Set([...safeTools, ...REQUIRED_PLAN_TOOLS])]);
 	}
 
 	function defaultNormalTools(): string[] {
@@ -1099,8 +1812,26 @@ Start with step 1: ${firstStep}`;
 	}
 
 	function restoreSavedTools(): void {
-		const toolsToRestore = existingToolNames(savedTools.filter((name: string) => name !== PLAN_QUESTIONS_TOOL));
+		const toolsToRestore = existingToolNames(savedTools.filter((name: string) => !isPlanOwnedTool(name)));
 		pi.setActiveTools(toolsToRestore.length > 0 ? toolsToRestore : defaultNormalTools());
+	}
+
+	function enableExecutionTools(): void {
+		const active = currentActiveToolNames().filter((name: string) => !isPlanOwnedTool(name));
+		const base = active.length > 0 ? active : defaultNormalTools();
+		pi.setActiveTools(existingToolNames([...new Set([...base, UPDATE_PLAN_TOOL])]));
+	}
+
+	function enterPlanThinkingMode(): void {
+		if (savedThinkingLevel === undefined) savedThinkingLevel = pi.getThinkingLevel();
+		pi.setThinkingLevel(PLAN_MODE_THINKING_LEVEL as any);
+	}
+
+	function restoreSavedThinkingLevel(): void {
+		if (savedThinkingLevel !== undefined) {
+			pi.setThinkingLevel(savedThinkingLevel as any);
+			savedThinkingLevel = undefined;
+		}
 	}
 
 	function togglePlanMode(ctx: ExtensionContext): void {
@@ -1116,19 +1847,20 @@ Start with step 1: ${firstStep}`;
 		planModeEnabled = !planModeEnabled;
 
 		if (planModeEnabled) {
-			// Save current tools and filter out edit/write. pi.getActiveTools() returns tool names.
+			// Save current tools and filter out Plan Mode-owned tools. pi.getActiveTools() returns tool names.
 			const currentTools = currentActiveToolNames();
-			savedTools = (currentTools.length > 0 ? currentTools : defaultNormalTools()).filter(
-				(name: string) => name !== PLAN_QUESTIONS_TOOL,
-			);
+			savedTools = (currentTools.length > 0 ? currentTools : defaultNormalTools()).filter((name: string) => !isPlanOwnedTool(name));
 			pi.setActiveTools(planModeToolNames(savedTools));
+			enterPlanThinkingMode();
 			lastProposedPlan = "";
 			todoItems = [];
 			contextResetActive = false;
-			ctx.ui.notify(`Plan mode enabled. Mutating tools (edit/write) disabled.`);
+			ctx.ui.notify(`Plan mode enabled. Read-only exploration tools and ${PLAN_MODE_THINKING_LEVEL} thinking enabled; mutating tools (edit/write) disabled.`);
 		} else {
 			contextResetActive = false;
+			planModeBashSnapshots.clear();
 			restoreSavedTools();
+			restoreSavedThinkingLevel();
 			ctx.ui.notify("Plan mode disabled. Full access restored.");
 		}
 		persistState();
@@ -1142,6 +1874,7 @@ Start with step 1: ${firstStep}`;
 			executing: executionMode,
 			lastProposedPlan: lastProposedPlan,
 			savedTools: savedTools,
+			savedThinkingLevel,
 			savedPlanAbsolutePath,
 			savedPlanRelativePath,
 			savedPlanRoot,
@@ -1151,6 +1884,17 @@ Start with step 1: ${firstStep}`;
 
 	function sameTodoTexts(a: TodoItem[], b: TodoItem[]): boolean {
 		return a.length === b.length && a.every((item, index) => item.text.toLowerCase() === b[index]?.text.toLowerCase());
+	}
+
+	function sameTodoState(a: TodoItem[], b: TodoItem[]): boolean {
+		return (
+			sameTodoTexts(a, b) &&
+			a.every(
+				(item, index) =>
+					(item.status ?? (item.completed ? "done" : "pending")) ===
+					(b[index]?.status ?? (b[index]?.completed ? "done" : "pending")),
+			)
+		);
 	}
 
 	function normalizeTodoTextForMigration(text: string): string {
@@ -1201,8 +1945,10 @@ Start with step 1: ${firstStep}`;
 				planModeEnabled = false;
 				executionMode = false;
 				contextResetActive = false;
+				planModeBashSnapshots.clear();
 				todoItems = [];
 				restoreSavedTools();
+				restoreSavedThinkingLevel();
 				persistState();
 				updateStatus(ctx);
 				ctx.ui.notify("Plan execution tracking cancelled. Full access restored.", "info");
@@ -1213,7 +1959,7 @@ Start with step 1: ${firstStep}`;
 	});
 
 	pi.registerCommand("todos", {
-		description: "Show or update current plan todo list. Usage: /todos, /todos done|skip|defer|block|open 1-3, /todos reset",
+		description: "Show or update current plan todo list. Usage: /todos, /todos start|done|skip|defer|block|open 1-3, /todos reset",
 		handler: async (args: any, ctx: ExtensionContext) => {
 			const command = String(args ?? "").trim();
 			if (todoItems.length === 0) {
@@ -1221,20 +1967,30 @@ Start with step 1: ${firstStep}`;
 				return;
 			}
 
-			const stateMatch = command.match(/^(done|mark|complete|skip|skipped|defer|deferred|block|blocked|open|reopen|pending)\b/i);
+			const stateMatch = command.match(/^(start|progress|in[-_ ]?progress|done|mark|complete|skip|skipped|defer|deferred|block|blocked|open|reopen|pending)\b/i);
 			if (stateMatch) {
 				const verb = stateMatch[1].toLowerCase();
 				const status: TodoStatus = /^(done|mark|complete)$/.test(verb)
 					? "done"
-					: /^skip/.test(verb)
-						? "skipped"
-						: /^defer/.test(verb)
-							? "deferred"
-							: /^block/.test(verb)
-								? "blocked"
-								: "pending";
+					: /^(start|progress|in[-_ ]?progress)$/.test(verb)
+						? "in_progress"
+						: /^skip/.test(verb)
+							? "skipped"
+							: /^defer/.test(verb)
+								? "deferred"
+								: /^block/.test(verb)
+									? "blocked"
+									: "pending";
 				const steps = parseStepSpec(command.slice(stateMatch[0].length));
 				let changed = 0;
+				if (status === "in_progress" && steps.length > 0) {
+					for (const item of todoItems) {
+						if ((item.status ?? (item.completed ? "done" : "pending")) === "in_progress" && !steps.includes(item.step)) {
+							setTodoStatus(item, "pending");
+							changed++;
+						}
+					}
+				}
 				for (const step of steps) {
 					const item = todoItems.find((todo: TodoItem) => todo.step === step);
 					if (item && (item.status ?? (item.completed ? "done" : "pending")) !== status) {
@@ -1301,6 +2057,7 @@ Start with step 1: ${firstStep}`;
 						executing: true,
 						lastProposedPlan,
 						savedTools,
+						savedThinkingLevel,
 						savedPlanAbsolutePath,
 						savedPlanRelativePath,
 						savedPlanRoot,
@@ -1324,8 +2081,8 @@ Start with step 1: ${firstStep}`;
 		handler: async (ctx: ExtensionContext) => togglePlanMode(ctx),
 	});
 
-	// Block destructive bash commands in plan mode
-	pi.on("tool_call", async (event: any) => {
+	// Block destructive bash commands in plan mode and snapshot tracked-file state.
+	pi.on("tool_call", async (event: any, ctx: ExtensionContext) => {
 		if (!planModeEnabled || event.toolName !== "bash") return;
 
 		const command = event.input.command as string;
@@ -1334,6 +2091,35 @@ Start with step 1: ${firstStep}`;
 				block: true,
 				reason: `Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\nCommand: ${command}`,
 			};
+		}
+
+		try {
+			const root = await gitRootForPath(ctx.cwd, ctx);
+			if (!root) return;
+			const status = await pi.exec("git", ["-C", root, "status", "--short", "--untracked-files=no"], { cwd: ctx.cwd, timeout: 5000, signal: ctx.signal });
+			if (status.code === 0) planModeBashSnapshots.set(event.toolCallId, { root, status: status.stdout.trim() });
+		} catch {
+			// Snapshotting is a safety aid; never break an otherwise safe read-only command because of it.
+		}
+	});
+
+	pi.on("tool_result", async (event: any, ctx: ExtensionContext) => {
+		if (!planModeEnabled || event.toolName !== "bash") return;
+		const snapshot = planModeBashSnapshots.get(event.toolCallId);
+		if (!snapshot) return;
+		planModeBashSnapshots.delete(event.toolCallId);
+
+		try {
+			const status = await pi.exec("git", ["-C", snapshot.root, "status", "--short", "--untracked-files=no"], { cwd: ctx.cwd, timeout: 5000, signal: ctx.signal });
+			const after = status.code === 0 ? status.stdout.trim() : snapshot.status;
+			if (after !== snapshot.status) {
+				const warning = `\n\n⚠️ Plan Mode warning: this bash command changed tracked files under ${snapshot.root}. Planning should remain read-only; inspect git diff before continuing.`;
+				const content = Array.isArray(event.content) ? event.content : [];
+				ctx.ui.notify(warning.trim(), "warning");
+				return { content: [...content, { type: "text" as const, text: warning }] };
+			}
+		} catch {
+			// Ignore post-check failures; the command result remains available to the model.
 		}
 	});
 
@@ -1403,6 +2189,10 @@ Please carefully read the user's feedback/request, and produce an updated, compl
 4. Ensure the plan remains decision-complete, highly detailed, and follows all Plan Mode rules.`,
 						display: false,
 					},
+					systemPrompt: withPlanModeSystemPrompt(
+						event,
+						`You are refining the current proposed plan. Produce a complete replacement only when the revision is decision-complete.\n\nCurrent proposed plan:\n<proposed_plan>\n${lastProposedPlan}\n</proposed_plan>`,
+					),
 				};
 			}
 
@@ -1426,6 +2216,8 @@ You may explore and execute **non-mutating** actions that improve the plan. You 
 Actions that gather truth, reduce ambiguity, or validate feasibility without changing repo-tracked state. Examples:
 * Reading or searching files, configs, schemas, types, manifests, and docs
 * Static analysis, inspection, and repo exploration
+* First-class Plan Mode tools: \`plan_repo_overview\`, \`plan_files\`, \`plan_search\`, and \`plan_read_many\`
+* Read-only bash search/list commands such as \`rg\`, \`fd\`, \`find\`, \`grep\`, \`git grep\`, \`git ls-files\`, \`ls\`, and \`tree\`
 * Read-only Git and GitHub CLI queries such as \`git status\`, \`git log\`, \`git diff\`, \`gh pr view\`, and \`gh issue list\`
 * Dry-run style commands when they do not edit repo-tracked files
 * Tests, builds, or checks that do not edit repo-tracked files
@@ -1444,6 +2236,7 @@ Begin by grounding yourself in the actual environment. Eliminate unknowns in the
 Before asking the user any question, perform at least one targeted non-mutating exploration pass (for example: search relevant files, inspect likely entrypoints/configs, confirm current implementation shape), unless no local environment/repo is available.
 Exception: you may ask clarifying questions about the user's prompt before exploring, ONLY if there are obvious ambiguities or contradictions in the prompt itself. However, if ambiguity might be resolved by exploring, always prefer exploring first.
 Do not ask questions that can be answered from the repo or system. Only ask once you have exhausted reasonable non-mutating exploration.
+Do not claim search tools like grep/find are unavailable: use \`plan_search\`, \`plan_files\`, \`plan_read_many\`, \`read\`, or read-only \`bash\` commands such as \`rg\`, \`fd\`, \`find\`, and \`git grep\`.
 
 ## PHASE 2 — Intent chat (what they actually want)
 * Keep asking until you can clearly state: goal + success criteria, audience, in/out of scope, constraints, current state, and the key preferences/tradeoffs.
@@ -1512,6 +2305,7 @@ Only produce at most one \`<proposed_plan>\` block per turn, and only when you a
 If the user stays in Plan mode and asks for revisions after a prior \`<proposed_plan>\`, any new \`<proposed_plan>\` must be a complete replacement.`,
 					display: false,
 				},
+				systemPrompt: withPlanModeSystemPrompt(event),
 			};
 		}
 
@@ -1530,36 +2324,35 @@ ${todoList}
 All steps for reference:
 ${allSteps}
 
-**IMPORTANT**: As you complete each step, you MUST mark it done by including a [DONE:n] tag in your response (e.g. [DONE:1] for step 1, [DONE:5] for step 5). Place the tag right after the section that completes the step, or end your response with a concise status line like \`Completed steps: 1-3\`. Multiple [DONE:n] tags can be included in one response if you complete multiple steps.
+**IMPORTANT**: Use the structured \`update_plan\` tool to keep this checklist current. Do not rely on prose markers like \`[DONE:n]\`.
 
-If the user explicitly skips or defers a step, run \`/todos skip <n>\` or \`/todos defer <n>\` instead of claiming it is done. If a step is blocked, run \`/todos block <n>\` and explain the blocker.
+Before starting work on a step, call \`update_plan\` with the full ordered checklist and mark exactly one open step \`in_progress\`. When that step is complete, skipped, deferred, or blocked, call \`update_plan\` again with the full checklist and the updated status before moving on.
+
+If the user explicitly skips or defers a step, use \`update_plan\` or \`/todos skip <n>\` / \`/todos defer <n>\` instead of claiming it is done. If a step is blocked, mark it \`blocked\` and explain the blocker.
 
 Before saying a PR is ready, clean, or ready for human review, check both CI and review state. For GitHub PR work, inspect normal comments and inline review comments/threads (for example with \`gh pr checks\`, \`gh pr view --comments\`, \`gh api repos/:owner/:repo/pulls/:number/comments\`, and GraphQL review thread queries where needed). Resolve or respond to actionable automated-review comments before handoff.
 
-If you only partially complete the plan, include exactly which step numbers are now complete, skipped, deferred, or blocked. Do not omit this even if you also provide a prose summary. Without these tags or \`/todos\` updates, the progress tracker may not update.`,
+Finish with all items completed, skipped, or deferred before ending the turn. If work remains blocked, leave the blocked item visible in \`update_plan\` and explain the blocker.`,
 					display: false,
 				},
 			};
 		}
 	});
 
-	// Track progress after each turn
-	pi.on("turn_end", async (event: any, ctx: ExtensionContext) => {
+	// Handoff warning after each assistant turn. Progress itself is updated only
+	// through update_plan or explicit /todos commands, never by parsing prose.
+	pi.on("turn_end", async (event: any) => {
 		if (!executionMode || todoItems.length === 0) return;
 		if (!isAssistantMessage(event.message)) return;
 
 		const text = getTextContent(event.message);
-		if (markExplicitNonDoneSteps(text, todoItems) + markCompletedSteps(text, todoItems) > 0) {
-			await updateSavedPlanProgress(ctx);
-			updateStatus(ctx);
-		}
 		if (hasHandoffClaim(text)) {
 			const open = todoItems.filter((item: TodoItem) => isTodoOpen(item));
 			if (open.length > 0) {
 				pi.sendMessage(
 					{
 						customType: "plan-handoff-warning",
-						content: `⚠️ **Plan handoff warning:** this response sounds like a handoff, but ${open.length} plan item(s) are still open. Mark them done, skipped, deferred, or blocked with \`/todos done|skip|defer|block <n>\` before handing off.\n\n${open.map((item) => `${item.step}. ${item.text}`).join("\n")}`,
+						content: `⚠️ **Plan handoff warning:** this response sounds like a handoff, but ${open.length} plan item(s) are still open. Use \`update_plan\` or \`/todos done|skip|defer|block <n>\` before handing off.\n\n${open.map((item) => `${item.step}. ${item.text}`).join("\n")}`,
 						display: true,
 					},
 					{ triggerTurn: false },
@@ -1588,6 +2381,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 			if (planContent) {
 				lastProposedPlan = planContent;
 				todoItems = extractTodoItemsFromProposedPlan(planContent);
+				for (const item of todoItems) setTodoStatus(item, "pending");
 				hasNewPlan = true;
 				persistState();
 			}
@@ -1644,7 +2438,10 @@ If you only partially complete the plan, include exactly which step numbers are 
 				planModeEnabled = false;
 				executionMode = true;
 				contextResetActive = true;
+				planModeBashSnapshots.clear();
 				restoreSavedTools();
+				restoreSavedThinkingLevel();
+				enableExecutionTools();
 				updateStatus(ctx);
 				persistState();
 
@@ -1673,7 +2470,10 @@ If you only partially complete the plan, include exactly which step numbers are 
 				planModeEnabled = false;
 				executionMode = true;
 				contextResetActive = false;
+				planModeBashSnapshots.clear();
 				restoreSavedTools();
+				restoreSavedThinkingLevel();
+				enableExecutionTools();
 				updateStatus(ctx);
 				persistState();
 
@@ -1701,10 +2501,10 @@ If you only partially complete the plan, include exactly which step numbers are 
 			planModeEnabled = true;
 		}
 
-		const entries = ctx.sessionManager.getEntries();
+		const branchEntries = ctx.sessionManager.getBranch();
 
-		// Restore persisted state
-		const planModeEntry = entries
+		// Restore persisted state from the active branch.
+		const planModeEntry = branchEntries
 			.filter((e: { type: string; customType?: string }) => e.type === "custom" && e.customType === "plan-mode")
 			.pop() as
 			| {
@@ -1714,6 +2514,7 @@ If you only partially complete the plan, include exactly which step numbers are 
 						executing?: boolean;
 						lastProposedPlan?: string;
 						savedTools?: string[];
+						savedThinkingLevel?: string;
 						savedPlanAbsolutePath?: string;
 						savedPlanRelativePath?: string;
 						savedPlanRoot?: string;
@@ -1729,9 +2530,8 @@ If you only partially complete the plan, include exactly which step numbers are 
 			todoItems = planModeEntry.data.todos ?? todoItems;
 			executionMode = planModeEntry.data.executing ?? executionMode;
 			lastProposedPlan = planModeEntry.data.lastProposedPlan ?? lastProposedPlan;
-			savedTools = existingToolNames(normalizeToolNames(planModeEntry.data.savedTools ?? savedTools)).filter(
-				(name: string) => name !== PLAN_QUESTIONS_TOOL,
-			);
+			savedTools = existingToolNames(normalizeToolNames(planModeEntry.data.savedTools ?? savedTools)).filter((name: string) => !isPlanOwnedTool(name));
+			savedThinkingLevel = planModeEntry.data.savedThinkingLevel ?? savedThinkingLevel;
 			savedPlanAbsolutePath = planModeEntry.data.savedPlanAbsolutePath ?? savedPlanAbsolutePath;
 			savedPlanRelativePath = planModeEntry.data.savedPlanRelativePath ?? savedPlanRelativePath;
 			savedPlanRoot = planModeEntry.data.savedPlanRoot ?? savedPlanRoot;
@@ -1768,31 +2568,15 @@ If you only partially complete the plan, include exactly which step numbers are 
 			}
 		}
 
-		// Rebuild execution completed state on resume
-		const isResume = planModeEntry !== undefined;
-		if (isResume && executionMode && todoItems.length > 0) {
-			let executeIndex = -1;
-			for (let i = entries.length - 1; i >= 0; i--) {
-				const entry = entries[i] as { type: string; customType?: string };
-				if (entry.customType === "plan-mode-execute" || entry.customType === PLAN_CONTEXT_RESET_CUSTOM_TYPE) {
-					executeIndex = i;
-					break;
-				}
-			}
-
-			const messages: AssistantMessage[] = [];
-			for (let i = executeIndex + 1; i < entries.length; i++) {
-				const entry = entries[i];
-				if (
-					entry.type === "message" &&
-					"message" in entry &&
-					isAssistantMessage(entry.message as AgentMessage)
-				) {
-					messages.push(entry.message as AssistantMessage);
-				}
-			}
-			const allText = messages.map(getTextContent).join("\n");
-			if (markExplicitNonDoneSteps(allText, todoItems) + markCompletedSteps(allText, todoItems) > 0) {
+		// Restore the latest structured update_plan result on resume. Do not infer progress
+		// from assistant prose; that is what caused false completions in long plans.
+		if (executionMode && todoItems.length > 0) {
+			const latestUpdatePlan = branchEntries
+				.filter((entry: any) => entry.type === "message" && entry.message?.role === "toolResult" && entry.message?.toolName === UPDATE_PLAN_TOOL)
+				.pop() as { message?: { details?: UpdatePlanToolResult } } | undefined;
+			const restoredTodos = normalizeStoredTodoItems(latestUpdatePlan?.message?.details?.todos);
+			if (restoredTodos.length > 0 && !sameTodoState(todoItems, restoredTodos)) {
+				todoItems = restoredTodos;
 				restoredPlanProgressNeedsWrite = true;
 				persistState();
 			}
@@ -1810,8 +2594,20 @@ If you only partially complete the plan, include exactly which step numbers are 
 			const currentActive = currentActiveToolNames();
 			const toolsToFilter = currentActive.length > 0 ? currentActive : savedTools.length > 0 ? savedTools : defaultNormalTools();
 			pi.setActiveTools(planModeToolNames(toolsToFilter));
+			enterPlanThinkingMode();
+		} else if (executionMode && todoItems.length > 0) {
+			restoreSavedTools();
+			restoreSavedThinkingLevel();
+			enableExecutionTools();
 		} else if (planModeEntry?.data) {
 			restoreSavedTools();
+			restoreSavedThinkingLevel();
+		} else {
+			const active = currentActiveToolNames();
+			if (active.some((name: string) => isPlanOwnedTool(name))) {
+				const filtered = active.filter((name: string) => !isPlanOwnedTool(name));
+				pi.setActiveTools(filtered.length > 0 ? filtered : defaultNormalTools());
+			}
 		}
 		if (restoredPlanProgressNeedsWrite) await updateSavedPlanProgress(ctx);
 		updateStatus(ctx);

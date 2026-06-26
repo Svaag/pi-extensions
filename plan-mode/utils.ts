@@ -19,6 +19,10 @@ const DESTRUCTIVE_PATTERNS = [
 	/\btruncate\b/i,
 	/\bdd\b/i,
 	/\bshred\b/i,
+	/\|\s*(?:bash|sh|zsh|fish|dash|ksh)\b/i,
+	/(?:^|[;&|]\s*)(?:bash|sh|zsh|fish|dash|ksh)\s+-c\b/i,
+	/\bcurl\b[^\n;|&]*(?:\s-o|\s--output)(?:=|\s+)/i,
+	/\bwget\b[^\n;|&]*(?:\s-O\s*(?!-\b)|\s--output-document(?:=|\s+)(?!-\b))/i,
 	/(^|[^<])>(?!>)/,
 	/>>/,
 	/\bnpm\s+(install|uninstall|update|ci|link|publish)/i,
@@ -91,6 +95,7 @@ const SAFE_PATTERNS = [
 	/^\s*free\b/,
 	/^\s*npm\s+(list|ls|view|info|search|outdated|audit)/i,
 	/^\s*yarn\s+(list|info|why|audit)/i,
+	/^\s*pnpm\s+(list|ls|view|info|why|outdated|audit)/i,
 	/^\s*node\s+--version/i,
 	/^\s*python\s+--version/i,
 	/^\s*(?:(?:timeout\s+(?:--preserve-status\s+)?(?:-k\s+\S+\s+)?\S+|[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S+))\s+)*(?:[~./\w-]+\/)*pytest(?:\s|$)/i,
@@ -102,6 +107,7 @@ const SAFE_PATTERNS = [
 	/^\s*sed\s+-n/i,
 	/^\s*awk\b/,
 	/^\s*rg\b/,
+	/^\s*git\s+grep\b/i,
 	/^\s*fd\b/,
 	/^\s*bat\b/,
 	/^\s*eza\b/,
@@ -190,7 +196,7 @@ export function isSafeCommand(command: string): boolean {
 	return !isDestructive && isSafe;
 }
 
-export type TodoStatus = "pending" | "done" | "skipped" | "deferred" | "blocked";
+export type TodoStatus = "pending" | "in_progress" | "done" | "skipped" | "deferred" | "blocked";
 
 export interface TodoItem {
 	step: number;
@@ -226,6 +232,8 @@ function statusLabel(status: TodoStatus): string {
 	switch (status) {
 		case "done":
 			return "done";
+		case "in_progress":
+			return "in progress";
 		case "skipped":
 			return "skipped";
 		case "deferred":
@@ -241,6 +249,8 @@ function statusCheckbox(status: TodoStatus): string {
 	switch (status) {
 		case "done":
 			return "[x]";
+		case "in_progress":
+			return "[~]";
 		case "skipped":
 			return "[-]";
 		case "deferred":
@@ -257,7 +267,7 @@ export function renderPlanProgressMarkdown(items: TodoItem[]): string {
 		"<!-- pi-plan-progress:start -->",
 		"## Progress",
 		"",
-		"Status legend: `[x]` done, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` pending.",
+		"Status legend: `[x]` done, `[~]` in progress, `[-]` skipped, `[>]` deferred, `[!]` blocked, `[ ]` pending.",
 		"",
 	];
 	for (const item of items) {
