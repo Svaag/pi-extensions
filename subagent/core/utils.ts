@@ -109,5 +109,14 @@ export function shallowCloneRecord(record: AgentRecord): AgentRecord {
 					metrics: record.result.metrics ? { ...record.result.metrics } : undefined,
 				}
 			: undefined,
+		routingDecision: record.routingDecision
+			? {
+					...record.routingDecision,
+					candidates: record.routingDecision.candidates.map((candidate) => ({
+						...candidate,
+						notes: [...candidate.notes],
+					})),
+				}
+			: undefined,
 	};
 }

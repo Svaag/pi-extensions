@@ -6,6 +6,59 @@ export type ContextMode = "fresh" | "summary" | "last_n_turns" | "full_sanitized
 
 export type WriteMode = "read_only" | "disjoint_scope" | "git_worktree";
 
+export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export type RoutingMode = "auto" | "off" | "explain";
+
+export type RoutingObjective = "balanced" | "cost_first" | "quality_first";
+
+export type TaskIntent =
+	| "lookup"
+	| "scout"
+	| "summarize"
+	| "batch_simple"
+	| "plan"
+	| "review"
+	| "debug"
+	| "implement"
+	| "complex";
+
+export type RoutingDecisionReason =
+	| "selected"
+	| "explicit_model"
+	| "explicit_thinking"
+	| "disabled"
+	| "explain_only"
+	| "no_scoped_models"
+	| "no_available_models"
+	| "fallback_current_model";
+
+export interface RoutingCandidateScore {
+	model: string;
+	score: number;
+	estimatedCostUsd: number;
+	quality: number;
+	notes: string[];
+}
+
+export interface RoutingDecision {
+	mode: RoutingMode;
+	objective: RoutingObjective;
+	applied: boolean;
+	reason: RoutingDecisionReason;
+	selectedModel?: string;
+	selectedThinkingLevel?: ThinkingLevel;
+	explicitModel?: string;
+	explicitThinkingLevel?: ThinkingLevel;
+	intent: TaskIntent | string;
+	risk: number;
+	complexity: number;
+	estimatedInputTokens: number;
+	estimatedOutputTokens: number;
+	explanation: string;
+	candidates: RoutingCandidateScore[];
+}
+
 export type AgentMessageRole = "parent" | "child" | "system";
 
 export type AgentMessageKind = "task" | "message" | "followup" | "status" | "result" | "error";
@@ -49,8 +102,12 @@ export interface AgentRecord {
 	cwd: string;
 	prompt: string;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	tools?: string[];
 	timeoutMs?: number;
+	routingMode?: RoutingMode;
+	routingProfile?: RoutingObjective;
+	routingDecision?: RoutingDecision;
 	createdAt: number;
 	startedAt?: number;
 	finishedAt?: number;
@@ -124,7 +181,11 @@ export interface SpawnAgentRequest {
 	timeoutMs?: number;
 	maxOutputChars?: number;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	tools?: string[];
+	routingMode?: RoutingMode;
+	routingProfile?: RoutingObjective;
+	routingDecision?: RoutingDecision;
 	jobId?: string;
 }
 
@@ -148,6 +209,9 @@ export interface AgentSummary {
 	output?: string;
 	error?: string;
 	metrics: AgentMetrics;
+	model?: string;
+	thinkingLevel?: ThinkingLevel;
+	routingDecision?: RoutingDecision;
 }
 
 export interface WaitAgentOptions {

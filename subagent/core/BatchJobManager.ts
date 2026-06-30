@@ -60,6 +60,15 @@ function cloneJob(job: BatchJob, includeItems = true): BatchJob {
 		...job,
 		allowedPaths: [...job.allowedPaths],
 		counts: { ...job.counts },
+		routingDecision: job.routingDecision
+			? {
+					...job.routingDecision,
+					candidates: job.routingDecision.candidates.map((candidate) => ({
+						...candidate,
+						notes: [...candidate.notes],
+					})),
+				}
+			: undefined,
 		items: includeItems ? job.items.map((item) => ({ ...item, data: { ...item.data } })) : [],
 	};
 }
@@ -229,7 +238,11 @@ export class BatchJobManager {
 			updatedAt: now,
 			cwd: request.cwd,
 			model: request.model,
+			thinkingLevel: request.thinkingLevel,
 			timeoutMs: request.timeoutMs,
+			routingMode: request.routingMode,
+			routingProfile: request.routingProfile,
+			routingDecision: request.routingDecision,
 			writeMode: request.writeMode ?? "read_only",
 			allowedPaths: request.allowedPaths ?? [],
 			contextMode: request.contextMode ?? "fresh",
@@ -359,7 +372,11 @@ export class BatchJobManager {
 				writeMode: job.writeMode,
 				allowedPaths: job.allowedPaths,
 				model: job.model,
+				thinkingLevel: job.thinkingLevel,
 				timeoutMs: job.timeoutMs,
+				routingMode: job.routingMode,
+				routingProfile: job.routingProfile,
+				routingDecision: job.routingDecision,
 			});
 			item.agentId = record.agentId;
 			item.taskPath = record.taskPath;

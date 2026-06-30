@@ -92,6 +92,41 @@ test("AgentManager ignores too-short runtime timeouts", async () => {
 	assert.equal(backend.requests[0].timeoutMs, 30 * 60_000);
 });
 
+test("AgentManager stores routed model, thinking, and routing decision", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend);
+	const routingDecision: any = {
+		mode: "auto",
+		objective: "balanced",
+		applied: true,
+		reason: "selected",
+		selectedModel: "local-llamacpp/local-model",
+		selectedThinkingLevel: "off",
+		intent: "lookup",
+		risk: 0.1,
+		complexity: 0.1,
+		estimatedInputTokens: 1000,
+		estimatedOutputTokens: 1000,
+		explanation: "test",
+		candidates: [],
+	};
+	const record = await h.manager.spawnAgent({
+		taskName: "demo",
+		prompt: "do it",
+		model: "local-llamacpp/local-model",
+		thinkingLevel: "off",
+		routingMode: "auto",
+		routingProfile: "balanced",
+		routingDecision,
+	});
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.equal(h.manager.getRecord(record.agentId)?.model, "local-llamacpp/local-model");
+	assert.equal(h.manager.getRecord(record.agentId)?.thinkingLevel, "off");
+	assert.equal(h.manager.summaries({ returnMode: "full" })[0].routingDecision?.reason, "selected");
+	assert.equal(backend.requests[0].record.routingDecision?.selectedModel, "local-llamacpp/local-model");
+});
+
 test("AgentManager preserves tool output tail after successful final output", async () => {
 	const backend = new FakeBackend();
 	backend.autoComplete = false;

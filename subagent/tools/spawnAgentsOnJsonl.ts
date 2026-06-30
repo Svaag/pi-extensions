@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readRowsFromJsonl } from "../core/BatchJobManager.ts";
-import { BatchCommonParams, type BatchManagerGetter, jobText } from "./batchCommon.ts";
+import { BatchCommonParams, type BatchManagerGetter, jobText, resolveBatchRouting } from "./batchCommon.ts";
 import { textResult } from "./common.ts";
 
 const SpawnAgentsOnJsonlParams = Type.Object({
@@ -30,6 +30,7 @@ export function registerSpawnAgentsOnJsonlTool(pi: ExtensionAPI, getBatchManager
 				if (!ok) throw new Error("Write-capable batch workers were not approved.");
 			}
 			const { rows, sourcePath } = await readRowsFromJsonl({ path: params.jsonlPath, text: params.jsonlText }, ctx.cwd, params.idField ?? params.idColumn);
+			const routed = await resolveBatchRouting(ctx, params, "jsonl", rows);
 			const job = getBatchManager(ctx).createJob({
 				name: params.name,
 				sourceType: "jsonl",
@@ -39,8 +40,12 @@ export function registerSpawnAgentsOnJsonlTool(pi: ExtensionAPI, getBatchManager
 				idColumn: params.idField ?? params.idColumn,
 				maxConcurrency: params.maxConcurrency,
 				cwd: params.cwd,
-				model: params.model,
+				model: routed.model,
+				thinkingLevel: routed.thinkingLevel,
 				timeoutMs: params.timeoutMs,
+				routingMode: params.routingMode,
+				routingProfile: params.routingProfile,
+				routingDecision: routed.decision,
 				writeMode: params.writeMode,
 				allowedPaths: params.allowedPaths,
 				contextMode: params.contextMode,

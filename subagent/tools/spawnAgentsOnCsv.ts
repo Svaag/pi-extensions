@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readRowsFromCsv } from "../core/BatchJobManager.ts";
-import { BatchCommonParams, type BatchManagerGetter, jobText } from "./batchCommon.ts";
+import { BatchCommonParams, type BatchManagerGetter, jobText, resolveBatchRouting } from "./batchCommon.ts";
 import { textResult } from "./common.ts";
 
 const SpawnAgentsOnCsvParams = Type.Object({
@@ -29,6 +29,7 @@ export function registerSpawnAgentsOnCsvTool(pi: ExtensionAPI, getBatchManager: 
 				if (!ok) throw new Error("Write-capable batch workers were not approved.");
 			}
 			const { rows, sourcePath } = await readRowsFromCsv({ path: params.csvPath, text: params.csvText }, ctx.cwd, params.idColumn);
+			const routed = await resolveBatchRouting(ctx, params, "csv", rows);
 			const job = getBatchManager(ctx).createJob({
 				name: params.name,
 				sourceType: "csv",
@@ -38,8 +39,12 @@ export function registerSpawnAgentsOnCsvTool(pi: ExtensionAPI, getBatchManager: 
 				idColumn: params.idColumn,
 				maxConcurrency: params.maxConcurrency,
 				cwd: params.cwd,
-				model: params.model,
+				model: routed.model,
+				thinkingLevel: routed.thinkingLevel,
 				timeoutMs: params.timeoutMs,
+				routingMode: params.routingMode,
+				routingProfile: params.routingProfile,
+				routingDecision: routed.decision,
 				writeMode: params.writeMode,
 				allowedPaths: params.allowedPaths,
 				contextMode: params.contextMode,

@@ -5,10 +5,11 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Type } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "../agents.ts";
-import type { ContextMode, WriteMode } from "../core/AgentTypes.ts";
+import type { ContextMode, RoutingMode, RoutingObjective, ThinkingLevel, WriteMode } from "../core/AgentTypes.ts";
 import { sanitizeContextText } from "../core/ContextSanitizer.ts";
 import { renderAgentSummary } from "../render/renderAgent.ts";
 import { type ManagerGetter, preview, textResult } from "./common.ts";
+import { resolveRouting } from "./router.ts";
 
 const SpawnAgentParams = Type.Object({
 	taskName: Type.String({ description: "Short lowercase-ish task name for the child agent." }),
@@ -29,6 +30,9 @@ const SpawnAgentParams = Type.Object({
 	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task. Values below 300000ms are ignored and use the default 30-minute runtime." })),
 	maxOutputChars: Type.Optional(Type.Number({ description: "Maximum retained output characters for this agent." })),
 	model: Type.Optional(Type.String({ description: "Optional model override for the child process." })),
+	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: "Optional thinking level override for the child process." })),
+	routingMode: Type.Optional(StringEnum(["auto", "off", "explain"] as const, { description: "Smart router mode. Defaults to auto when model is omitted." })),
+	routingProfile: Type.Optional(StringEnum(["balanced", "cost_first", "quality_first"] as const, { description: "Router objective for cost/reward/quality tradeoff." })),
 });
 
 function textFromMessageContent(content: any): string {
@@ -105,6 +109,24 @@ export function registerSpawnAgentTool(pi: ExtensionAPI, getManager: ManagerGett
 			const { definition, agent } = await resolveAgentDefinition(ctx, params);
 			const contextMode = (params.contextMode ?? "fresh") as ContextMode;
 			const contextSummary = params.contextSummary ?? (contextMode === "summary" ? buildVisibleSessionSummary(ctx) : undefined);
+			const explicitModel = params.model ?? agent?.model;
+			const explicitThinkingLevel = (params.thinkingLevel ?? agent?.thinkingLevel) as ThinkingLevel | undefined;
+			const routingMode = (params.routingMode ?? agent?.routingMode) as RoutingMode | undefined;
+			const routingProfile = (params.routingProfile ?? agent?.routingProfile) as RoutingObjective | undefined;
+			const routed = await resolveRouting(ctx, {
+				taskName: params.taskName,
+				prompt: params.prompt,
+				agentName: agent?.name ?? params.agentName,
+				agentDefinition: definition,
+				contextSummary,
+				contextMode,
+				writeMode,
+				tools: agent?.tools,
+				explicitModel,
+				explicitThinkingLevel,
+				routingMode,
+				routingProfile,
+			});
 			onUpdate?.(textResult(`Spawning subagent ${params.taskName}...`));
 			const record = await manager.spawnAgent({
 				taskName: params.taskName,
@@ -122,8 +144,12 @@ export function registerSpawnAgentTool(pi: ExtensionAPI, getManager: ManagerGett
 				allowedPaths: params.allowedPaths,
 				timeoutMs: params.timeoutMs,
 				maxOutputChars: params.maxOutputChars,
-				model: params.model ?? agent?.model,
+				model: routed.model,
+				thinkingLevel: routed.thinkingLevel,
 				tools: agent?.tools,
+				routingMode,
+				routingProfile,
+				routingDecision: routed.decision,
 			}, signal);
 			return textResult(`Spawned ${record.taskPath} (${record.status}). agentId=${record.agentId}`, record);
 		},

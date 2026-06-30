@@ -109,6 +109,41 @@ test("BatchJobManager respects maxConcurrency and starts queued workers", async 
 	assert(entries.some((entry) => entry.data?.job?.jobId === job.jobId));
 });
 
+test("BatchJobManager passes routed model and thinking to workers", async () => {
+	const fake = new FakeAgentManager();
+	const manager = new BatchJobManager({ agentManager: fake as any, appender: { appendEntry() {} }, rootCwd: "/tmp" });
+	const job = manager.createJob({
+		sourceType: "jsonl",
+		rows: parseJsonlRows('{"id":"1"}\n'),
+		promptTemplate: "Do {id}",
+		maxConcurrency: 1,
+		model: "local-llamacpp/local-model",
+		thinkingLevel: "off",
+		routingDecision: {
+			mode: "auto",
+			objective: "balanced",
+			applied: true,
+			reason: "selected",
+			selectedModel: "local-llamacpp/local-model",
+			selectedThinkingLevel: "off",
+			intent: "batch_simple",
+			risk: 0,
+			complexity: 0,
+			estimatedInputTokens: 1000,
+			estimatedOutputTokens: 2000,
+			explanation: "test",
+			candidates: [],
+		},
+	});
+	await delay(50);
+	assert.equal(fake.spawnRequests[0].model, "local-llamacpp/local-model");
+	assert.equal(fake.spawnRequests[0].thinkingLevel, "off");
+	assert.equal(fake.spawnRequests[0].routingDecision?.intent, "batch_simple");
+	assert.equal(manager.getJob(job.jobId)?.routingDecision?.selectedThinkingLevel, "off");
+	fake.complete("agent_1", "done");
+	await manager.waitJob(job.jobId, 2000);
+});
+
 test("BatchJobManager can cancel queued/running jobs", async () => {
 	const fake = new FakeAgentManager();
 	const manager = new BatchJobManager({ agentManager: fake as any, appender: { appendEntry() {} }, rootCwd: "/tmp" });

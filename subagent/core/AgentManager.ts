@@ -142,8 +142,12 @@ export class AgentManager {
 			cwd,
 			prompt: request.prompt,
 			model: request.model,
+			thinkingLevel: request.thinkingLevel,
 			tools,
 			timeoutMs,
+			routingMode: request.routingMode,
+			routingProfile: request.routingProfile,
+			routingDecision: request.routingDecision,
 			createdAt: now,
 			updatedAt: now,
 			contextMode: request.contextMode ?? "fresh",
@@ -229,7 +233,11 @@ export class AgentManager {
 				writeMode: record.writeMode,
 				allowedPaths: record.allowedPaths,
 				model: record.model,
+				thinkingLevel: record.thinkingLevel,
 				tools: record.tools,
+				routingMode: record.routingMode,
+				routingProfile: record.routingProfile,
+				routingDecision: record.routingDecision,
 			});
 			return { agentId, spawnedAgentId: spawned.agentId, delivered: true, queued: spawned.status === "queued", deliveryMode: "spawn_followup", message: `Spawned follow-up agent ${spawned.agentId}.` };
 		}
@@ -586,6 +594,9 @@ export class AgentManager {
 				outputChars: record.outputChars,
 				exitCode: record.exitCode,
 			},
+			model: record.model,
+			thinkingLevel: record.thinkingLevel,
+			routingDecision: record.routingDecision,
 		};
 	}
 

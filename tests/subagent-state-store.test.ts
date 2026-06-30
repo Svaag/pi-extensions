@@ -46,6 +46,32 @@ test("StateStore restore marks previously running agents as lost", () => {
 	assert.deepEqual(restored.lostAgentIds, ["agent_1"]);
 });
 
+test("StateStore restore preserves routing decisions", () => {
+	const r = {
+		...record("succeeded"),
+		routingDecision: {
+			mode: "auto" as const,
+			objective: "balanced" as const,
+			applied: true,
+			reason: "selected" as const,
+			selectedModel: "local-llamacpp/local-model",
+			selectedThinkingLevel: "off" as const,
+			intent: "lookup" as const,
+			risk: 0,
+			complexity: 0,
+			estimatedInputTokens: 1000,
+			estimatedOutputTokens: 1000,
+			explanation: "test",
+			candidates: [{ model: "local-llamacpp/local-model", score: 1, estimatedCostUsd: 0, quality: 0.2, notes: ["local"] }],
+		},
+	};
+	const restored = StateStore.restore([
+		{ type: "custom", customType: SUBAGENT_AGENT_STATE_ENTRY, data: { record: r } },
+	]);
+	assert.equal(restored.records[0].routingDecision?.selectedModel, "local-llamacpp/local-model");
+	assert.deepEqual(restored.records[0].routingDecision?.candidates[0].notes, ["local"]);
+});
+
 test("StateStore restore does not re-emit already persisted lost records", () => {
 	const r = { ...record("running"), status: "lost" as const, processState: "unknown" as const, controllable: false };
 	const restored = StateStore.restore([

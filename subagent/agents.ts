@@ -3,8 +3,30 @@
  */
 
 import * as fs from "node:fs";
+import { homedir } from "node:os";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
+import type { RoutingMode, RoutingObjective, ThinkingLevel } from "./core/AgentTypes.ts";
+
+const CONFIG_DIR_NAME = ".pi";
+
+function getAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR ?? path.join(homedir(), CONFIG_DIR_NAME, "agent");
+}
+
+function parseFrontmatter<T extends Record<string, string>>(content: string): { frontmatter: T; body: string } {
+	if (!content.startsWith("---\n")) return { frontmatter: {} as T, body: content };
+	const end = content.indexOf("\n---", 4);
+	if (end < 0) return { frontmatter: {} as T, body: content };
+	const raw = content.slice(4, end).trim();
+	const frontmatter: Record<string, string> = {};
+	for (const line of raw.split("\n")) {
+		const colon = line.indexOf(":");
+		if (colon <= 0) continue;
+		frontmatter[line.slice(0, colon).trim()] = line.slice(colon + 1).trim().replace(/^['\"]|['\"]$/g, "");
+	}
+	const bodyStart = content.indexOf("\n", end + 4);
+	return { frontmatter: frontmatter as T, body: bodyStart >= 0 ? content.slice(bodyStart + 1) : "" };
+}
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -13,6 +35,9 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
+	routingMode?: RoutingMode;
+	routingProfile?: RoutingObjective;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -21,6 +46,15 @@ export interface AgentConfig {
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+}
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const ROUTING_MODES = new Set<RoutingMode>(["auto", "off", "explain"]);
+const ROUTING_OBJECTIVES = new Set<RoutingObjective>(["balanced", "cost_first", "quality_first"]);
+
+function parseOptionalEnum<T extends string>(value: string | undefined, allowed: Set<T>): T | undefined {
+	const normalized = value?.trim();
+	return normalized && allowed.has(normalized as T) ? (normalized as T) : undefined;
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -55,6 +89,9 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
+			thinkingLevel: parseOptionalEnum(frontmatter.thinking, THINKING_LEVELS),
+			routingMode: parseOptionalEnum(frontmatter.router, ROUTING_MODES),
+			routingProfile: parseOptionalEnum(frontmatter.routingProfile, ROUTING_OBJECTIVES),
 			systemPrompt: body,
 			source,
 			filePath,

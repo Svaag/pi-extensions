@@ -1,4 +1,4 @@
-import type { ContextMode, WriteMode } from "./AgentTypes.ts";
+import type { ContextMode, RoutingDecision, RoutingMode, RoutingObjective, ThinkingLevel, WriteMode } from "./AgentTypes.ts";
 
 export type BatchSourceType = "csv" | "jsonl";
 export type BatchJobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
@@ -53,7 +53,11 @@ export interface BatchJob {
 	updatedAt: number;
 	cwd?: string;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	timeoutMs?: number;
+	routingMode?: RoutingMode;
+	routingProfile?: RoutingObjective;
+	routingDecision?: RoutingDecision;
 	writeMode: WriteMode;
 	allowedPaths: string[];
 	contextMode: ContextMode;
@@ -76,7 +80,11 @@ export interface CreateBatchJobRequest {
 	maxConcurrency?: number;
 	cwd?: string;
 	model?: string;
+	thinkingLevel?: ThinkingLevel;
 	timeoutMs?: number;
+	routingMode?: RoutingMode;
+	routingProfile?: RoutingObjective;
+	routingDecision?: RoutingDecision;
 	writeMode?: WriteMode;
 	allowedPaths?: string[];
 	contextMode?: ContextMode;

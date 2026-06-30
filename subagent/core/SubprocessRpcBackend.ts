@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentBackend, AgentBackendEvents, AgentHandle, BackendSpawnRequest } from "./AgentBackend.ts";
-import type { AgentResult } from "./AgentTypes.ts";
+import type { AgentRecord, AgentResult } from "./AgentTypes.ts";
 import { RpcClient } from "./RpcClient.ts";
 import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 
@@ -64,6 +64,35 @@ export function textFromToolResult(result: any): string {
 		? `\n[Full output saved by child at ${fullOutputPath}]`
 		: "";
 	return `${text}${suffix}`.trimEnd();
+}
+
+export function buildSubprocessRpcArgs(record: AgentRecord, childPolicyPath: string, tempPromptFilePath: string): string[] {
+	const tools = record.tools && record.tools.length > 0
+		? record.tools
+		: record.writeMode === "read_only"
+			? ["read", "bash"]
+			: ["read", "bash", "edit", "write"];
+	const args = [
+		"--mode",
+		"rpc",
+		"--no-session",
+		"--name",
+		`subagent:${record.taskPath}`,
+		"--no-extensions",
+		"--no-skills",
+		"--no-prompt-templates",
+		"--no-context-files",
+		"--no-approve",
+		"-e",
+		childPolicyPath,
+		"--append-system-prompt",
+		tempPromptFilePath,
+		"--tools",
+		tools.join(","),
+	];
+	if (record.model) args.push("--model", record.model);
+	if (record.thinkingLevel) args.push("--thinking", record.thinkingLevel);
+	return args;
 }
 
 function finalAssistantMessage(messages: any[]): any | undefined {
@@ -137,30 +166,7 @@ export class SubprocessRpcBackend implements AgentBackend {
 	async spawn(request: BackendSpawnRequest, events: AgentBackendEvents, signal?: AbortSignal): Promise<AgentHandle> {
 		const { record, systemPrompt, userPrompt, policy } = request;
 		const tempPrompt = await writeTempPrompt(record.agentId, systemPrompt);
-		const tools = record.tools && record.tools.length > 0
-			? record.tools
-			: record.writeMode === "read_only"
-				? ["read", "bash"]
-				: ["read", "bash", "edit", "write"];
-		const args = [
-			"--mode",
-			"rpc",
-			"--no-session",
-			"--name",
-			`subagent:${record.taskPath}`,
-			"--no-extensions",
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-			"--no-approve",
-			"-e",
-			this.childPolicyPath,
-			"--append-system-prompt",
-			tempPrompt.filePath,
-			"--tools",
-			tools.join(","),
-		];
-		if (record.model) args.push("--model", record.model);
+		const args = buildSubprocessRpcArgs(record, this.childPolicyPath, tempPrompt.filePath);
 
 		const invocation = getPiInvocation(args);
 		const proc = spawn(invocation.command, invocation.args, {
