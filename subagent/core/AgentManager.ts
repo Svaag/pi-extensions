@@ -408,6 +408,8 @@ export class AgentManager {
 			this.lastOutputPersistAt.set(agentId, record.updatedAt);
 			this.store.appendEvent("agent.output_tail", { agentId, taskPath: record.taskPath, data: { outputTail: record.outputTail.slice(-maxPersistedTail), outputChars: record.outputChars } });
 			this.store.appendAgentState(record);
+			this.notifyChange();
+			return;
 		}
 		this.notifyChange(false);
 	}

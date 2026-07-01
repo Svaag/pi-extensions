@@ -1,6 +1,6 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { AgentGraphEdge, AgentRecord } from "../core/AgentTypes.ts";
-import { statusColor, statusIcon } from "./renderAgent.ts";
+import { statusColor, statusIcon } from "./agentFormat.ts";
 
 export function renderAgentGraph(records: AgentRecord[], edges: AgentGraphEdge[], theme: any) {
 	if (records.length === 0) return new Text(theme.fg("muted", "No subagent graph."), 0, 0);

@@ -4,7 +4,8 @@ import { AgentManager } from "./core/AgentManager.ts";
 import { BatchJobManager } from "./core/BatchJobManager.ts";
 import { SubprocessRpcBackend } from "./core/SubprocessRpcBackend.ts";
 import { StateStore } from "./core/StateStore.ts";
-import { formatDuration, statusColor, statusIcon } from "./render/renderAgent.ts";
+import { formatDuration } from "./render/agentFormat.ts";
+import { renderSubagentWidgetLines, subagentStatusSummary } from "./render/renderSubagentWidget.ts";
 import { registerCancelAgentJobTool } from "./tools/cancelAgentJob.ts";
 import { registerCloseAgentTool } from "./tools/closeAgent.ts";
 import { registerExportAgentJobResultsTool } from "./tools/exportAgentJobResults.ts";
@@ -39,32 +40,20 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	}
 
 	function renderWidget(ctx: ExtensionContext, current: AgentManager): void {
-		const agents = current.summaries({ includeClosed: false }).slice(-8);
-		const jobs = batchManager?.listJobs({ includeCompleted: false }).slice(-4) ?? [];
+		const agents = current.summaries({ includeClosed: false });
+		const jobs = batchManager?.listJobs({ includeCompleted: false }) ?? [];
+		const status = subagentStatusSummary(agents, jobs);
+		ctx.ui.setStatus("subagent", status ? ctx.ui.theme.fg(status.color, status.text) : undefined);
 		if (agents.length === 0 && jobs.length === 0) {
-			ctx.ui.setStatus("subagent", undefined);
 			ctx.ui.setWidget("subagent-agents", undefined);
 			return;
 		}
-		const running = agents.filter((agent) => agent.status === "running").length;
-		const queued = agents.filter((agent) => agent.status === "queued").length;
-		const runningJobs = jobs.filter((job) => job.status === "running" || job.status === "queued").length;
-		ctx.ui.setStatus("subagent", ctx.ui.theme.fg(running > 0 || runningJobs > 0 ? "warning" : "accent", `🤖 ${running}${queued ? `+${queued}` : ""}${runningJobs ? ` jobs:${runningJobs}` : ""}`));
-		const lines = [ctx.ui.theme.fg("accent", "Subagents")];
-		for (const agent of agents) {
-			const icon = ctx.ui.theme.fg(statusColor(agent.status), statusIcon(agent.status));
-			const duration = formatDuration(agent.durationMs);
-			const brief = agent.summary || agent.error || agent.outputTail || "";
-			lines.push(`${icon} ${ctx.ui.theme.fg("accent", agent.taskPath)} ${ctx.ui.theme.fg("muted", `[${agent.status}${duration ? ` ${duration}` : ""}]`)}`);
-			if (brief) lines.push(ctx.ui.theme.fg("dim", `  ${brief.replace(/\s+/g, " ").slice(0, 100)}`));
-		}
-		if (jobs.length > 0) {
-			lines.push("", ctx.ui.theme.fg("accent", "Batch jobs"));
-			for (const job of jobs) {
-				lines.push(ctx.ui.theme.fg("muted", `• ${job.name}: ${job.status} ${job.counts.succeeded}/${job.counts.total} done, ${job.counts.running} running`));
-			}
-		}
-		ctx.ui.setWidget("subagent-agents", lines);
+		ctx.ui.setWidget("subagent-agents", (_tui, theme) => ({
+			invalidate() {},
+			render(width: number) {
+				return renderSubagentWidgetLines(agents, jobs, theme, width, { maxActiveRows: 5 });
+			},
+		}));
 	}
 
 	function initialize(ctx: ExtensionContext): AgentManager {
@@ -123,11 +112,12 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	registerExportAgentJobResultsTool(pi, getBatchManager);
 
 	pi.registerCommand("subagents", {
-		description: "Show subagent status. Use /subagents graph for the persistent tree.",
+		description: "Show subagent status. Use /subagents graph for the persistent tree, /subagents full for summaries.",
 		handler: async (args, ctx) => {
 			const current = getManager(ctx);
 			renderWidget(ctx, current);
-			if (args.trim() === "graph") {
+			const mode = args.trim().toLowerCase();
+			if (mode === "graph") {
 				const records = current.listRecords({ includeClosed: true });
 				const edges = current.listEdges();
 				if (records.length === 0) ctx.ui.notify("No subagent graph in this session.", "info");
@@ -135,8 +125,18 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				return;
 			}
 			const agents = current.summaries({ includeClosed: true });
-			if (agents.length === 0) ctx.ui.notify("No subagents in this session.", "info");
-			else ctx.ui.notify(agents.map((agent) => `${agent.taskPath}: ${agent.status}${agent.summary ? ` — ${agent.summary}` : ""}`).join("\n"), "info");
+			if (agents.length === 0) {
+				ctx.ui.notify("No subagents in this session.", "info");
+				return;
+			}
+			const includeSummaries = mode === "full" || mode === "verbose";
+			const lines = agents.map((agent) => {
+				const duration = formatDuration(agent.durationMs);
+				const base = `${agent.taskPath}: ${agent.status}${duration ? ` ${duration}` : ""}`;
+				if (!includeSummaries) return base;
+				return `${base}${agent.summary ? ` — ${agent.summary}` : agent.error ? ` — ${agent.error}` : ""}`;
+			});
+			ctx.ui.notify(`${lines.join("\n")}\n\nTip: /subagents full shows summaries; /subagents graph shows the tree.`, "info");
 		},
 	});
 
