@@ -154,7 +154,8 @@ function renderAgentRow(agent: AgentSummary, theme: ThemeLike, nowMs: number, wi
 	if (agent.status === "running" && updatedAgo > 5_000) meta.push(`upd ${formatDuration(updatedAgo)} ago`);
 	if (width >= 110 && agent.model) {
 		const model = agent.model.split("/").slice(-1)[0] ?? agent.model;
-		meta.push(`${model}${agent.thinkingLevel ? `/${agent.thinkingLevel}` : ""}`);
+		const tier = agent.routingDecision?.complexityTier;
+		meta.push(`${model}${agent.thinkingLevel ? `/${agent.thinkingLevel}` : ""}${tier ? `/${tier}` : ""}`);
 	}
 	const status = theme.fg("muted", `[${agent.status}]`);
 	const suffix = meta.length > 0 ? ` ${theme.fg("dim", meta.join(" · "))}` : "";

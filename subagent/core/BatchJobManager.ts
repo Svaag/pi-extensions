@@ -63,6 +63,7 @@ function cloneJob(job: BatchJob, includeItems = true): BatchJob {
 		routingDecision: job.routingDecision
 			? {
 					...job.routingDecision,
+					signals: [...(job.routingDecision.signals ?? [])],
 					candidates: job.routingDecision.candidates.map((candidate) => ({
 						...candidate,
 						notes: [...candidate.notes],

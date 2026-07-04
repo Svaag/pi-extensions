@@ -59,6 +59,11 @@ test("StateStore restore preserves routing decisions", () => {
 			intent: "lookup" as const,
 			risk: 0,
 			complexity: 0,
+			complexityTier: "trivial" as const,
+			complexityScore: 0.05,
+			confidence: 0.8,
+			classificationReason: "lookup",
+			signals: ["lookup"],
 			estimatedInputTokens: 1000,
 			estimatedOutputTokens: 1000,
 			explanation: "test",
@@ -69,6 +74,8 @@ test("StateStore restore preserves routing decisions", () => {
 		{ type: "custom", customType: SUBAGENT_AGENT_STATE_ENTRY, data: { record: r } },
 	]);
 	assert.equal(restored.records[0].routingDecision?.selectedModel, "local-llamacpp/local-model");
+	assert.equal(restored.records[0].routingDecision?.complexityTier, "trivial");
+	assert.deepEqual(restored.records[0].routingDecision?.signals, ["lookup"]);
 	assert.deepEqual(restored.records[0].routingDecision?.candidates[0].notes, ["local"]);
 });
 

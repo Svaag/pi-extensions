@@ -6,6 +6,7 @@ import type {
 	AgentResult,
 	AgentStatus,
 	AgentSummary,
+	RoutingDecision,
 	SpawnAgentRequest,
 	WaitAgentOptions,
 	WaitAgentResult,
@@ -65,6 +66,46 @@ export interface FollowupTaskResult {
 	queued: boolean;
 	deliveryMode: "rpc_follow_up" | "rpc_prompt" | "spawn_followup" | "unavailable";
 	message: string;
+}
+
+export interface FollowupSpawnOptions {
+	contextMode?: SpawnAgentRequest["contextMode"];
+	model?: string;
+	thinkingLevel?: SpawnAgentRequest["thinkingLevel"];
+	routingMode?: SpawnAgentRequest["routingMode"];
+	routingProfile?: SpawnAgentRequest["routingProfile"];
+	routingDecision?: RoutingDecision;
+	inheritModelAndThinking?: boolean;
+}
+
+function inheritedRoutingDecision(record: AgentRecord, selectedModel: string | undefined, selectedThinkingLevel: SpawnAgentRequest["thinkingLevel"]): RoutingDecision | undefined {
+	const base = record.routingDecision;
+	const candidates = (base?.candidates ?? []).map((candidate) => ({ ...candidate, notes: [...(candidate.notes ?? [])] }));
+	if (!base && !selectedModel && !selectedThinkingLevel) return undefined;
+	return {
+		mode: base?.mode ?? record.routingMode ?? "auto",
+		objective: base?.objective ?? record.routingProfile ?? "balanced",
+		applied: Boolean(selectedModel || selectedThinkingLevel),
+		reason: "inherited",
+		selectedModel,
+		selectedThinkingLevel,
+		explicitModel: base?.explicitModel,
+		explicitThinkingLevel: base?.explicitThinkingLevel,
+		intent: base?.intent ?? "scout",
+		risk: base?.risk ?? 0,
+		complexity: base?.complexity ?? 0,
+		complexityTier: base?.complexityTier ?? "simple",
+		complexityScore: base?.complexityScore ?? base?.complexity ?? 0,
+		confidence: base?.confidence ?? 0,
+		classificationReason: base?.classificationReason ?? "Inherited from parent subagent.",
+		signals: [...(base?.signals ?? []), "followup-inherited"],
+		classifierUsed: base?.classifierUsed,
+		classifierModel: base?.classifierModel,
+		estimatedInputTokens: base?.estimatedInputTokens ?? 0,
+		estimatedOutputTokens: base?.estimatedOutputTokens ?? 0,
+		explanation: "Spawned follow-up inherited model and thinking level from the parent subagent.",
+		candidates,
+	};
 }
 
 export class AgentManager {
@@ -208,36 +249,42 @@ export class AgentManager {
 		};
 	}
 
-	async followupTask(agentId: string, prompt: string, mode: "live_if_supported" | "spawn_followup" = "live_if_supported"): Promise<FollowupTaskResult> {
+	async followupTask(agentId: string, prompt: string, mode: "live_if_supported" | "spawn_followup" = "live_if_supported", spawnOptions: FollowupSpawnOptions = {}): Promise<FollowupTaskResult> {
 		const record = this.requireRecord(agentId);
 		const handle = this.handles.get(agentId);
 		this.store.appendEvent("agent.followup", { agentId, taskPath: record.taskPath, data: { prompt: truncateMiddle(prompt, 2000), mode } });
 
-		if (record.status === "running" && handle?.isAlive()) {
+		if (mode === "live_if_supported" && record.status === "running" && handle?.isAlive()) {
 			await handle.followupTask(prompt);
 			return { agentId, delivered: true, queued: true, deliveryMode: "rpc_follow_up", message: "Follow-up queued via RPC follow_up." };
 		}
-		if ((record.status === "succeeded" || record.status === "failed") && handle?.isAlive()) {
+		if (mode === "live_if_supported" && (record.status === "succeeded" || record.status === "failed") && handle?.isAlive()) {
 			this.transition(record, "running", { processState: "live_running", controllable: true, startedAt: nowMs(), finishedAt: undefined, error: undefined });
 			await handle.prompt(prompt);
 			return { agentId, delivered: true, queued: false, deliveryMode: "rpc_prompt", message: "Follow-up started on the existing live agent." };
 		}
 		if (mode === "spawn_followup") {
+			const inheritModelAndThinking = spawnOptions.inheritModelAndThinking ?? true;
+			const model = spawnOptions.model ?? (inheritModelAndThinking ? record.model : undefined);
+			const thinkingLevel = spawnOptions.thinkingLevel ?? (inheritModelAndThinking ? record.thinkingLevel : undefined);
+			const routingMode = spawnOptions.routingMode ?? (inheritModelAndThinking ? record.routingMode : undefined);
+			const routingProfile = spawnOptions.routingProfile ?? (inheritModelAndThinking ? record.routingProfile : undefined);
+			const routingDecision = spawnOptions.routingDecision ?? (inheritModelAndThinking ? inheritedRoutingDecision(record, model, thinkingLevel) : undefined);
 			const spawned = await this.spawnAgent({
 				taskName: `${record.taskName}-followup`,
 				prompt,
 				parentAgentId: agentId,
 				cwd: record.cwd,
-				contextMode: "summary",
+				contextMode: spawnOptions.contextMode ?? "summary",
 				contextSummary: record.result?.summary ?? record.outputTail,
 				writeMode: record.writeMode,
 				allowedPaths: record.allowedPaths,
-				model: record.model,
-				thinkingLevel: record.thinkingLevel,
+				model,
+				thinkingLevel,
 				tools: record.tools,
-				routingMode: record.routingMode,
-				routingProfile: record.routingProfile,
-				routingDecision: record.routingDecision,
+				routingMode,
+				routingProfile,
+				routingDecision,
 			});
 			return { agentId, spawnedAgentId: spawned.agentId, delivered: true, queued: spawned.status === "queued", deliveryMode: "spawn_followup", message: `Spawned follow-up agent ${spawned.agentId}.` };
 		}

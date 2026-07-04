@@ -1,5 +1,11 @@
-import type { RouterConfig, RouterModelProfileOverride } from "./RouterConfig.ts";
+import {
+	DEFAULT_TIER_QUALITY_FLOOR,
+	type RouterConfig,
+	type RouterModelProfileOverride,
+	type RouterTierQualityFloor,
+} from "./RouterConfig.ts";
 import type {
+	ComplexityTier,
 	ContextMode,
 	RoutingCandidateScore,
 	RoutingDecision,
@@ -35,6 +41,7 @@ export interface ModelProfile {
 	quality: number;
 	speed: number;
 	preferredIntents: TaskIntent[];
+	preferredTiers: ComplexityTier[];
 	notes: string[];
 	profilePattern?: string;
 }
@@ -53,6 +60,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.2,
 		speed: 0.85,
 		preferredIntents: ["lookup", "summarize"],
+		preferredTiers: ["trivial", "simple"],
 		notes: ["local/cheap", "best for low-risk lookup and simple summarization"],
 	},
 	{
@@ -60,6 +68,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.45,
 		speed: 0.9,
 		preferredIntents: ["batch_simple", "lookup", "scout"],
+		preferredTiers: ["trivial", "simple"],
 		notes: ["fast flash-class model", "good for batch/simple scout work"],
 	},
 	{
@@ -67,6 +76,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.55,
 		speed: 0.75,
 		preferredIntents: ["scout", "summarize", "batch_simple"],
+		preferredTiers: ["simple", "moderate"],
 		notes: ["large-context economy model"],
 	},
 	{
@@ -74,6 +84,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.68,
 		speed: 0.7,
 		preferredIntents: ["scout", "debug", "summarize"],
+		preferredTiers: ["simple", "moderate", "complex"],
 		notes: ["coding-specialized mid-tier model"],
 	},
 	{
@@ -81,6 +92,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.72,
 		speed: 0.7,
 		preferredIntents: ["scout", "plan", "summarize"],
+		preferredTiers: ["moderate", "complex"],
 		notes: ["large-context planning/scout model"],
 	},
 	{
@@ -88,6 +100,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.78,
 		speed: 0.6,
 		preferredIntents: ["debug", "plan", "review"],
+		preferredTiers: ["moderate", "complex"],
 		notes: ["reasoning-heavy debug/plan model"],
 	},
 	{
@@ -95,6 +108,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.9,
 		speed: 0.55,
 		preferredIntents: ["review", "implement", "complex", "debug", "plan"],
+		preferredTiers: ["complex", "critical"],
 		notes: ["high-quality coding/review model"],
 	},
 	{
@@ -102,6 +116,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.98,
 		speed: 0.4,
 		preferredIntents: ["complex", "review", "implement"],
+		preferredTiers: ["critical"],
 		notes: ["premium expert model", "reserve for high-risk work"],
 	},
 	{
@@ -109,6 +124,7 @@ export const DEFAULT_MODEL_PROFILE_RULES: ModelProfileRule[] = [
 		quality: 0.95,
 		speed: 0.45,
 		preferredIntents: ["complex", "implement", "debug", "review"],
+		preferredTiers: ["complex", "critical"],
 		notes: ["premium code-heavy model"],
 	},
 ];
@@ -155,6 +171,7 @@ function inferBaseProfile(model: ModelLike): ModelProfile {
 	let quality = 0.55;
 	let speed = 0.55;
 	let preferredIntents: TaskIntent[] = ["scout", "summarize"];
+	let preferredTiers: ComplexityTier[] = ["simple", "moderate"];
 
 	if (model.reasoning) {
 		quality += 0.1;
@@ -164,24 +181,28 @@ function inferBaseProfile(model: ModelLike): ModelProfile {
 		quality -= 0.16;
 		speed += 0.22;
 		preferredIntents = ["lookup", "summarize", "batch_simple"];
+		preferredTiers = ["trivial", "simple"];
 		notes.push("small/local-class heuristic");
 	}
 	if (/flash/.test(label)) {
 		quality = Math.min(quality, 0.5);
 		speed = Math.max(speed, 0.85);
 		preferredIntents = ["lookup", "batch_simple", "scout"];
+		preferredTiers = ["trivial", "simple"];
 		notes.push("flash-class heuristic");
 	}
 	if (/sonnet|deepseek|glm|kimi/.test(label)) {
 		quality = Math.max(quality, 0.72);
 		speed = Math.max(speed, 0.55);
 		preferredIntents = ["scout", "debug", "plan", "review"];
+		preferredTiers = ["moderate", "complex"];
 		notes.push("strong coding/reasoning heuristic");
 	}
 	if (/opus|gpt-5|codex|pro/.test(label)) {
 		quality = Math.max(quality, 0.88);
 		speed = Math.min(speed, 0.55);
 		preferredIntents = ["complex", "implement", "review", "debug"];
+		preferredTiers = ["complex", "critical"];
 		notes.push("premium-class heuristic");
 	}
 
@@ -198,6 +219,7 @@ function inferBaseProfile(model: ModelLike): ModelProfile {
 		quality: clamp01(quality),
 		speed: clamp01(speed),
 		preferredIntents,
+		preferredTiers,
 		notes,
 	};
 }
@@ -208,6 +230,7 @@ function applyProfileRule(profile: ModelProfile, rule: ModelProfileRule, source:
 		quality: typeof rule.quality === "number" ? clamp01(rule.quality) : profile.quality,
 		speed: typeof rule.speed === "number" ? clamp01(rule.speed) : profile.speed,
 		preferredIntents: rule.preferredIntents ? [...rule.preferredIntents] : profile.preferredIntents,
+		preferredTiers: rule.preferredTiers ? [...rule.preferredTiers] : profile.preferredTiers,
 		notes: [...profile.notes, ...(rule.notes ?? []), `${source} profile: ${rule.pattern}`],
 		profilePattern: rule.pattern,
 	};
@@ -283,6 +306,12 @@ export interface RoutingTokenEstimate {
 	outputTokens: number;
 }
 
+export interface ComplexityAssessment {
+	complexityScore: number;
+	complexityTier: ComplexityTier;
+	contextBoost: number;
+}
+
 export interface ClassifierDecision {
 	intent: TaskIntent;
 	risk: number;
@@ -320,6 +349,7 @@ export interface RouteSubagentResult {
 	thinkingLevel?: ThinkingLevel;
 	decision: RoutingDecision;
 	classification: IntentClassification;
+	complexity: ComplexityAssessment;
 	profiles: ProfiledScopedModel[];
 }
 
@@ -347,6 +377,18 @@ const HIGH_RISK_KEYWORDS = [
 ];
 
 const LOW_RISK_KEYWORDS = ["list", "find", "locate", "grep", "search", "summarize", "inventory", "inspect", "read-only", "map"];
+
+const INTENT_COMPLEXITY_BASE: Record<TaskIntent, number> = {
+	lookup: 0.05,
+	batch_simple: 0.1,
+	summarize: 0.15,
+	scout: 0.3,
+	debug: 0.45,
+	plan: 0.5,
+	review: 0.6,
+	implement: 0.7,
+	complex: 0.85,
+};
 
 function escapeRegExp(value: string): string {
 	return value.replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
@@ -452,6 +494,40 @@ export function classifyTaskIntent(input: DeterministicIntentInput): IntentClass
 	return { intent, risk, complexity, confidence: clamp01(confidence - ambiguityPenalty), reason, signals };
 }
 
+export function complexityTierForScore(score: number, thresholds: RouterConfig["complexity"]["thresholds"]): ComplexityTier {
+	const normalized = clamp01(score);
+	if (normalized < thresholds.trivialMax) return "trivial";
+	if (normalized < thresholds.simpleMax) return "simple";
+	if (normalized < thresholds.moderateMax) return "moderate";
+	if (normalized < thresholds.complexMax) return "complex";
+	return "critical";
+}
+
+export function assessTaskComplexity(
+	input: DeterministicIntentInput,
+	classification: IntentClassification,
+	complexityConfig?: RouterConfig["complexity"],
+): ComplexityAssessment {
+	const thresholds = complexityConfig?.thresholds ?? {
+		trivialMax: 0.2,
+		simpleMax: 0.38,
+		moderateMax: 0.58,
+		complexMax: 0.78,
+	};
+	const contextBoost = input.contextMode && input.contextMode !== "fresh" ? 1 : 0;
+	const complexityScore = clamp01(
+		0.45 * INTENT_COMPLEXITY_BASE[classification.intent] +
+		0.25 * classification.complexity +
+		0.25 * classification.risk +
+		0.05 * contextBoost,
+	);
+	return {
+		complexityScore,
+		complexityTier: complexityTierForScore(complexityScore, thresholds),
+		contextBoost,
+	};
+}
+
 export function estimateRoutingTokens(input: DeterministicIntentInput, intent: TaskIntent): RoutingTokenEstimate {
 	const chars = input.prompt.length + (input.agentDefinition?.length ?? 0) + (input.contextSummary?.length ?? 0) + (input.batch?.samplePrompts?.join("\n").length ?? 0);
 	const inputTokens = Math.ceil(chars / 4) + 1000;
@@ -465,7 +541,13 @@ export function estimateRoutingTokens(input: DeterministicIntentInput, intent: T
 	return { inputTokens, outputTokens };
 }
 
-function requiredQuality(intent: TaskIntent, risk: number, complexity: number): number {
+function requiredQuality(
+	intent: TaskIntent,
+	risk: number,
+	complexity: number,
+	complexityTier: ComplexityTier,
+	tierQualityFloor: RouterTierQualityFloor,
+): number {
 	const base = intent === "lookup"
 		? 0.28
 		: intent === "summarize"
@@ -483,7 +565,8 @@ function requiredQuality(intent: TaskIntent, risk: number, complexity: number): 
 								: intent === "implement"
 									? 0.82
 									: 0.88;
-	return clamp01(base + risk * 0.12 + complexity * 0.08);
+	const intentRequired = clamp01(base + risk * 0.12 + complexity * 0.08);
+	return clamp01(Math.max(intentRequired, tierQualityFloor[complexityTier] ?? DEFAULT_TIER_QUALITY_FLOOR[complexityTier]));
 }
 
 function scoreWeights(objective: RoutingObjective): { quality: number; cost: number; speed: number; context: number } {
@@ -518,37 +601,49 @@ function contextFit(profile: ModelProfile, estimate: RoutingTokenEstimate): numb
 
 export function defaultThinkingLevelForTask(
 	classification: IntentClassification,
+	assessment: ComplexityAssessment,
 	profile: ModelProfile | undefined,
 	objective: RoutingObjective,
 ): ThinkingLevel {
 	if (profile && !profile.reasoning) return "off";
 	const { intent, risk, complexity } = classification;
-	let level: ThinkingLevel = intent === "lookup" || intent === "batch_simple"
-		? "off"
-		: intent === "summarize"
-			? "minimal"
-			: intent === "scout"
-				? "low"
-				: intent === "debug" || intent === "plan" || intent === "review"
-					? "medium"
-					: "high";
-	if (intent === "scout" && risk < 0.25 && complexity < 0.35) level = "minimal";
-	if (intent === "debug" && risk < 0.35 && complexity < 0.45) level = "low";
+	let level: ThinkingLevel;
+	switch (assessment.complexityTier) {
+		case "trivial":
+			level = "off";
+			break;
+		case "simple":
+			level = intent === "lookup" || intent === "batch_simple" ? "off" : "minimal";
+			break;
+		case "moderate":
+			level = "low";
+			break;
+		case "complex":
+			level = intent === "implement" || intent === "review" || risk >= 0.7 ? "high" : "medium";
+			break;
+		case "critical":
+			level = "high";
+			break;
+	}
+	if (intent === "debug" && assessment.complexityTier === "moderate" && risk < 0.35 && complexity < 0.45) level = "low";
 	if ((intent === "review" || intent === "plan") && risk >= 0.7) level = "high";
-	if (objective === "quality_first" && risk >= 0.85 && complexity >= 0.75) level = "xhigh";
+	if (objective === "quality_first" && risk >= 0.85 && complexity >= 0.75 && assessment.complexityTier === "critical") level = "xhigh";
 	return level;
 }
 
 export function scoreProfilesForTask(
 	profiles: ProfiledScopedModel[],
 	classification: IntentClassification,
+	assessment: ComplexityAssessment,
 	estimate: RoutingTokenEstimate,
 	objective: RoutingObjective,
+	tierQualityFloor: RouterTierQualityFloor = DEFAULT_TIER_QUALITY_FLOOR,
 ): RoutingCandidateScore[] {
 	const costs = profiles.map((candidate) => estimateModelCostUsd(candidate.profile, estimate.inputTokens, estimate.outputTokens));
 	const medianCost = median(costs.filter((cost) => Number.isFinite(cost)));
 	const weights = scoreWeights(objective);
-	const required = requiredQuality(classification.intent, classification.risk, classification.complexity);
+	const required = requiredQuality(classification.intent, classification.risk, classification.complexity, assessment.complexityTier, tierQualityFloor);
+	const tierFloor = tierQualityFloor[assessment.complexityTier] ?? DEFAULT_TIER_QUALITY_FLOOR[assessment.complexityTier];
 	return profiles
 		.map((candidate, index) => {
 			const profile = candidate.profile;
@@ -557,31 +652,39 @@ export function scoreProfilesForTask(
 			const cFit = costFit(estimatedCostUsd, costs);
 			const ctxFit = contextFit(profile, estimate);
 			const roleBoost = profile.preferredIntents.includes(classification.intent) ? 0.08 : 0;
+			const tierBoost = profile.preferredTiers.includes(assessment.complexityTier) ? 0.06 : 0;
 			const riskPenalty = profile.quality < required ? (required - profile.quality) * classification.risk * 0.45 : 0;
-			const lowRiskIntent = classification.intent === "lookup" || classification.intent === "summarize" || classification.intent === "batch_simple";
+			const tierMismatchPenalty = profile.quality < tierFloor ? (tierFloor - profile.quality) * 0.5 : 0;
+			const lowRiskIntent = classification.intent === "lookup" || classification.intent === "summarize" || classification.intent === "batch_simple" || assessment.complexityTier === "trivial" || assessment.complexityTier === "simple";
 			const overkillPenalty = lowRiskIntent && profile.quality > required + 0.3 && medianCost > 0 && estimatedCostUsd > medianCost * 2 ? 0.18 : 0;
 			const score = clamp01(
 				qFit * weights.quality +
 				cFit * weights.cost +
 				profile.speed * weights.speed +
 				ctxFit * weights.context +
-				roleBoost -
+				roleBoost +
+				tierBoost -
 				riskPenalty -
+				tierMismatchPenalty -
 				overkillPenalty,
 			);
 			const notes = [
 				...profile.notes,
+				`tier=${assessment.complexityTier}`,
 				`requiredQuality=${required.toFixed(2)}`,
 				`qualityFit=${qFit.toFixed(2)}`,
 				`costFit=${cFit.toFixed(2)}`,
 				`contextFit=${ctxFit.toFixed(2)}`,
 			];
 			if (roleBoost > 0) notes.push(`roleBoost=${roleBoost.toFixed(2)}`);
+			if (tierBoost > 0) notes.push(`tierBoost=${tierBoost.toFixed(2)}`);
 			if (riskPenalty > 0) notes.push(`riskPenalty=${riskPenalty.toFixed(2)}`);
+			if (tierMismatchPenalty > 0) notes.push(`tierMismatchPenalty=${tierMismatchPenalty.toFixed(2)}`);
 			if (overkillPenalty > 0) notes.push(`overkillPenalty=${overkillPenalty.toFixed(2)}`);
-			return { model: profile.ref, score, estimatedCostUsd, quality: profile.quality, notes };
+			return { score: { model: profile.ref, score, estimatedCostUsd, quality: profile.quality, notes }, tierPreferred: tierBoost > 0 };
 		})
-		.sort((a, b) => b.score - a.score || a.estimatedCostUsd - b.estimatedCostUsd);
+		.sort((a, b) => b.score.score - a.score.score || Number(b.tierPreferred) - Number(a.tierPreferred) || a.score.estimatedCostUsd - b.score.estimatedCostUsd)
+		.map((entry) => entry.score);
 }
 
 function findProfileByRef(profiles: ProfiledScopedModel[], ref: string | undefined): ProfiledScopedModel | undefined {
@@ -688,17 +791,23 @@ function classifierApplied(base: IntentClassification, decision: ClassifierDecis
 	};
 }
 
+interface ClassifierApplication {
+	classification: IntentClassification;
+	classifierUsed?: boolean;
+	classifierModel?: string;
+}
+
 async function maybeApplyClassifier(
 	request: RouteSubagentRequest,
 	profiles: ProfiledScopedModel[],
 	classification: IntentClassification,
 	estimate: RoutingTokenEstimate,
 	candidateScores: RoutingCandidateScore[],
-): Promise<IntentClassification> {
-	if (!request.classifier || request.config.classifier.enabled === false || request.explicitModel) return classification;
-	if (!isAmbiguousRoute(classification, candidateScores)) return classification;
+): Promise<ClassifierApplication> {
+	if (!request.classifier || request.config.classifier.enabled === false || request.explicitModel) return { classification };
+	if (!isAmbiguousRoute(classification, candidateScores)) return { classification };
 	const classifierModel = selectClassifierModel(profiles, request.config);
-	if (!classifierModel) return classification;
+	if (!classifierModel) return { classification };
 	try {
 		const decision = await request.classifier({
 			model: classifierModel,
@@ -707,10 +816,14 @@ async function maybeApplyClassifier(
 			estimate,
 			metadata: classifierMetadata(request),
 		});
-		if (!decision || decision.confidence < 0.55) return classification;
-		return classifierApplied(classification, decision);
+		if (!decision || decision.confidence < 0.55) return { classification };
+		return {
+			classification: classifierApplied(classification, decision),
+			classifierUsed: true,
+			classifierModel: classifierModel.profile.ref,
+		};
 	} catch {
-		return classification;
+		return { classification };
 	}
 }
 
@@ -725,9 +838,12 @@ function decisionFrom(
 		explicitModel?: string;
 		explicitThinkingLevel?: ThinkingLevel;
 		classification: IntentClassification;
+		assessment: ComplexityAssessment;
 		estimate: RoutingTokenEstimate;
 		explanation: string;
 		candidates: RoutingCandidateScore[];
+		classifierUsed?: boolean;
+		classifierModel?: string;
 	},
 ): RoutingDecision {
 	return {
@@ -742,6 +858,13 @@ function decisionFrom(
 		intent: base.classification.intent,
 		risk: base.classification.risk,
 		complexity: base.classification.complexity,
+		complexityTier: base.assessment.complexityTier,
+		complexityScore: base.assessment.complexityScore,
+		confidence: base.classification.confidence,
+		classificationReason: base.classification.reason,
+		signals: [...base.classification.signals],
+		classifierUsed: base.classifierUsed,
+		classifierModel: base.classifierModel,
 		estimatedInputTokens: base.estimate.inputTokens,
 		estimatedOutputTokens: base.estimate.outputTokens,
 		explanation: base.explanation,
@@ -753,7 +876,10 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 	const mode: RoutingMode = request.routingMode ?? (request.config.enabled ? "auto" : "off");
 	const objective = request.routingProfile ?? request.config.objective;
 	let classification = classifyTaskIntent(request);
+	let assessment = assessTaskComplexity(request, classification, request.config.complexity);
 	let estimate = estimateRoutingTokens(request, classification.intent);
+	let classifierUsed: boolean | undefined;
+	let classifierModel: string | undefined;
 	const explicitModel = request.explicitModel;
 	const explicitThinkingLevel = request.explicitThinkingLevel;
 
@@ -768,11 +894,12 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 			explicitModel,
 			explicitThinkingLevel,
 			classification,
+			assessment,
 			estimate,
 			explanation: "Smart subagent routing is disabled for this request.",
 			candidates: [],
 		});
-		return { model: explicitModel, thinkingLevel: explicitThinkingLevel, decision, classification, profiles: [] };
+		return { model: explicitModel, thinkingLevel: explicitThinkingLevel, decision, classification, complexity: assessment, profiles: [] };
 	}
 
 	let profiles: ProfiledScopedModel[] = [];
@@ -787,7 +914,7 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 	} catch {
 		const fallbackModel = explicitModel ?? (request.currentModel ? modelRef(request.currentModel) : undefined);
 		const fallbackProfile = request.currentModel ? profileModel(request.currentModel, request.config.modelProfiles) : undefined;
-		const thinkingLevel = explicitThinkingLevel ?? defaultThinkingLevelForTask(classification, fallbackProfile, objective);
+		const thinkingLevel = explicitThinkingLevel ?? defaultThinkingLevelForTask(classification, assessment, fallbackProfile, objective);
 		const decision = decisionFrom({
 			mode,
 			objective,
@@ -798,21 +925,26 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 			explicitModel,
 			explicitThinkingLevel,
 			classification,
+			assessment,
 			estimate,
 			explanation: "Could not list available scoped models; falling back to the explicit/current model.",
 			candidates: [],
 		});
-		return { model: fallbackModel, thinkingLevel, decision, classification, profiles: [] };
+		return { model: fallbackModel, thinkingLevel, decision, classification, complexity: assessment, profiles: [] };
 	}
 
-	let candidateScores = scoreProfilesForTask(profiles, classification, estimate, objective);
-	classification = await maybeApplyClassifier(request, profiles, classification, estimate, candidateScores);
+	let candidateScores = scoreProfilesForTask(profiles, classification, assessment, estimate, objective, request.config.complexity.tierQualityFloor);
+	const classifierApplication = await maybeApplyClassifier(request, profiles, classification, estimate, candidateScores);
+	classification = classifierApplication.classification;
+	classifierUsed = classifierApplication.classifierUsed;
+	classifierModel = classifierApplication.classifierModel;
+	assessment = assessTaskComplexity(request, classification, request.config.complexity);
 	estimate = estimateRoutingTokens(request, classification.intent);
-	candidateScores = scoreProfilesForTask(profiles, classification, estimate, objective);
+	candidateScores = scoreProfilesForTask(profiles, classification, assessment, estimate, objective, request.config.complexity.tierQualityFloor);
 	if (explicitModel) {
 		const explicitProfile = findProfileByRef(profiles, explicitModel)?.profile;
 		const fallbackProfile = explicitProfile ?? (request.currentModel && modelRef(request.currentModel).toLowerCase() === explicitModel.toLowerCase() ? profileModel(request.currentModel, request.config.modelProfiles) : undefined);
-		const thinkingLevel = explicitThinkingLevel ?? defaultThinkingLevelForTask(classification, fallbackProfile, objective);
+		const thinkingLevel = explicitThinkingLevel ?? defaultThinkingLevelForTask(classification, assessment, fallbackProfile, objective);
 		const decision = decisionFrom({
 			mode,
 			objective,
@@ -823,19 +955,22 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 			explicitModel,
 			explicitThinkingLevel,
 			classification,
+			assessment,
 			estimate,
 			explanation: explicitThinkingLevel
 				? "Explicit model and thinking level were preserved; model routing was not applied."
 				: "Explicit model was preserved; router only selected a task-appropriate thinking level.",
 			candidates: candidateScores,
+			classifierUsed,
+			classifierModel,
 		});
-		return { model: explicitModel, thinkingLevel, decision, classification, profiles };
+		return { model: explicitModel, thinkingLevel, decision, classification, complexity: assessment, profiles };
 	}
 
 	if (profiles.length === 0) {
 		const fallbackModel = request.config.fallbackWhenNoScopedModels === "current_model" && request.currentModel ? modelRef(request.currentModel) : undefined;
 		const fallbackProfile = request.currentModel ? profileModel(request.currentModel, request.config.modelProfiles) : undefined;
-		const thinkingLevel = explicitThinkingLevel ?? defaultThinkingLevelForTask(classification, fallbackProfile, objective);
+		const thinkingLevel = explicitThinkingLevel ?? defaultThinkingLevelForTask(classification, assessment, fallbackProfile, objective);
 		const decision = decisionFrom({
 			mode,
 			objective,
@@ -846,22 +981,25 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 			explicitModel,
 			explicitThinkingLevel,
 			classification,
+			assessment,
 			estimate,
 			explanation: fallbackModel
 				? "No scoped models were available; falling back to the current parent model."
 				: "No scoped models were available and no current-model fallback is configured.",
 			candidates: [],
+			classifierUsed,
+			classifierModel,
 		});
-		return { model: fallbackModel, thinkingLevel, decision, classification, profiles };
+		return { model: fallbackModel, thinkingLevel, decision, classification, complexity: assessment, profiles };
 	}
 
 	const neededTokens = estimate.inputTokens + estimate.outputTokens;
 	const fittingProfiles = profiles.filter((candidate) => candidate.profile.contextWindow >= neededTokens);
 	const scoredPool = fittingProfiles.length > 0 ? fittingProfiles : profiles;
-	const scored = scoreProfilesForTask(scoredPool, classification, estimate, objective);
+	const scored = scoreProfilesForTask(scoredPool, classification, assessment, estimate, objective, request.config.complexity.tierQualityFloor);
 	const bestScore = scored[0];
 	const best = bestScore ? scoredPool.find((candidate) => candidate.profile.ref === bestScore.model) : undefined;
-	const selectedThinkingLevel = explicitThinkingLevel ?? best?.scopedThinkingLevel ?? defaultThinkingLevelForTask(classification, best?.profile, objective);
+	const selectedThinkingLevel = explicitThinkingLevel ?? best?.scopedThinkingLevel ?? defaultThinkingLevelForTask(classification, assessment, best?.profile, objective);
 	const selectedModel = best?.profile.ref;
 	const explainOnly = mode === "explain";
 	const contextWarning = fittingProfiles.length === 0 ? " No candidate fit the estimated context; selected from the largest/available pool." : "";
@@ -875,15 +1013,19 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 		explicitModel,
 		explicitThinkingLevel,
 		classification,
+		assessment,
 		estimate,
-		explanation: `${classification.reason}; selected ${selectedModel ?? "no model"} for ${classification.intent} (${objective}).${contextWarning}`,
+		explanation: `${classification.reason}; selected ${selectedModel ?? "no model"} for ${classification.intent}/${assessment.complexityTier} (${objective}).${contextWarning}`,
 		candidates: scored,
+		classifierUsed,
+		classifierModel,
 	});
 	return {
 		model: explainOnly ? undefined : selectedModel,
 		thinkingLevel: explicitThinkingLevel ?? (explainOnly ? undefined : selectedThinkingLevel),
 		decision,
 		classification,
+		complexity: assessment,
 		profiles,
 	};
 }

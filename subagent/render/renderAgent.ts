@@ -11,10 +11,11 @@ export function renderAgentSummary(summary: AgentSummary | AgentRecord, theme: a
 	const meta = [summary.agentId, duration !== undefined ? formatDuration(duration) : "", summary.controllable ? "controllable" : "not controllable"].filter(Boolean).join(" · ");
 	lines.push(theme.fg("dim", meta));
 	const routing = summary.routingDecision;
+	const routeLabel = routing ? `routed:${routing.intent}/${routing.complexityTier ?? "unknown"}/${routing.objective}${routing.applied ? "" : ` (${routing.reason})`}` : "";
 	const modelMeta = [
 		summary.model ? `model:${summary.model}` : "",
 		summary.thinkingLevel ? `thinking:${summary.thinkingLevel}` : "",
-		routing ? `routed:${routing.intent}/${routing.objective}${routing.applied ? "" : ` (${routing.reason})`}` : "",
+		routeLabel,
 	].filter(Boolean).join(" · ");
 	if (modelMeta) lines.push(theme.fg("dim", modelMeta));
 	const text = "summary" in summary ? summary.summary : summary.result?.summary;
@@ -24,7 +25,11 @@ export function renderAgentSummary(summary: AgentSummary | AgentRecord, theme: a
 	if (routing && expanded) {
 		lines.push("", theme.fg("muted", "── routing ──"));
 		lines.push(`decision: ${routing.reason}; selected=${routing.selectedModel ?? "(none)"}; thinking=${routing.selectedThinkingLevel ?? "(none)"}`);
+		lines.push(`tier=${routing.complexityTier ?? "unknown"} score=${(routing.complexityScore ?? routing.complexity ?? 0).toFixed(2)} confidence=${(routing.confidence ?? 0).toFixed(2)}`);
 		lines.push(`risk=${routing.risk.toFixed(2)} complexity=${routing.complexity.toFixed(2)} estimated=${routing.estimatedInputTokens}+${routing.estimatedOutputTokens} tokens`);
+		if (routing.classificationReason) lines.push(`reason: ${routing.classificationReason}`);
+		if (routing.signals?.length) lines.push(`signals: ${routing.signals.join(", ")}`);
+		lines.push(`classifier: ${routing.classifierUsed ? routing.classifierModel ?? "used" : "none"}`);
 		if (routing.explanation) lines.push(routing.explanation);
 		for (const candidate of routing.candidates.slice(0, 3)) {
 			lines.push(theme.fg("dim", `• ${candidate.model} score=${candidate.score.toFixed(3)} cost=$${candidate.estimatedCostUsd.toFixed(5)} quality=${candidate.quality.toFixed(2)}`));

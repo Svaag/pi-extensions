@@ -112,6 +112,7 @@ export function shallowCloneRecord(record: AgentRecord): AgentRecord {
 		routingDecision: record.routingDecision
 			? {
 					...record.routingDecision,
+					signals: [...(record.routingDecision.signals ?? [])],
 					candidates: record.routingDecision.candidates.map((candidate) => ({
 						...candidate,
 						notes: [...candidate.notes],

@@ -91,11 +91,13 @@ async function withAgentDir(patterns: string[], fn: (agentDir: string) => Promis
 async function route(agentDir: string, overrides: any = {}) {
 	return routeSubagentModel({
 		cwd: "/repo",
-		config: config(),
+		config: overrides.config ?? config(),
 		modelRegistry: registry(overrides.models),
 		currentModel: MODELS[5],
 		taskName: overrides.taskName ?? "lookup",
 		prompt: overrides.prompt ?? "Find where authentication routes are defined. Return file paths only.",
+		contextMode: overrides.contextMode,
+		contextSummary: overrides.contextSummary,
 		writeMode: overrides.writeMode ?? "read_only",
 		routingMode: overrides.routingMode,
 		routingProfile: overrides.routingProfile,
@@ -112,6 +114,8 @@ test("smart router sends simple lookup to low-cost scoped model with off/minimal
 		assert.equal(result.model, "local-llamacpp/local-model");
 		assert.equal(result.thinkingLevel, "off");
 		assert.equal(result.decision.intent, "lookup");
+		assert.equal(result.decision.complexityTier, "trivial");
+		assert(result.decision.complexityScore < 0.2);
 		assert.equal(result.decision.reason, "selected");
 	});
 });
@@ -129,8 +133,9 @@ test("smart router routes security review to Sonnet-class quality", async () => 
 			prompt: "Review the authentication and permission checks for security vulnerabilities, race conditions, and secret handling issues.",
 		});
 		assert.equal(result.model, "anthropic/claude-sonnet-4-6");
-		assert(["medium", "high"].includes(result.thinkingLevel ?? ""));
+		assert(["low", "medium", "high"].includes(result.thinkingLevel ?? ""));
 		assert.equal(result.decision.intent, "review");
+		assert(["moderate", "complex", "critical"].includes(result.decision.complexityTier));
 	});
 });
 
@@ -143,6 +148,88 @@ test("smart router avoids weak/local models for write-capable implementation", a
 		});
 		assert.equal(result.model, "anthropic/claude-sonnet-4-6");
 		assert.equal(result.decision.intent, "implement");
+		assert(["moderate", "complex", "critical"].includes(result.decision.complexityTier));
+	});
+});
+
+test("smart router exposes critical complexity tier for high-risk multi-step work", async () => {
+	await withAgentDir([
+		"local-llamacpp/local-model",
+		"openrouter/deepseek/deepseek-v4-pro",
+		"anthropic/claude-sonnet-*",
+		"anthropic/claude-opus-*",
+		"openai-codex/gpt-*",
+	], async (agentDir) => {
+		const result = await route(agentDir, {
+			taskName: "critical-payment-auth-migration",
+			contextMode: "summary",
+			contextSummary: "Prior architecture and incident context. ".repeat(1200),
+			prompt: "Implement a multi-step production payment wallet authentication and permission schema migration across all usages. Review security, secrets, data loss, concurrency, race conditions, rollback, and architecture risks before making changes.",
+			writeMode: "disjoint_scope",
+		});
+		assert.equal(result.decision.complexityTier, "critical");
+		assert(result.decision.complexityScore >= 0.78);
+		assert(["anthropic/claude-sonnet-4-6", "anthropic/claude-opus-4-8", "openai-codex/gpt-5.5"].includes(result.model ?? ""));
+		assert(["high", "xhigh"].includes(result.thinkingLevel ?? ""));
+	});
+});
+
+test("smart router recomputes complexity tier after classifier refinement", async () => {
+	await withAgentDir(["local-llamacpp/local-model", "anthropic/claude-sonnet-*"], async (agentDir) => {
+		const result = await route(agentDir, {
+			taskName: "ambiguous",
+			prompt: "Handle this task after checking repository context.",
+			config: { ...config(), classifier: { ...DEFAULT_ROUTER_CONFIG.classifier, enabled: "auto" } },
+			classifier: async () => ({
+				intent: "implement",
+				risk: 1,
+				complexity: 1,
+				confidence: 0.9,
+				reason: "classifier saw critical implementation risk",
+			}),
+		});
+		assert.equal(result.decision.classifierUsed, true);
+		assert.equal(result.decision.classifierModel, "local-llamacpp/local-model");
+		assert.equal(result.decision.intent, "implement");
+		assert.equal(result.decision.complexityTier, "critical");
+		assert.equal(result.model, "anthropic/claude-sonnet-4-6");
+	});
+});
+
+test("smart router honors configured complexity thresholds", async () => {
+	await withAgentDir(["local-llamacpp/local-model", "anthropic/claude-sonnet-*"], async (agentDir) => {
+		const customConfig: RouterConfig = {
+			...config(),
+			complexity: {
+				thresholds: { trivialMax: 0.01, simpleMax: 0.5, moderateMax: 0.7, complexMax: 0.9 },
+				tierQualityFloor: { ...DEFAULT_ROUTER_CONFIG.complexity.tierQualityFloor },
+			},
+		};
+		const result = await route(agentDir, { config: customConfig, prompt: "List files that mention TODO." });
+		assert.equal(result.decision.complexityTier, "simple");
+	});
+});
+
+test("smart router profile preferredTiers influences otherwise tied candidates", async () => {
+	const models: ModelLike[] = [
+		{ provider: "test", id: "moderate", name: "Moderate Tier", reasoning: false, contextWindow: 128000, maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+		{ provider: "test", id: "simple", name: "Simple Tier", reasoning: false, contextWindow: 128000, maxTokens: 8192, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+	];
+	await withAgentDir(["test/moderate", "test/simple"], async (agentDir) => {
+		const customConfig: RouterConfig = {
+			...config(),
+			complexity: {
+				thresholds: { trivialMax: 0.01, simpleMax: 0.5, moderateMax: 0.7, complexMax: 0.9 },
+				tierQualityFloor: { ...DEFAULT_ROUTER_CONFIG.complexity.tierQualityFloor },
+			},
+			modelProfiles: {
+				"test/moderate": { quality: 0.55, speed: 0.5, preferredIntents: ["lookup"], preferredTiers: ["moderate"] },
+				"test/simple": { quality: 0.55, speed: 0.5, preferredIntents: ["lookup"], preferredTiers: ["simple"] },
+			},
+		};
+		const result = await route(agentDir, { config: customConfig, models, prompt: "List files that mention TODO." });
+		assert.equal(result.decision.complexityTier, "simple");
+		assert.equal(result.model, "test/simple");
 	});
 });
 

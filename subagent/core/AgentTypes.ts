@@ -12,6 +12,8 @@ export type RoutingMode = "auto" | "off" | "explain";
 
 export type RoutingObjective = "balanced" | "cost_first" | "quality_first";
 
+export type ComplexityTier = "trivial" | "simple" | "moderate" | "complex" | "critical";
+
 export type TaskIntent =
 	| "lookup"
 	| "scout"
@@ -31,7 +33,8 @@ export type RoutingDecisionReason =
 	| "explain_only"
 	| "no_scoped_models"
 	| "no_available_models"
-	| "fallback_current_model";
+	| "fallback_current_model"
+	| "inherited";
 
 export interface RoutingCandidateScore {
 	model: string;
@@ -53,6 +56,13 @@ export interface RoutingDecision {
 	intent: TaskIntent | string;
 	risk: number;
 	complexity: number;
+	complexityTier: ComplexityTier;
+	complexityScore: number;
+	confidence: number;
+	classificationReason: string;
+	signals: string[];
+	classifierUsed?: boolean;
+	classifierModel?: string;
 	estimatedInputTokens: number;
 	estimatedOutputTokens: number;
 	explanation: string;

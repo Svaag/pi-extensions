@@ -51,11 +51,14 @@ export function jobText(job: BatchJobSummary, includeItems = true): string {
 	const routeMeta = [
 		job.model ? `model:${job.model}` : "",
 		job.thinkingLevel ? `thinking:${job.thinkingLevel}` : "",
-		routing ? `routed:${routing.intent}/${routing.objective}${routing.applied ? "" : ` (${routing.reason})`}` : "",
+		routing ? `routed:${routing.intent}/${routing.complexityTier ?? "unknown"}/${routing.objective}${routing.applied ? "" : ` (${routing.reason})`}` : "",
 	].filter(Boolean).join(" · ");
 	if (routeMeta) lines.push(routeMeta);
 	if (includeItems && routing) {
 		lines.push(`routing: ${routing.reason}; selected=${routing.selectedModel ?? "(none)"}; thinking=${routing.selectedThinkingLevel ?? "(none)"}`);
+		lines.push(`tier=${routing.complexityTier ?? "unknown"} score=${(routing.complexityScore ?? routing.complexity ?? 0).toFixed(2)} confidence=${(routing.confidence ?? 0).toFixed(2)}`);
+		if (routing.classificationReason) lines.push(`reason: ${routing.classificationReason}`);
+		if (routing.signals?.length) lines.push(`signals: ${routing.signals.join(", ")}`);
 		for (const candidate of routing.candidates.slice(0, 3)) {
 			lines.push(`  - ${candidate.model} score=${candidate.score.toFixed(3)} cost=$${candidate.estimatedCostUsd.toFixed(5)} quality=${candidate.quality.toFixed(2)}`);
 		}

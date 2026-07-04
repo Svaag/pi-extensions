@@ -129,6 +129,11 @@ test("BatchJobManager passes routed model and thinking to workers", async () => 
 			intent: "batch_simple",
 			risk: 0,
 			complexity: 0,
+			complexityTier: "trivial",
+			complexityScore: 0.05,
+			confidence: 0.82,
+			classificationReason: "batch",
+			signals: ["batch"],
 			estimatedInputTokens: 1000,
 			estimatedOutputTokens: 2000,
 			explanation: "test",
@@ -140,6 +145,7 @@ test("BatchJobManager passes routed model and thinking to workers", async () => 
 	assert.equal(fake.spawnRequests[0].thinkingLevel, "off");
 	assert.equal(fake.spawnRequests[0].routingDecision?.intent, "batch_simple");
 	assert.equal(manager.getJob(job.jobId)?.routingDecision?.selectedThinkingLevel, "off");
+	assert.equal(manager.getJob(job.jobId)?.routingDecision?.complexityTier, "trivial");
 	fake.complete("agent_1", "done");
 	await manager.waitJob(job.jobId, 2000);
 });

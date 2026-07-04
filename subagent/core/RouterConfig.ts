@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import type { RoutingObjective, TaskIntent } from "./AgentTypes.ts";
+import type { ComplexityTier, RoutingObjective, TaskIntent } from "./AgentTypes.ts";
 
 const CONFIG_DIR_NAME = ".pi";
 
@@ -13,6 +13,35 @@ export type RouterCandidateSource = "scoped";
 export type RouterFallbackWhenNoScopedModels = "current_model" | "none";
 export type RouterZeroCostPolicy = "trust" | "penalize";
 export type RouterClassifierEnabled = "auto" | boolean;
+
+export interface RouterComplexityThresholds {
+	trivialMax: number;
+	simpleMax: number;
+	moderateMax: number;
+	complexMax: number;
+}
+
+export type RouterTierQualityFloor = Record<ComplexityTier, number>;
+
+export interface RouterComplexityConfig {
+	thresholds: RouterComplexityThresholds;
+	tierQualityFloor: RouterTierQualityFloor;
+}
+
+export const DEFAULT_COMPLEXITY_THRESHOLDS: RouterComplexityThresholds = {
+	trivialMax: 0.2,
+	simpleMax: 0.38,
+	moderateMax: 0.58,
+	complexMax: 0.78,
+};
+
+export const DEFAULT_TIER_QUALITY_FLOOR: RouterTierQualityFloor = {
+	trivial: 0.2,
+	simple: 0.4,
+	moderate: 0.6,
+	complex: 0.78,
+	critical: 0.9,
+};
 
 export interface RouterClassifierConfig {
 	enabled: RouterClassifierEnabled;
@@ -27,6 +56,7 @@ export interface RouterModelProfileOverride {
 	quality?: number;
 	speed?: number;
 	preferredIntents?: TaskIntent[];
+	preferredTiers?: ComplexityTier[];
 	notes?: string[];
 }
 
@@ -37,6 +67,7 @@ export interface RouterConfig {
 	fallbackWhenNoScopedModels: RouterFallbackWhenNoScopedModels;
 	showExplanations: boolean;
 	zeroCostPolicy: RouterZeroCostPolicy;
+	complexity: RouterComplexityConfig;
 	classifier: RouterClassifierConfig;
 	modelProfiles: Record<string, RouterModelProfileOverride>;
 }
@@ -48,6 +79,10 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
 	fallbackWhenNoScopedModels: "current_model",
 	showExplanations: true,
 	zeroCostPolicy: "trust",
+	complexity: {
+		thresholds: { ...DEFAULT_COMPLEXITY_THRESHOLDS },
+		tierQualityFloor: { ...DEFAULT_TIER_QUALITY_FLOOR },
+	},
 	classifier: {
 		enabled: "auto",
 		requireLocalOrZeroCost: true,
@@ -71,6 +106,10 @@ function isObject(value: unknown): value is Record<string, unknown> {
 function cloneDefaultConfig(): RouterConfig {
 	return {
 		...DEFAULT_ROUTER_CONFIG,
+		complexity: {
+			thresholds: { ...DEFAULT_ROUTER_CONFIG.complexity.thresholds },
+			tierQualityFloor: { ...DEFAULT_ROUTER_CONFIG.complexity.tierQualityFloor },
+		},
 		classifier: { ...DEFAULT_ROUTER_CONFIG.classifier },
 		modelProfiles: { ...DEFAULT_ROUTER_CONFIG.modelProfiles },
 	};
@@ -113,6 +152,11 @@ function sanitizeProfileOverride(value: unknown): RouterModelProfileOverride | u
 			typeof item === "string" && TASK_INTENTS.has(item as TaskIntent),
 		);
 	}
+	if (Array.isArray(value.preferredTiers)) {
+		override.preferredTiers = value.preferredTiers.filter((item): item is ComplexityTier =>
+			typeof item === "string" && COMPLEXITY_TIERS.has(item as ComplexityTier),
+		);
+	}
 	if (Array.isArray(value.notes)) override.notes = value.notes.filter((item): item is string => typeof item === "string");
 	return Object.keys(override).length > 0 ? override : undefined;
 }
@@ -139,8 +183,53 @@ const TASK_INTENTS = new Set<TaskIntent>([
 	"complex",
 ]);
 
+const COMPLEXITY_TIERS = new Set<ComplexityTier>(["trivial", "simple", "moderate", "complex", "critical"]);
+
 function clamp01(value: number): number {
 	return Math.max(0, Math.min(1, value));
+}
+
+function asUnitNumber(value: unknown, fallback: number): number {
+	return typeof value === "number" && Number.isFinite(value) ? clamp01(value) : fallback;
+}
+
+function sanitizeComplexityThresholds(value: unknown, fallback: RouterComplexityThresholds): RouterComplexityThresholds {
+	if (!isObject(value)) return { ...fallback };
+	const thresholds: RouterComplexityThresholds = {
+		trivialMax: asUnitNumber(value.trivialMax, fallback.trivialMax),
+		simpleMax: asUnitNumber(value.simpleMax, fallback.simpleMax),
+		moderateMax: asUnitNumber(value.moderateMax, fallback.moderateMax),
+		complexMax: asUnitNumber(value.complexMax, fallback.complexMax),
+	};
+	if (
+		thresholds.trivialMax <= 0 ||
+		thresholds.trivialMax >= thresholds.simpleMax ||
+		thresholds.simpleMax >= thresholds.moderateMax ||
+		thresholds.moderateMax >= thresholds.complexMax ||
+		thresholds.complexMax >= 1
+	) {
+		return { ...fallback };
+	}
+	return thresholds;
+}
+
+function sanitizeTierQualityFloor(value: unknown, fallback: RouterTierQualityFloor): RouterTierQualityFloor {
+	if (!isObject(value)) return { ...fallback };
+	return {
+		trivial: asUnitNumber(value.trivial, fallback.trivial),
+		simple: asUnitNumber(value.simple, fallback.simple),
+		moderate: asUnitNumber(value.moderate, fallback.moderate),
+		complex: asUnitNumber(value.complex, fallback.complex),
+		critical: asUnitNumber(value.critical, fallback.critical),
+	};
+}
+
+function sanitizeComplexityConfig(value: unknown, fallback: RouterComplexityConfig): RouterComplexityConfig {
+	const patch = isObject(value) ? value : {};
+	return {
+		thresholds: sanitizeComplexityThresholds(patch.thresholds, fallback.thresholds),
+		tierQualityFloor: sanitizeTierQualityFloor(patch.tierQualityFloor, fallback.tierQualityFloor),
+	};
 }
 
 export function mergeRouterConfig(base: RouterConfig, rawPatch: unknown): RouterConfig {
@@ -153,6 +242,7 @@ export function mergeRouterConfig(base: RouterConfig, rawPatch: unknown): Router
 		fallbackWhenNoScopedModels: asStringEnum(rawPatch.fallbackWhenNoScopedModels, ["current_model", "none"] as const, base.fallbackWhenNoScopedModels),
 		showExplanations: asBoolean(rawPatch.showExplanations, base.showExplanations),
 		zeroCostPolicy: asStringEnum(rawPatch.zeroCostPolicy, ["trust", "penalize"] as const, base.zeroCostPolicy),
+		complexity: sanitizeComplexityConfig(rawPatch.complexity, base.complexity),
 		classifier: {
 			enabled: asClassifierEnabled(classifierPatch.enabled, base.classifier.enabled),
 			requireLocalOrZeroCost: asBoolean(classifierPatch.requireLocalOrZeroCost, base.classifier.requireLocalOrZeroCost),

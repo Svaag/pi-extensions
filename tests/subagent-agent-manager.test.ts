@@ -106,6 +106,11 @@ test("AgentManager stores routed model, thinking, and routing decision", async (
 		intent: "lookup",
 		risk: 0.1,
 		complexity: 0.1,
+		complexityTier: "trivial",
+		complexityScore: 0.08,
+		confidence: 0.8,
+		classificationReason: "test classification",
+		signals: ["lookup"],
 		estimatedInputTokens: 1000,
 		estimatedOutputTokens: 1000,
 		explanation: "test",
@@ -125,6 +130,96 @@ test("AgentManager stores routed model, thinking, and routing decision", async (
 	assert.equal(h.manager.getRecord(record.agentId)?.thinkingLevel, "off");
 	assert.equal(h.manager.summaries({ returnMode: "full" })[0].routingDecision?.reason, "selected");
 	assert.equal(backend.requests[0].record.routingDecision?.selectedModel, "local-llamacpp/local-model");
+});
+
+test("AgentManager spawned follow-up inherits model, thinking, and records inherited routing", async () => {
+	const backend = new FakeBackend();
+	const h = manager(backend, { maxAgentsRunning: 2 });
+	const parentRouting: any = {
+		mode: "auto",
+		objective: "balanced",
+		applied: true,
+		reason: "selected",
+		selectedModel: "local-llamacpp/local-model",
+		selectedThinkingLevel: "off",
+		intent: "lookup",
+		risk: 0,
+		complexity: 0,
+		complexityTier: "trivial",
+		complexityScore: 0.05,
+		confidence: 0.8,
+		classificationReason: "lookup",
+		signals: ["lookup"],
+		estimatedInputTokens: 1000,
+		estimatedOutputTokens: 1000,
+		explanation: "test",
+		candidates: [],
+	};
+	const parent = await h.manager.spawnAgent({ taskName: "demo", prompt: "do it", model: "local-llamacpp/local-model", thinkingLevel: "off", routingDecision: parentRouting });
+	await h.manager.wait({ agentId: parent.agentId, timeoutMs: 1000 });
+	const result = await h.manager.followupTask(parent.agentId, "check another file", "spawn_followup");
+	const child = h.manager.getRecord(result.spawnedAgentId!)!;
+	assert.equal(child.model, "local-llamacpp/local-model");
+	assert.equal(child.thinkingLevel, "off");
+	assert.equal(child.routingDecision?.reason, "inherited");
+	assert.equal(child.routingDecision?.complexityTier, "trivial");
+	assert.deepEqual(child.routingDecision?.signals.at(-1), "followup-inherited");
+});
+
+test("AgentManager spawned follow-up can use routed overrides instead of inheriting", async () => {
+	const backend = new FakeBackend();
+	const h = manager(backend, { maxAgentsRunning: 2 });
+	const parent = await h.manager.spawnAgent({ taskName: "demo", prompt: "do it", model: "local-llamacpp/local-model", thinkingLevel: "off" });
+	await h.manager.wait({ agentId: parent.agentId, timeoutMs: 1000 });
+	const routed: any = {
+		mode: "auto",
+		objective: "quality_first",
+		applied: true,
+		reason: "selected",
+		selectedModel: "anthropic/claude-sonnet-4-6",
+		selectedThinkingLevel: "high",
+		intent: "review",
+		risk: 0.9,
+		complexity: 0.8,
+		complexityTier: "critical",
+		complexityScore: 0.82,
+		confidence: 0.9,
+		classificationReason: "critical follow-up",
+		signals: ["review"],
+		estimatedInputTokens: 2000,
+		estimatedOutputTokens: 3000,
+		explanation: "rerouted",
+		candidates: [],
+	};
+	const result = await h.manager.followupTask(parent.agentId, "critical review", "spawn_followup", {
+		model: "anthropic/claude-sonnet-4-6",
+		thinkingLevel: "high",
+		routingMode: "auto",
+		routingProfile: "quality_first",
+		routingDecision: routed,
+		inheritModelAndThinking: false,
+	});
+	const child = h.manager.getRecord(result.spawnedAgentId!)!;
+	assert.equal(child.model, "anthropic/claude-sonnet-4-6");
+	assert.equal(child.thinkingLevel, "high");
+	assert.equal(child.routingDecision?.reason, "selected");
+	assert.equal(child.routingDecision?.complexityTier, "critical");
+});
+
+test("AgentManager live follow-up keeps existing process and ignores spawn overrides", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend, { maxAgentsRunning: 2 });
+	const parent = await h.manager.spawnAgent({ taskName: "demo", prompt: "do it", model: "local-llamacpp/local-model", thinkingLevel: "off" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	const result = await h.manager.followupTask(parent.agentId, "live follow-up", "live_if_supported", {
+		model: "anthropic/claude-sonnet-4-6",
+		thinkingLevel: "high",
+		inheritModelAndThinking: false,
+	});
+	assert.equal(result.deliveryMode, "rpc_follow_up");
+	assert.equal(backend.requests.length, 1);
+	assert.deepEqual(backend.handles.get(parent.agentId)?.messages, ["live follow-up"]);
 });
 
 test("AgentManager preserves tool output tail after successful final output", async () => {

@@ -57,7 +57,17 @@ It also persists latest agent records, parent/child graph edge records, and batc
 
 The router is enabled by default for `spawn_agent`, `spawn_agents_on_csv`, and `spawn_agents_on_jsonl` when `model` is omitted.
 
-Routing inputs include task text, `taskName`, `agentName`, write mode, tools, context mode, and batch metadata. The router classifies intent (`lookup`, `scout`, `summarize`, `batch_simple`, `plan`, `review`, `debug`, `implement`, or `complex`), estimates task size/risk, scores available scoped models, and launches the child with `--model` plus `--thinking`.
+Routing inputs include task text, `taskName`, `agentName`, write mode, tools, context mode, and batch metadata. The router classifies intent (`lookup`, `scout`, `summarize`, `batch_simple`, `plan`, `review`, `debug`, `implement`, or `complex`), computes a deterministic complexity tier (`trivial`, `simple`, `moderate`, `complex`, or `critical`), estimates task size/risk, scores available scoped models, and launches the child with `--model` plus `--thinking`.
+
+Complexity tiers are persisted in routing decisions as `complexityTier` and `complexityScore`, and expanded render views show the tier, score, classifier use, and top candidates. Typical routing outcomes:
+
+| Tier | Typical work | Preferred model class | Thinking |
+|---|---|---|---|
+| `trivial` | find/list/grep/read-only lookups | local or flash-class | `off` |
+| `simple` | light summarization, simple batch rows | local/flash/economy | `off`/`minimal` |
+| `moderate` | codebase scout, ordinary debug/plan | mid-tier coding/reasoning | `low` |
+| `complex` | implementation, review, high-context debug | Sonnet/Codex/strong reasoning | `medium`/`high` |
+| `critical` | security/auth/payment/migration/data-loss work | premium/highest-quality scoped models | `high` (`xhigh` only by explicit choice or exceptional quality-first routing) |
 
 Defaults:
 
@@ -94,6 +104,21 @@ Example:
   "enabled": true,
   "objective": "balanced",
   "fallbackWhenNoScopedModels": "current_model",
+  "complexity": {
+    "thresholds": {
+      "trivialMax": 0.2,
+      "simpleMax": 0.38,
+      "moderateMax": 0.58,
+      "complexMax": 0.78
+    },
+    "tierQualityFloor": {
+      "trivial": 0.2,
+      "simple": 0.4,
+      "moderate": 0.6,
+      "complex": 0.78,
+      "critical": 0.9
+    }
+  },
   "classifier": {
     "enabled": "auto",
     "requireLocalOrZeroCost": true,
@@ -102,13 +127,13 @@ Example:
     "timeoutMs": 10000
   },
   "modelProfiles": {
-    "local-llamacpp/local-model": { "quality": 0.2, "speed": 0.9, "preferredIntents": ["lookup", "summarize"] },
-    "anthropic/claude-sonnet-*": { "quality": 0.9, "preferredIntents": ["review", "implement", "complex"] }
+    "local-llamacpp/local-model": { "quality": 0.2, "speed": 0.9, "preferredIntents": ["lookup", "summarize"], "preferredTiers": ["trivial", "simple"] },
+    "anthropic/claude-sonnet-*": { "quality": 0.9, "preferredIntents": ["review", "implement", "complex"], "preferredTiers": ["complex", "critical"] }
   }
 }
 ```
 
-The candidate pool comes from Pi scoped models (`enabledModels` / `/scoped-models`). Keep cheap/fast models in the scoped list if you want the router to use them for grunt work.
+The candidate pool comes from Pi scoped models (`enabledModels` / `/scoped-models`). Keep cheap/fast models in the scoped list if you want the router to use them for grunt work. Batch fan-out routes once per job using sample row prompts, then each worker inherits that job-level model/thinking decision.
 
 ## Agent definitions
 
@@ -184,7 +209,19 @@ The router records the override but does not replace the explicit model/thinking
 }
 ```
 
-If the original subprocess is no longer live, use `mode: "spawn_followup"`.
+If the original subprocess is no longer live, use `mode: "spawn_followup"`. Spawned follow-ups default to `spawnRoutingMode: "inherit"`, which keeps the original child model/thinking and records an `inherited` routing decision. To reroute the follow-up from its new prompt, use:
+
+```json
+{
+  "agentId": "agent_...",
+  "prompt": "Now perform a security-focused review of that finding and propose a safe patch plan.",
+  "mode": "spawn_followup",
+  "spawnRoutingMode": "auto",
+  "routingProfile": "balanced"
+}
+```
+
+For spawned follow-ups, explicit `model` and `thinkingLevel` still win. `spawnRoutingMode: "off"` disables routing for the spawned follow-up except explicit overrides, and `spawnRoutingMode: "explain"` records a decision without applying it.
 
 ### CSV batch fan-out
 

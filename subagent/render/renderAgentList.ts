@@ -10,7 +10,8 @@ export function renderAgentList(summaries: AgentSummary[], theme: any, expanded 
 		const icon = theme.fg(statusColor(summary.status), statusIcon(summary.status));
 		const duration = formatDuration(summary.durationMs);
 		const output = compactNumber(summary.metrics?.outputChars);
-		const meta = [duration, output ? `${output} out` : ""].filter(Boolean).join(" · ");
+		const route = summary.routingDecision ? `${summary.routingDecision.intent}/${summary.routingDecision.complexityTier ?? "unknown"}` : "";
+		const meta = [duration, output ? `${output} out` : "", expanded && route ? `routed:${route}` : ""].filter(Boolean).join(" · ");
 		const label = expanded ? summary.taskPath : shortTaskLabel(summary.taskPath);
 		lines.push(`${icon} ${theme.fg("accent", label)} ${theme.fg("muted", `[${summary.status}]`)}${meta ? ` ${theme.fg("dim", meta)}` : ""}`.trim());
 		if (summary.summary) {
