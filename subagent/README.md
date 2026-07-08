@@ -21,7 +21,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 ## Safety defaults
 
 - Child agents default to `writeMode: "read_only"`.
-- When `model` is omitted, the Smart Agentic Intent Router selects a child model and thinking level from Pi's scoped model list instead of inheriting the parent model/effort.
+- When `model` is omitted, child agents inherit the current main Pi model by default (falling back to Pi defaults if no current model is available). The Smart Agentic Intent Router is opt-in via `routingMode: "auto"`.
 - Child subprocesses are launched with extension/resource discovery disabled, plus a controlled child policy extension.
 - Read-only children can use `read` inside the child `cwd` (plus explicit `allowedPaths`) and conservative read-only `bash` commands.
 - `edit`/`write` are blocked unless `writeMode: "disjoint_scope"` and the path is under `allowedPaths`.
@@ -55,7 +55,7 @@ It also persists latest agent records, parent/child graph edge records, and batc
 
 ## Smart Agentic Intent Router
 
-The router is enabled by default for `spawn_agent`, `spawn_agents_on_csv`, and `spawn_agents_on_jsonl` when `model` is omitted.
+The router is available for `spawn_agent`, `spawn_agents_on_csv`, and `spawn_agents_on_jsonl`, but is no longer applied by default. When `model` is omitted and `routingMode` is also omitted, subagents use the current main Pi model. Set `routingMode: "auto"` to let the router select a child model from scoped models.
 
 Routing inputs include task text, `taskName`, `agentName`, write mode, tools, context mode, and batch metadata. The router classifies intent (`lookup`, `scout`, `summarize`, `batch_simple`, `plan`, `review`, `debug`, `implement`, or `complex`), computes a deterministic complexity tier (`trivial`, `simple`, `moderate`, `complex`, or `critical`), estimates task size/risk, scores available scoped models, and launches the child with `--model` plus `--thinking`.
 
@@ -71,10 +71,11 @@ Complexity tiers are persisted in routing decisions as `complexityTier` and `com
 
 Defaults:
 
-- Objective: `balanced` cost/reward/quality.
+- Omitted `routingMode`: no router selection; inherit the current main Pi model.
+- Objective when routing is enabled: `balanced` cost/reward/quality.
 - Explicit `model` is a hard override; it is preserved.
 - Explicit `thinkingLevel` is a hard override; it is preserved.
-- If `model` is explicit but `thinkingLevel` is omitted, the router may still pick a task-appropriate thinking level.
+- If `model` is explicit but `thinkingLevel` is omitted, the router may still pick a task-appropriate thinking level when `routingMode: "auto"` is set.
 - If no scoped models are available, it falls back to the current parent model when configured to do so.
 - Optional classifier support is bounded: it only runs for ambiguous tasks, uses a local/zero-cost or very cheap scoped model, receives a sanitized/truncated classifier prompt, and deterministic routing remains the fallback.
 
@@ -88,7 +89,7 @@ Tool parameters:
 }
 ```
 
-- `routingMode`: `auto` (default), `off`, or `explain`.
+- `routingMode`: `off`/omitted inherits the current main Pi model, `auto` routes via scoped models, and `explain` records a routing decision without applying it.
 - `routingProfile`: `balanced` (default), `cost_first`, or `quality_first`.
 - `thinkingLevel`: optional explicit `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
 
@@ -133,7 +134,7 @@ Example:
 }
 ```
 
-The candidate pool comes from Pi scoped models (`enabledModels` / `/scoped-models`). Keep cheap/fast models in the scoped list if you want the router to use them for grunt work. Batch fan-out routes once per job using sample row prompts, then each worker inherits that job-level model/thinking decision.
+The candidate pool comes from Pi scoped models (`enabledModels` / `/scoped-models`). Keep cheap/fast models in the scoped list if you opt into router-based grunt-work routing. Batch fan-out routes once per job when `routingMode: "auto"` is set, then each worker inherits that job-level model/thinking decision.
 
 ## Agent definitions
 
@@ -164,7 +165,7 @@ Project-local agent definitions require confirmation by default.
 
 ### Single research subagent
 
-With `contextMode: "summary"`, the extension includes a capped, sanitized excerpt of recent visible parent conversation when no explicit `contextSummary` is provided. Because `model` is omitted, the router selects from scoped models.
+With `contextMode: "summary"`, the extension includes a capped, sanitized excerpt of recent visible parent conversation when no explicit `contextSummary` is provided. Because `model` and `routingMode` are omitted, the child uses the current main Pi model.
 
 ```json
 {
@@ -172,8 +173,7 @@ With `contextMode: "summary"`, the extension includes a capped, sanitized excerp
   "prompt": "Inspect the auth flow and summarize risks. Do not modify files.",
   "contextMode": "summary",
   "contextSummary": "We are reviewing authentication code for security risks.",
-  "writeMode": "read_only",
-  "routingProfile": "balanced"
+  "writeMode": "read_only"
 }
 ```
 
@@ -189,7 +189,7 @@ With `contextMode: "summary"`, the extension includes a capped, sanitized excerp
 }
 ```
 
-The router records the override but does not replace the explicit model/thinking choice.
+The explicit model/thinking choice is preserved. Add `routingMode: "auto"` only when you want the router to choose missing pieces such as a task-appropriate thinking level.
 
 ### Parallel read-only specialists
 
@@ -221,7 +221,7 @@ If the original subprocess is no longer live, use `mode: "spawn_followup"`. Spaw
 }
 ```
 
-For spawned follow-ups, explicit `model` and `thinkingLevel` still win. `spawnRoutingMode: "off"` disables routing for the spawned follow-up except explicit overrides, and `spawnRoutingMode: "explain"` records a decision without applying it.
+For spawned follow-ups, explicit `model` and `thinkingLevel` still win. `spawnRoutingMode: "off"` disables router selection and uses the current main Pi model unless an explicit override is supplied; `spawnRoutingMode: "explain"` records a decision without applying it.
 
 ### CSV batch fan-out
 

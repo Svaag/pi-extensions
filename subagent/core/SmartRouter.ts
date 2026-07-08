@@ -873,7 +873,7 @@ function decisionFrom(
 }
 
 export async function routeSubagentModel(request: RouteSubagentRequest): Promise<RouteSubagentResult> {
-	const mode: RoutingMode = request.routingMode ?? (request.config.enabled ? "auto" : "off");
+	const mode: RoutingMode = request.routingMode ?? "off";
 	const objective = request.routingProfile ?? request.config.objective;
 	let classification = classifyTaskIntent(request);
 	let assessment = assessTaskComplexity(request, classification, request.config.complexity);
@@ -884,22 +884,28 @@ export async function routeSubagentModel(request: RouteSubagentRequest): Promise
 	const explicitThinkingLevel = request.explicitThinkingLevel;
 
 	if (mode === "off" || !request.config.enabled) {
+		const inheritedModel = explicitModel ?? (request.currentModel ? modelRef(request.currentModel) : undefined);
+		const explanation = explicitModel
+			? "Smart subagent routing is disabled for this request; using the explicit model."
+			: inheritedModel
+				? "Smart subagent routing is disabled for this request; using the current parent Pi model."
+				: "Smart subagent routing is disabled for this request.";
 		const decision = decisionFrom({
 			mode,
 			objective,
 			applied: false,
 			reason: "disabled",
-			selectedModel: explicitModel,
+			selectedModel: inheritedModel,
 			selectedThinkingLevel: explicitThinkingLevel,
 			explicitModel,
 			explicitThinkingLevel,
 			classification,
 			assessment,
 			estimate,
-			explanation: "Smart subagent routing is disabled for this request.",
+			explanation,
 			candidates: [],
 		});
-		return { model: explicitModel, thinkingLevel: explicitThinkingLevel, decision, classification, complexity: assessment, profiles: [] };
+		return { model: inheritedModel, thinkingLevel: explicitThinkingLevel, decision, classification, complexity: assessment, profiles: [] };
 	}
 
 	let profiles: ProfiledScopedModel[] = [];

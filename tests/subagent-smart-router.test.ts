@@ -99,7 +99,7 @@ async function route(agentDir: string, overrides: any = {}) {
 		contextMode: overrides.contextMode,
 		contextSummary: overrides.contextSummary,
 		writeMode: overrides.writeMode ?? "read_only",
-		routingMode: overrides.routingMode,
+		routingMode: overrides.routingMode ?? "auto",
 		routingProfile: overrides.routingProfile,
 		explicitModel: overrides.explicitModel,
 		explicitThinkingLevel: overrides.explicitThinkingLevel,
@@ -108,7 +108,26 @@ async function route(agentDir: string, overrides: any = {}) {
 	});
 }
 
-test("smart router sends simple lookup to low-cost scoped model with off/minimal thinking", async () => {
+test("subagent routing defaults to the current parent model when mode is omitted", async () => {
+	await withAgentDir(["local-llamacpp/local-model", "openrouter/deepseek/deepseek-v4-pro"], async (agentDir) => {
+		const result = await routeSubagentModel({
+			cwd: "/repo",
+			config: config(),
+			modelRegistry: registry(),
+			currentModel: MODELS[5],
+			taskName: "lookup",
+			prompt: "Find where authentication routes are defined. Return file paths only.",
+			writeMode: "read_only",
+			scopedModelOptions: { agentDir },
+		});
+		assert.equal(result.model, "openai-codex/gpt-5.5");
+		assert.equal(result.thinkingLevel, undefined);
+		assert.equal(result.decision.reason, "disabled");
+		assert.match(result.decision.explanation, /current parent Pi model/);
+	});
+});
+
+test("smart router sends simple lookup to low-cost scoped model with off/minimal thinking when auto is requested", async () => {
 	await withAgentDir(["local-llamacpp/local-model", "anthropic/claude-sonnet-*", "openai-codex/gpt-*"], async (agentDir) => {
 		const result = await route(agentDir);
 		assert.equal(result.model, "local-llamacpp/local-model");

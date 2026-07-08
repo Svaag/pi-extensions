@@ -29,9 +29,9 @@ const SpawnAgentParams = Type.Object({
 	allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "Allowed paths for disjoint_scope write mode." })),
 	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task. Values below 300000ms are ignored and use the default 30-minute runtime." })),
 	maxOutputChars: Type.Optional(Type.Number({ description: "Maximum retained output characters for this agent." })),
-	model: Type.Optional(Type.String({ description: "Optional model override for the child process." })),
+	model: Type.Optional(Type.String({ description: "Optional model override for the child process. Defaults to the current main Pi model." })),
 	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, { description: "Optional thinking level override for the child process." })),
-	routingMode: Type.Optional(StringEnum(["auto", "off", "explain"] as const, { description: "Smart router mode. Defaults to auto when model is omitted." })),
+	routingMode: Type.Optional(StringEnum(["auto", "off", "explain"] as const, { description: "Smart router mode. Defaults to off/inherit current main Pi model; set auto to route." })),
 	routingProfile: Type.Optional(StringEnum(["balanced", "cost_first", "quality_first"] as const, { description: "Router objective for cost/reward/quality tradeoff." })),
 });
 
