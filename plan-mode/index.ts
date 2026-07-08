@@ -589,13 +589,24 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 
 	function buildPlanOnlyExecutionPrompt(savedPlanPath: string): string {
 		const firstStep = todoItems[0]?.text ?? "the first implementation step";
-		return `Implement the plan saved at ${savedPlanPath}.
+		return `Plan Mode has ended. Execution mode is active with full implementation tool access.
+Do not claim Plan Mode is still active.
+
+Implement the plan saved at ${savedPlanPath}.
 
 <proposed_plan>
 ${lastProposedPlan}
 </proposed_plan>
 
 Start with step 1: ${firstStep}`;
+	}
+
+	function buildCurrentSessionExecutionPrompt(savedPlanPath: string): string {
+		const firstStep = todoItems[0]?.text ?? "the first implementation step";
+		return `Plan Mode has ended. Execution mode is active with full implementation tool access.
+Do not claim Plan Mode is still active.
+
+Implement the plan saved at ${savedPlanPath}. Start with step 1: ${firstStep}`;
 	}
 
 	function clampInt(value: unknown, fallback: number, min: number, max: number): number {
@@ -2461,9 +2472,16 @@ Finish with all items completed, skipped, or deferred before ending the turn. If
 				persistState();
 
 				const planOnlyPrompt = `[PLAN CONTEXT RESET]\n\n${buildPlanOnlyExecutionPrompt(savedPlanPath)}\n\nThe model context for this execution turn is intentionally reset to this marker plus later messages; previous planning conversation is excluded by the Plan Mode extension.`;
+				// Queue the reset marker and kickoff as follow-ups. Triggering a custom message
+				// directly from agent_end can reuse the just-finished Plan Mode turn/system
+				// prompt, which makes the model think Plan Mode is still active.
 				pi.sendMessage(
 					{ customType: PLAN_CONTEXT_RESET_CUSTOM_TYPE, content: planOnlyPrompt, display: true },
-					{ triggerTurn: true },
+					{ deliverAs: "followUp" },
+				);
+				pi.sendUserMessage(
+					"Begin implementation now from the reset plan context above. Plan Mode has ended; do not claim Plan Mode is still active.",
+					{ deliverAs: "followUp" },
 				);
 				ctx.ui.notify("Started implementation with reset model context. The old transcript remains visible, but is excluded from model context from this marker onward.", "info");
 				return;
@@ -2492,11 +2510,11 @@ Finish with all items completed, skipped, or deferred before ending the turn. If
 				updateStatus(ctx);
 				persistState();
 
-				const execMessage = `Execute the plan saved at ${savedPlanPath}. Start with: ${todoItems[0].text}`;
-				pi.sendMessage(
-					{ customType: "plan-mode-execute", content: execMessage, display: true },
-					{ triggerTurn: true },
-				);
+				const execMessage = buildCurrentSessionExecutionPrompt(savedPlanPath);
+				// Send a follow-up user prompt instead of triggering a custom message from
+				// inside agent_end. This forces a fresh agent start, so the Plan Mode system
+				// overlay is gone and the execution context hook can inject full-tool access.
+				pi.sendUserMessage(execMessage, { deliverAs: "followUp" });
 				ctx.ui.notify("Started implementation in the current session. Use /todos to view or repair progress.", "info");
 			} else if (choice?.startsWith("Refine the plan")) {
 				const refinement = await ctx.ui.editor("Provide feedback to refine the plan:", "");
