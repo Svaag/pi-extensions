@@ -13,6 +13,7 @@ export function buildChildSystemPrompt(options: BuildPromptOptions): string {
 	const policyLines = [
 		"You are a Pi subagent spawned by a parent/root Pi agent.",
 		"Work only on the delegated task. Be concise and report concrete findings, changed files, and validation steps.",
+		"Protect your own context window: use targeted reads/commands with offsets, limits, and filters; do not read raw binary/database/log blobs into context; summarize large outputs instead of expanding them.",
 		`Canonical task path: ${record.taskPath}`,
 		`Write mode: ${record.writeMode}`,
 	];

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildSubprocessRpcArgs, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
+import { buildSubprocessRpcArgs, isContextWindowError, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
 
 test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	const args = buildSubprocessRpcArgs({
@@ -27,6 +27,12 @@ test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	assert.equal(args[args.indexOf("--model") + 1], "local-llamacpp/local-model");
 	assert(args.includes("--thinking"));
 	assert.equal(args[args.indexOf("--thinking") + 1], "off");
+});
+
+test("isContextWindowError recognizes provider overflow wording", () => {
+	assert.equal(isContextWindowError("Your input exceeds the context window of this model. Please adjust your input and try again."), true);
+	assert.equal(isContextWindowError("maximum context length is 200000 tokens"), true);
+	assert.equal(isContextWindowError("ordinary model failure"), false);
 });
 
 test("textFromToolResult extracts text content and full-output path", () => {

@@ -10,6 +10,11 @@ import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 const STDERR_TAIL_CAP = 16_384;
 const TOOL_RESULT_TEXT_CAP = 4_000;
 
+export function isContextWindowError(message: unknown): boolean {
+	if (typeof message !== "string") return false;
+	return /context window|context length|maximum context|too many tokens|input exceeds/i.test(message);
+}
+
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
@@ -184,13 +189,63 @@ export class SubprocessRpcBackend implements AgentBackend {
 		let outputChars = 0;
 		let lastAssistantText = "";
 		let lastAssistant: any | undefined;
+		let sawContextOverflow = false;
+		let overflowRecoveryAttempted = false;
+		let overflowRecoveryActive = false;
+		let rpc: RpcClient;
 
-		const rpc = new RpcClient(proc, {
+		const finishContextOverflowFailure = (message: string, recoveryError?: unknown) => {
+			const recoverySuffix = recoveryError ? ` Overflow recovery failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}` : "";
+			sawTerminalResult = true;
+			events.onResult?.({
+				agentId: record.agentId,
+				status: "failed",
+				summary: `${message}${recoverySuffix}`,
+				output: lastAssistantText,
+				metrics: { outputChars },
+			});
+		};
+
+		const recoverFromContextOverflow = async (message: string): Promise<void> => {
+			if (overflowRecoveryAttempted) return;
+			overflowRecoveryAttempted = true;
+			overflowRecoveryActive = true;
+			events.onOutput?.("\n[Child context window overflow detected; requesting manual compaction and one no-tools partial-report retry.]\n");
+			try {
+				try {
+					await rpc.send({ type: "set_auto_compaction", enabled: true }, 10_000);
+				} catch {
+					// Manual compaction below is the important recovery path.
+				}
+				await rpc.send({
+					type: "compact",
+					customInstructions: "Recover a failed subagent turn that exceeded the context window. Preserve the delegated task, files inspected, commands/results seen, partial findings, blockers, and safest next steps. Omit raw large/binary tool output.",
+				}, 120_000);
+				events.onOutput?.("\n[Child compaction completed after overflow; asking for a concise partial report without more tools.]\n");
+				await rpc.send({
+					type: "prompt",
+					message: "Your previous turn exceeded the context window and has now been compacted. Do not call tools. Return a concise partial final report using only retained context and outputs already inspected: summary, evidence/files/commands seen, validation status, blockers, and next safe actions.",
+				}, 10_000);
+			} catch (error) {
+				overflowRecoveryActive = false;
+				finishContextOverflowFailure(message, error);
+			}
+		};
+
+		rpc = new RpcClient(proc, {
 			onMalformedLine: (line, error) => {
 				events.onOutput?.(`\n[Malformed child RPC JSON ignored: ${error.message}; line=${line.slice(0, 160)}]\n`);
 			},
 			onEvent: (event) => {
 				if (event.type === "agent_start") events.onStarted?.();
+				if (event.type === "compaction_start") events.onOutput?.(`\n[Child compaction started: ${event.reason ?? "unknown"}]\n`);
+				if (event.type === "compaction_end") {
+					const result = event.result;
+					const status = event.aborted ? "aborted" : result ? "completed" : "failed";
+					const estimate = result?.estimatedTokensAfter ? `; estimatedTokensAfter=${result.estimatedTokensAfter}` : "";
+					const error = event.errorMessage ? `; error=${event.errorMessage}` : "";
+					events.onOutput?.(`\n[Child compaction ${status}: ${event.reason ?? "unknown"}${estimate}${error}]\n`);
+				}
 				if (event.type === "message_update") {
 					const delta = event.assistantMessageEvent;
 					if (delta?.type === "text_delta" && typeof delta.delta === "string") {
@@ -198,6 +253,7 @@ export class SubprocessRpcBackend implements AgentBackend {
 						events.onOutput?.(delta.delta);
 					}
 					if (delta?.type === "error") {
+						if (isContextWindowError(delta.errorMessage)) sawContextOverflow = true;
 						events.onOutput?.(`\n[Child model error: ${delta.errorMessage ?? "unknown error"}]\n`);
 					}
 				}
@@ -224,6 +280,12 @@ export class SubprocessRpcBackend implements AgentBackend {
 					const errorMessage = lastAssistant?.errorMessage;
 					const status: AgentResult["status"] = stopReason === "aborted" ? "interrupted" : stopReason === "error" ? "failed" : "succeeded";
 					const summary = errorMessage || summarizeText(lastAssistantText, 800) || "(no output)";
+					if (status === "failed" && (sawContextOverflow || isContextWindowError(summary)) && !overflowRecoveryAttempted) {
+						sawTerminalResult = false;
+						void recoverFromContextOverflow(summary);
+						return;
+					}
+					overflowRecoveryActive = false;
 					events.onResult?.({
 						agentId: record.agentId,
 						status,
@@ -241,7 +303,7 @@ export class SubprocessRpcBackend implements AgentBackend {
 		proc.on("error", (error) => events.onError?.(error instanceof Error ? error : new Error(String(error))));
 		proc.on("close", (code, closeSignal) => {
 			cleanupTemp(tempPrompt);
-			if (!sawTerminalResult && code !== 0) {
+			if (!sawTerminalResult && !overflowRecoveryActive && code !== 0) {
 				events.onError?.(new Error(stderrTail.trim() || `Child process exited before completion with code ${code}`));
 			}
 			events.onExit?.(code, closeSignal);
@@ -256,6 +318,11 @@ export class SubprocessRpcBackend implements AgentBackend {
 		}
 
 		const handle = new SubprocessRpcHandle(record.agentId, proc, rpc, tempPrompt);
+		try {
+			await rpc.send({ type: "set_auto_compaction", enabled: true }, 10_000);
+		} catch (error) {
+			events.onOutput?.(`\n[Child auto-compaction enable failed: ${error instanceof Error ? error.message : String(error)}]\n`);
+		}
 		await handle.prompt(userPrompt);
 		return handle;
 	}

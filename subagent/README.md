@@ -6,7 +6,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 
 ## Tools
 
-- `spawn_agent` — spawn a bounded child agent for a concrete task.
+- `spawn_agent` — spawn a bounded child agent for a concrete task, or pass `tasks: [...]` to spawn several independent children in one tool execution.
 - `wait_agent` — wait for one, many, or all subagents.
 - `send_message` — steer/message a running subagent when live RPC steering is available; otherwise record an honest mailbox-only event.
 - `followup_task` — queue or trigger additional work on an existing subagent, or spawn a follow-up child.
@@ -23,7 +23,8 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - Child agents default to `writeMode: "read_only"`.
 - When `model` is omitted, child agents inherit the current main Pi model by default (falling back to Pi defaults if no current model is available). The Smart Agentic Intent Router is opt-in via `routingMode: "auto"`.
 - Child subprocesses are launched with extension/resource discovery disabled, plus a controlled child policy extension.
-- Read-only children can use `read` inside the child `cwd` (plus explicit `allowedPaths`) and conservative read-only `bash` commands.
+- The child policy blocks raw reads of likely-binary/database files and caps oversized tool-result text before it enters the child LLM context.
+- Read-only children can use `read` inside the child `cwd` (plus explicit `allowedPaths`) and conservative read-only `bash` commands, including simple `&&`/pipe chains and `sqlite3 -readonly` queries.
 - `edit`/`write` are blocked unless `writeMode: "disjoint_scope"` and the path is under `allowedPaths`.
 - `writeMode: "git_worktree"` is reserved for a later phase and currently rejected.
 - Running agents are killed on session shutdown/reload.
@@ -193,10 +194,22 @@ The explicit model/thinking choice is preserved. Add `routingMode: "auto"` only 
 
 ### Parallel read-only specialists
 
+Use one multi-task `spawn_agent` call (or `spawn_agents_on_jsonl` / `spawn_agents_on_csv` for structured batches) instead of emitting several separate `spawn_agent` calls in the same assistant message.
+
 ```json
-{ "taskName": "review-routing", "prompt": "Review routing for risks.", "writeMode": "read_only" }
-{ "taskName": "review-database", "prompt": "Review database layer for risks.", "writeMode": "read_only" }
-{ "all": true, "timeoutMs": 120000 }
+{
+  "writeMode": "read_only",
+  "tasks": [
+    { "taskName": "review-routing", "prompt": "Review routing for risks." },
+    { "taskName": "review-database", "prompt": "Review database layer for risks." }
+  ]
+}
+```
+
+Then wait for the workers:
+
+```json
+{ "all": true, "timeoutMs": 300000 }
 ```
 
 ### Follow-up task

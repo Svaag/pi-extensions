@@ -20,7 +20,7 @@ export function registerSpawnAgentsOnJsonlTool(pi: ExtensionAPI, getBatchManager
 		label: "Spawn Agents on JSONL",
 		description: "Fan out one subagent worker per JSONL object with max concurrency and persistent job progress.",
 		promptSnippet: "Spawn many subagent workers from JSONL objects",
-		promptGuidelines: ["Use spawn_agents_on_jsonl for structured batch fan-out when each JSONL object can be processed independently."],
+		promptGuidelines: ["Use spawn_agents_on_jsonl for structured batch fan-out when each JSONL object can be processed independently; prefer it over emitting multiple spawn_agent calls in one assistant response."],
 		parameters: SpawnAgentsOnJsonlParams,
 		async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
 			if (!params.jsonlPath && !params.jsonlText) throw new Error("spawn_agents_on_jsonl requires jsonlPath or jsonlText.");

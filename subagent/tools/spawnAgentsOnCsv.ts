@@ -19,7 +19,7 @@ export function registerSpawnAgentsOnCsvTool(pi: ExtensionAPI, getBatchManager: 
 		label: "Spawn Agents on CSV",
 		description: "Fan out one subagent worker per CSV row with max concurrency and persistent job progress.",
 		promptSnippet: "Spawn many subagent workers from CSV rows",
-		promptGuidelines: ["Use spawn_agents_on_csv for structured batch fan-out when each CSV row can be processed independently."],
+		promptGuidelines: ["Use spawn_agents_on_csv for structured batch fan-out when each CSV row can be processed independently; prefer it over emitting multiple spawn_agent calls in one assistant response."],
 		parameters: SpawnAgentsOnCsvParams,
 		async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
 			if (!params.csvPath && !params.csvText) throw new Error("spawn_agents_on_csv requires csvPath or csvText.");
