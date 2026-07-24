@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	cleanStepText,
 	extractDoneSteps,
 	extractProposedPlan,
 	extractTodoItemsFromProposedPlan,
@@ -85,6 +86,42 @@ test("extractTodoItemsFromProposedPlan prefers tracker-level implementation step
 		extractTodoItemsFromProposedPlan(plan).map((item) => item.text),
 		["Update the config loader.", "Refactor runtime paths.", "Add tests."],
 	);
+});
+
+test("extractTodoItemsFromProposedPlan preserves snake_case paths from code spans", () => {
+	// Regression: stripMarkdownInline used to unwrap code spans before applying a
+	// naive _emphasis_ rule, so `src/evm_hunter/..._receipts.py` lost underscores.
+	const plan = `# Plan
+
+## Implementation Steps
+1. Adapt \`src/evm_hunter/oracle/terminal_blocked_skim_receipts.py\` to the typed fanout-authority API.
+2. Route markers with missing \`schema_version\` to \`_verify_terminal_skim_completion_v1\` and fail closed.
+`;
+
+	const texts = extractTodoItemsFromProposedPlan(plan).map((item) => item.text);
+	assert.equal(texts.length, 2);
+	assert.ok(texts[0].includes("evm_hunter"), texts[0]);
+	assert.ok(texts[1].includes("schema_version"), texts[1]);
+});
+
+test("cleanStepText keeps underscores in code spans and bare identifiers", () => {
+	assert.equal(
+		cleanStepText("1. Adapt \`terminal_blocked_skim_receipts.py\` to the typed API."),
+		"Adapt terminal_blocked_skim_receipts.py to the typed API.",
+	);
+	// Intraword underscores are literal in CommonMark even outside code spans.
+	assert.equal(
+		cleanStepText("- Update terminal_blocked_skim_receipts handling."),
+		"Update terminal_blocked_skim_receipts handling.",
+	);
+	// Code span content is verbatim, even when it looks like markup.
+	assert.equal(cleanStepText("- Call \`_verify_*chain*_v1\` next."), "Call _verify_*chain*_v1 next.");
+});
+
+test("cleanStepText still strips real emphasis and links", () => {
+	assert.equal(cleanStepText("- **Bold step:** do the thing."), "Bold step: do the thing.");
+	assert.equal(cleanStepText("- _Important note_ for later."), "Important note for later.");
+	assert.equal(cleanStepText("- See [the docs](https://example.com) here."), "See the docs here.");
 });
 
 test("markCompletedSteps supports explicit tags and natural-language ranges", () => {

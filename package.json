@@ -2,7 +2,12 @@
   "name": "pi-extensions",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "model-router",
+    "subagent"
+  ],
   "scripts": {
+    "build:model-router": "npm run build --workspace @svaag/pi-model-router",
     "test": "node --experimental-strip-types --test tests/*.test.ts"
   }
 }

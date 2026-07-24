@@ -1,0 +1,147 @@
+/**
+ * Agent discovery and configuration for the subagent extension.
+ */
+
+import * as fs from "node:fs";
+import { homedir } from "node:os";
+import * as path from "node:path";
+import type { RoutingMode, RoutingObjective, ThinkingLevel } from "./core/AgentTypes.ts";
+
+const CONFIG_DIR_NAME = ".pi";
+
+function getAgentDir(): string {
+	return process.env.PI_CODING_AGENT_DIR ?? path.join(homedir(), CONFIG_DIR_NAME, "agent");
+}
+
+function parseFrontmatter<T extends Record<string, string>>(content: string): { frontmatter: T; body: string } {
+	if (!content.startsWith("---\n")) return { frontmatter: {} as T, body: content };
+	const end = content.indexOf("\n---", 4);
+	if (end < 0) return { frontmatter: {} as T, body: content };
+	const raw = content.slice(4, end).trim();
+	const frontmatter: Record<string, string> = {};
+	for (const line of raw.split("\n")) {
+		const colon = line.indexOf(":");
+		if (colon <= 0) continue;
+		frontmatter[line.slice(0, colon).trim()] = line.slice(colon + 1).trim().replace(/^['\"]|['\"]$/g, "");
+	}
+	const bodyStart = content.indexOf("\n", end + 4);
+	return { frontmatter: frontmatter as T, body: bodyStart >= 0 ? content.slice(bodyStart + 1) : "" };
+}
+
+export type AgentScope = "user" | "project" | "both";
+
+export interface AgentConfig {
+	name: string;
+	description: string;
+	tools?: string[];
+	model?: string;
+	thinkingLevel?: ThinkingLevel;
+	routingMode?: RoutingMode;
+	routingProfile?: RoutingObjective;
+	systemPrompt: string;
+	source: "user" | "project";
+	filePath: string;
+}
+
+export interface AgentDiscoveryResult {
+	agents: AgentConfig[];
+	projectAgentsDir: string | null;
+}
+
+const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const ROUTING_MODES = new Set<RoutingMode>(["auto", "off", "explain"]);
+const ROUTING_OBJECTIVES = new Set<RoutingObjective>(["balanced", "cost_first", "quality_first", "latency_first"]);
+
+function parseOptionalEnum<T extends string>(value: string | undefined, allowed: Set<T>): T | undefined {
+	const normalized = value?.trim();
+	return normalized && allowed.has(normalized as T) ? (normalized as T) : undefined;
+}
+
+function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
+	const agents: AgentConfig[] = [];
+	if (!fs.existsSync(dir)) return agents;
+
+	let entries: fs.Dirent[];
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return agents;
+	}
+
+	for (const entry of entries) {
+		if (!entry.name.endsWith(".md")) continue;
+		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+		const filePath = path.join(dir, entry.name);
+		let content: string;
+		try {
+			content = fs.readFileSync(filePath, "utf-8");
+		} catch {
+			continue;
+		}
+		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		if (!frontmatter.name || !frontmatter.description) continue;
+		const tools = frontmatter.tools
+			?.split(",")
+			.map((tool: string) => tool.trim())
+			.filter(Boolean);
+		agents.push({
+			name: frontmatter.name,
+			description: frontmatter.description,
+			tools: tools && tools.length > 0 ? tools : undefined,
+			model: frontmatter.model,
+			thinkingLevel: parseOptionalEnum(frontmatter.thinking, THINKING_LEVELS),
+			routingMode: parseOptionalEnum(frontmatter.router, ROUTING_MODES),
+			routingProfile: parseOptionalEnum(frontmatter.routingProfile, ROUTING_OBJECTIVES),
+			systemPrompt: body,
+			source,
+			filePath,
+		});
+	}
+	return agents;
+}
+
+function isDirectory(p: string): boolean {
+	try {
+		return fs.statSync(p).isDirectory();
+	} catch {
+		return false;
+	}
+}
+
+function findNearestProjectAgentsDir(cwd: string): string | null {
+	let currentDir = cwd;
+	while (true) {
+		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
+		if (isDirectory(candidate)) return candidate;
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) return null;
+		currentDir = parentDir;
+	}
+}
+
+export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
+	const userDir = path.join(getAgentDir(), "agents");
+	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
+	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
+	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const agentMap = new Map<string, AgentConfig>();
+	if (scope === "both") {
+		for (const agent of userAgents) agentMap.set(agent.name, agent);
+		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+	} else if (scope === "user") {
+		for (const agent of userAgents) agentMap.set(agent.name, agent);
+	} else {
+		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+	}
+	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+}
+
+export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
+	if (agents.length === 0) return { text: "none", remaining: 0 };
+	const listed = agents.slice(0, maxItems);
+	const remaining = agents.length - listed.length;
+	return {
+		text: listed.map((agent) => `${agent.name} (${agent.source}): ${agent.description}`).join("; "),
+		remaining,
+	};
+}

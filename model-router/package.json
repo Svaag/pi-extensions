@@ -1,0 +1,75 @@
+{
+  "name": "@svaag/pi-model-router",
+  "version": "0.1.0",
+  "description": "Telemetry-informed, self-learning model routing for Pi and compatible hosts",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "files": [
+    "dist",
+    "src",
+    "index.ts",
+    "*.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./pi": {
+      "types": "./dist/adapters/pi/extension.d.ts",
+      "import": "./dist/adapters/pi/extension.js"
+    },
+    "./subagent": {
+      "types": "./dist/adapters/subagent/SubagentRouterAdapter.d.ts",
+      "import": "./dist/adapters/subagent/SubagentRouterAdapter.js"
+    },
+    "./sdk": {
+      "types": "./dist/adapters/sdk/RoutedSessionAdapter.d.ts",
+      "import": "./dist/adapters/sdk/RoutedSessionAdapter.js"
+    },
+    "./telemetry": {
+      "types": "./dist/telemetry/index.d.ts",
+      "import": "./dist/telemetry/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
+  },
+  "optionalDependencies": {
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.221.0",
+    "@opentelemetry/exporter-trace-otlp-http": "^0.221.0",
+    "@opentelemetry/resources": "^2.10.0",
+    "@opentelemetry/sdk-metrics": "^2.10.0",
+    "@opentelemetry/sdk-trace-node": "^2.10.0",
+    "@opentelemetry/semantic-conventions": "^1.43.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.82.0",
+    "@earendil-works/pi-coding-agent": "^0.82.0",
+    "@earendil-works/pi-tui": "^0.82.0",
+    "@types/node": "^22.15.0",
+    "typebox": "^1.1.38",
+    "typescript": "^5.9.0"
+  }
+}
