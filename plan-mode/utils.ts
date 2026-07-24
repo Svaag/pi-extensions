@@ -311,12 +311,21 @@ const ACTION_SECTION_EXCLUDES = [
 ];
 
 function stripMarkdownInline(text: string): string {
-	return text
+	// Mask inline code spans first: their content is literal text (often
+	// snake_case identifiers or paths) and must never be treated as emphasis.
+	const codeSpans: string[] = [];
+	const masked = text.replace(/`([^`]+)`/g, (_match, code: string) => {
+		codeSpans.push(code);
+		return `\u0000CODE${codeSpans.length - 1}\u0000`;
+	});
+	const stripped = masked
 		.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
-		.replace(/`([^`]+)`/g, "$1")
 		.replace(/\*{1,3}([^*]+)\*{1,3}/g, "$1")
-		.replace(/_{1,3}([^_]+)_{1,3}/g, "$1")
+		// CommonMark: `_` emphasis cannot open/close inside a word, so snake_case
+		// identifiers keep their underscores; only boundary-flanked spans count.
+		.replace(/(?<![A-Za-z0-9_])_{1,3}([^_]+)_{1,3}(?![A-Za-z0-9_])/g, "$1")
 		.replace(/<[^>]+>/g, "");
+	return stripped.replace(/\u0000CODE(\d+)\u0000/g, (_match, index: string) => codeSpans[Number(index)] ?? "");
 }
 
 export function cleanStepText(text: string): string {
