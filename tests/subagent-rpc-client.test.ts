@@ -67,6 +67,26 @@ test("RpcClient rejects failed responses", async () => {
 	await assert.rejects(() => client.send({ type: "set_model" }), /boom/);
 });
 
+test("RpcClient observes request success and failure exactly once without payload capture", async () => {
+	const proc = fakeProcess();
+	const started: any[] = [];
+	const completed: any[] = [];
+	const writes: string[] = [];
+	proc.stdin.on("data", (chunk: Buffer) => writes.push(chunk.toString()));
+	const client = new RpcClient(proc, { onRequestStarted: (event) => started.push(event), onRequestCompleted: (event) => completed.push(event) }, 1000);
+	const success = client.send({ type: "prompt", message: "CANARY secret prompt" });
+	const successPayload = JSON.parse(writes[0]);
+	proc.stdout.write(`${JSON.stringify({ type: "response", id: successPayload.id, success: true })}\n`);
+	await success;
+	const failure = client.send({ type: "steer", message: "CANARY secret steer" });
+	const failurePayload = JSON.parse(writes[1]);
+	proc.stdout.write(`${JSON.stringify({ type: "response", id: failurePayload.id, success: false, error: "failed" })}\n`);
+	await assert.rejects(failure, /failed/);
+	assert.deepEqual(started.map((event) => event.command), ["prompt", "steer"]);
+	assert.deepEqual(completed.map((event) => event.success), [true, false]);
+	assert(!JSON.stringify({ started, completed }).includes("CANARY"));
+});
+
 test("RpcClient reports malformed lines and keeps reading", async () => {
 	const proc = fakeProcess();
 	const malformed: string[] = [];

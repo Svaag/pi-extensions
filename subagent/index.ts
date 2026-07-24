@@ -20,6 +20,11 @@ import { registerSpawnAgentsOnCsvTool } from "./tools/spawnAgentsOnCsv.ts";
 import { registerSpawnAgentsOnJsonlTool } from "./tools/spawnAgentsOnJsonl.ts";
 import { registerWaitAgentTool } from "./tools/waitAgent.ts";
 import { registerWaitAgentJobTool } from "./tools/waitAgentJob.ts";
+import { registerAnalyzeSubagentTelemetryTool } from "./tools/analyzeSubagentTelemetry.ts";
+import { TelemetryAnalysisClient } from "./telemetry/AnalysisClient.ts";
+import { loadSubagentTelemetryConfig, safeEndpointOrigin } from "./telemetry/Config.ts";
+import { NOOP_SUBAGENT_TELEMETRY } from "./telemetry/NoopTelemetry.ts";
+import type { SubagentTelemetry } from "./telemetry/Telemetry.ts";
 
 const CHILD_POLICY_PATH = fileURLToPath(new URL("./child-policy.ts", import.meta.url));
 
@@ -27,6 +32,9 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	let manager: AgentManager | undefined;
 	let batchManager: BatchJobManager | undefined;
 	let activeContext: ExtensionContext | undefined;
+	let telemetry: SubagentTelemetry = NOOP_SUBAGENT_TELEMETRY;
+	let telemetryHealthTimer: NodeJS.Timeout | undefined;
+	const telemetryConfig = loadSubagentTelemetryConfig();
 
 	function appendEntrySafe(customType: string, data?: unknown): void {
 		try {
@@ -39,7 +47,13 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		}
 	}
 
+	function renderTelemetryStatus(ctx: ExtensionContext): void {
+		const health = telemetry.getHealth();
+		ctx.ui.setStatus("subagent-telemetry", health.enabled && health.degraded ? ctx.ui.theme.fg("error", `OTel degraded · ${health.droppedRecords} dropped`) : undefined);
+	}
+
 	function renderWidget(ctx: ExtensionContext, current: AgentManager): void {
+		renderTelemetryStatus(ctx);
 		const agents = current.summaries({ includeClosed: false });
 		const jobs = batchManager?.listJobs({ includeCompleted: false }) ?? [];
 		const status = subagentStatusSummary(agents, jobs);
@@ -60,6 +74,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		activeContext = ctx;
 		const branch = ctx.sessionManager.getBranch();
 		const restored = StateStore.restore(branch);
+		telemetry.startSession({ sessionId: ctx.sessionManager.getSessionId(), projectPath: ctx.cwd });
 		manager = new AgentManager({
 			backend: new SubprocessRpcBackend(CHILD_POLICY_PATH),
 			store: new StateStore({ appendEntry: appendEntrySafe }),
@@ -67,6 +82,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			restoredRecords: restored.records,
 			restoredEdges: restored.edges,
 			restoredLostAgentIds: restored.lostAgentIds,
+			telemetry,
 			onChange: (current) => {
 				if (activeContext) renderWidget(activeContext, current);
 			},
@@ -76,6 +92,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			appender: { appendEntry: appendEntrySafe },
 			rootCwd: ctx.cwd,
 			restoredJobs: BatchJobManager.restore(branch),
+			telemetry,
 			onChange: () => {
 				if (activeContext && manager) renderWidget(activeContext, manager);
 			},
@@ -109,6 +126,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	registerListAgentJobsTool(pi, getBatchManager);
 	registerWaitAgentJobTool(pi, getBatchManager);
 	registerCancelAgentJobTool(pi, getBatchManager);
+	registerAnalyzeSubagentTelemetryTool(pi, () => telemetryConfig);
 	registerExportAgentJobResultsTool(pi, getBatchManager);
 
 	pi.registerCommand("subagents", {
@@ -117,6 +135,21 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			const current = getManager(ctx);
 			renderWidget(ctx, current);
 			const mode = args.trim().toLowerCase();
+			if (mode === "telemetry" || mode === "otel") {
+				const health = telemetry.getHealth();
+				const availability = await new TelemetryAnalysisClient(telemetryConfig).probe();
+				const issues = telemetryConfig.issues.length ? telemetryConfig.issues.map((issue) => `${issue.code}:${issue.field}`).join(", ") : "none";
+				const lines = [
+					`requested=${telemetryConfig.requestedEnabled} enabled=${health.enabled} degraded=${health.degraded}`,
+					`collector=${safeEndpointOrigin(telemetryConfig.traces.endpoint)} sampleRatio=${telemetryConfig.traceSampleRatio}`,
+					`lastExport=${health.lastSuccessfulExportAt ? new Date(health.lastSuccessfulExportAt).toISOString() : "never"} lastError=${health.lastErrorCategory ?? "none"} dropped=${health.droppedRecords}`,
+					`prometheus=${availability.prometheus ? "available" : "unavailable"} (${safeEndpointOrigin(telemetryConfig.prometheusUrl)})`,
+					`jaeger=${availability.jaeger ? "available" : "unavailable"} (${safeEndpointOrigin(telemetryConfig.jaegerUrl)})`,
+					`configIssues=${issues}`,
+				];
+				ctx.ui.notify(lines.join("\n"), health.degraded || telemetryConfig.issues.length ? "warning" : "info");
+				return;
+			}
 			if (mode === "graph") {
 				const records = current.listRecords({ includeClosed: true });
 				const edges = current.listEdges();
@@ -141,15 +174,36 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		telemetry = NOOP_SUBAGENT_TELEMETRY;
+		if (telemetryConfig.enabled) {
+			try {
+				const { createOpenTelemetrySubagentTelemetry } = await import("./telemetry/OpenTelemetry.ts");
+				telemetry = await createOpenTelemetrySubagentTelemetry(telemetryConfig);
+			} catch {
+				telemetry = NOOP_SUBAGENT_TELEMETRY;
+			}
+		}
 		initialize(ctx);
+		if (telemetryHealthTimer) clearInterval(telemetryHealthTimer);
+		telemetryHealthTimer = setInterval(() => {
+			if (activeContext) renderTelemetryStatus(activeContext);
+		}, 10_000);
+		telemetryHealthTimer.unref?.();
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		activeContext = undefined;
 		batchManager = undefined;
+		if (telemetryHealthTimer) clearInterval(telemetryHealthTimer);
+		telemetryHealthTimer = undefined;
 		if (manager) await manager.shutdownAll("session shutdown");
+		telemetry.endSession({ reason: "shutdown" });
+		await telemetry.forceFlush();
+		await telemetry.shutdown(5_000);
+		telemetry = NOOP_SUBAGENT_TELEMETRY;
 		manager = undefined;
 		ctx.ui.setStatus("subagent", undefined);
+		ctx.ui.setStatus("subagent-telemetry", undefined);
 		ctx.ui.setWidget("subagent-agents", undefined);
 	});
 }

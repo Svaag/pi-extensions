@@ -87,8 +87,21 @@ export interface AgentMessage {
 
 export interface AgentMetrics {
 	durationMs?: number;
+	queueDurationMs?: number;
+	startupDurationMs?: number;
+	firstProgressMs?: number;
 	outputChars?: number;
 	exitCode?: number;
+	turns?: number;
+	toolCalls?: number;
+	providerRequests?: number;
+	compactions?: number;
+	inputTokens?: number;
+	outputTokens?: number;
+	cacheReadTokens?: number;
+	cacheWriteTokens?: number;
+	totalTokens?: number;
+	costUsd?: number;
 }
 
 export interface AgentResult {

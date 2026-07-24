@@ -24,13 +24,14 @@ ln -s "$PWD/pi-extensions/tool-highlight" ~/.pi/agent/extensions/tool-highlight
 ln -s "$PWD/pi-extensions/x402-wallet" ~/.pi/agent/extensions/x402-wallet
 ```
 
-Extensions with extra runtime dependencies (currently `x402-wallet`) need their dependencies installed next to the extension entrypoint because Pi resolves modules from the extension path:
+Extensions with extra runtime dependencies (`subagent` for optional OpenTelemetry and `x402-wallet`) need their dependencies installed next to the extension entrypoint because Pi resolves modules from the extension path:
 
 ```bash
+npm install --prefix subagent
 npm install --prefix x402-wallet
 ```
 
-If you copy only `x402-wallet/` outside this repo, run `npm install` inside that copied directory.
+If you copy either extension directory outside this repo, run `npm install` inside that copied directory. Subagent telemetry remains disabled unless `PI_SUBAGENT_OTEL_ENABLED=1`; see [`subagent/OBSERVABILITY.md`](subagent/OBSERVABILITY.md).
 
 Reload Pi with `/reload` after installing or updating.
 

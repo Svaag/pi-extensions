@@ -15,6 +15,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - `spawn_agents_on_csv` / `spawn_agents_on_jsonl` — fan out one worker per structured input row.
 - `list_agent_jobs` / `wait_agent_job` / `cancel_agent_job` — inspect and control batch jobs.
 - `export_agent_job_results` — export batch results to JSONL or CSV.
+- `analyze_subagent_telemetry` — query a bounded metadata-only reliability/cost/UX snapshot from configured Prometheus and Jaeger endpoints.
 - `interrupt_agent` — abort/kill a running child and preserve partial output.
 - `close_agent` — release child process resources while preserving history.
 
@@ -136,6 +137,20 @@ Example:
 ```
 
 The candidate pool comes from Pi scoped models (`enabledModels` / `/scoped-models`). Keep cheap/fast models in the scoped list if you opt into router-based grunt-work routing. Batch fan-out routes once per job when `routingMode: "auto"` is set, then each worker inherits that job-level model/thinking decision.
+
+## OpenTelemetry observability
+
+The extension supports opt-in metadata-only traces, metrics, and structured logs over OTLP/HTTP. It is disabled unless `PI_SUBAGENT_OTEL_ENABLED=1`.
+
+```bash
+npm install --prefix subagent
+export PI_SUBAGENT_OTEL_ENABLED=1
+export PI_SUBAGENT_OTEL_ENDPOINT=http://127.0.0.1:4318
+```
+
+Use `/subagents telemetry` for exporter/query health and `analyze_subagent_telemetry` for fixed, read-only Prometheus/Jaeger analysis. Prompts, source paths, commands, tool payloads, output, raw errors, environment variables, and headers are never exported.
+
+See [`OBSERVABILITY.md`](./OBSERVABILITY.md) and [`../observability/otel-collector.yaml`](../observability/otel-collector.yaml) for collector configuration, signal/query catalogs, retention, SLOs, and troubleshooting.
 
 ## Agent definitions
 
@@ -271,6 +286,12 @@ Symlink the extension directory:
 ```bash
 mkdir -p ~/.pi/agent/extensions
 ln -s /home/svag/Dev/pi-extensions/subagent ~/.pi/agent/extensions/subagent
+```
+
+Install the extension-local OTel runtime dependencies:
+
+```bash
+npm install --prefix /home/svag/Dev/pi-extensions/subagent
 ```
 
 Then run `/reload` in Pi.

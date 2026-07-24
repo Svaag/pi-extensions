@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AgentBackend, AgentBackendEvents, AgentHandle, BackendSpawnRequest } from "./AgentBackend.ts";
 import type { AgentRecord, AgentResult } from "./AgentTypes.ts";
 import { RpcClient } from "./RpcClient.ts";
+import { aggregateAssistantUsage } from "../telemetry/Usage.ts";
 import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 
 const STDERR_TAIL_CAP = 16_384;
@@ -184,15 +185,50 @@ export class SubprocessRpcBackend implements AgentBackend {
 			},
 		}) as ChildProcessWithoutNullStreams;
 
+		const observe = (observation: Parameters<NonNullable<typeof events.onObservation>>[0]) => {
+			try { events.onObservation?.(observation); } catch { /* telemetry must not affect the child */ }
+		};
+		observe({ kind: "process.spawned", at: Date.now(), pid: proc.pid });
+
 		let stderrTail = "";
 		let sawTerminalResult = false;
 		let outputChars = 0;
+		let turnOutputChars = 0;
+		let turnToolCalls = 0;
+		let turnProviderRequests = 0;
+		let turnCompactions = 0;
 		let lastAssistantText = "";
 		let lastAssistant: any | undefined;
 		let sawContextOverflow = false;
+		let sawFirstModelOutput = false;
 		let overflowRecoveryAttempted = false;
 		let overflowRecoveryActive = false;
+		let overflowRecoveryStartedAt: number | undefined;
+		let compactionStartedAt: number | undefined;
+		const toolStartedAt = new Map<string, number>();
+		const fallbackToolCallIds = new Map<string, string[]>();
+		let generatedToolCallId = 0;
 		let rpc: RpcClient;
+
+		const eventToolCallId = (event: any, phase: "start" | "end"): string => {
+			const candidate = event?.toolCallId ?? event?.toolCall?.id ?? event?.id;
+			if (typeof candidate === "string" && candidate) return candidate;
+			const toolName = String(event?.toolName ?? "tool");
+			if (phase === "end") {
+				const queued = fallbackToolCallIds.get(toolName);
+				const existing = queued?.shift();
+				if (queued?.length === 0) fallbackToolCallIds.delete(toolName);
+				if (existing) return existing;
+			}
+			generatedToolCallId += 1;
+			const generated = `${toolName}-${generatedToolCallId}`;
+			if (phase === "start") {
+				const queued = fallbackToolCallIds.get(toolName) ?? [];
+				queued.push(generated);
+				fallbackToolCallIds.set(toolName, queued);
+			}
+			return generated;
+		};
 
 		const finishContextOverflowFailure = (message: string, recoveryError?: unknown) => {
 			const recoverySuffix = recoveryError ? ` Overflow recovery failed: ${recoveryError instanceof Error ? recoveryError.message : String(recoveryError)}` : "";
@@ -202,7 +238,7 @@ export class SubprocessRpcBackend implements AgentBackend {
 				status: "failed",
 				summary: `${message}${recoverySuffix}`,
 				output: lastAssistantText,
-				metrics: { outputChars },
+				metrics: { outputChars: turnOutputChars, turns: 1, toolCalls: turnToolCalls, providerRequests: turnProviderRequests, compactions: turnCompactions },
 			});
 		};
 
@@ -210,6 +246,8 @@ export class SubprocessRpcBackend implements AgentBackend {
 			if (overflowRecoveryAttempted) return;
 			overflowRecoveryAttempted = true;
 			overflowRecoveryActive = true;
+			overflowRecoveryStartedAt = Date.now();
+			observe({ kind: "context_overflow.recovery", at: overflowRecoveryStartedAt, phase: "started" });
 			events.onOutput?.("\n[Child context window overflow detected; requesting manual compaction and one no-tools partial-report retry.]\n");
 			try {
 				try {
@@ -226,54 +264,116 @@ export class SubprocessRpcBackend implements AgentBackend {
 					type: "prompt",
 					message: "Your previous turn exceeded the context window and has now been compacted. Do not call tools. Return a concise partial final report using only retained context and outputs already inspected: summary, evidence/files/commands seen, validation status, blockers, and next safe actions.",
 				}, 10_000);
+				const finishedAt = Date.now();
+				observe({ kind: "context_overflow.recovery", at: finishedAt, phase: "completed", success: true, durationMs: overflowRecoveryStartedAt ? finishedAt - overflowRecoveryStartedAt : undefined });
 			} catch (error) {
 				overflowRecoveryActive = false;
+				const finishedAt = Date.now();
+				const recoveryError = error instanceof Error ? error : new Error(String(error));
+				observe({ kind: "context_overflow.recovery", at: finishedAt, phase: "completed", success: false, durationMs: overflowRecoveryStartedAt ? finishedAt - overflowRecoveryStartedAt : undefined, error: recoveryError });
 				finishContextOverflowFailure(message, error);
 			}
 		};
 
 		rpc = new RpcClient(proc, {
 			onMalformedLine: (line, error) => {
+				observe({ kind: "rpc.malformed", at: Date.now(), error });
 				events.onOutput?.(`\n[Malformed child RPC JSON ignored: ${error.message}; line=${line.slice(0, 160)}]\n`);
 			},
+			onRequestStarted: (request) => observe({ kind: "rpc.started", at: request.startedAt, requestId: request.requestId, command: request.command }),
+			onRequestCompleted: (request) => observe({ kind: "rpc.completed", at: request.finishedAt, requestId: request.requestId, command: request.command, durationMs: request.durationMs, success: request.success, error: request.error }),
 			onEvent: (event) => {
-				if (event.type === "agent_start") events.onStarted?.();
-				if (event.type === "compaction_start") events.onOutput?.(`\n[Child compaction started: ${event.reason ?? "unknown"}]\n`);
+				if (event.type === "agent_start") {
+					sawFirstModelOutput = false;
+					turnOutputChars = 0;
+					turnToolCalls = 0;
+					turnProviderRequests = 0;
+					turnCompactions = 0;
+					events.onStarted?.();
+				}
+				if (event.type === "compaction_start") {
+					turnCompactions += 1;
+					compactionStartedAt = Date.now();
+					observe({ kind: "compaction.started", at: compactionStartedAt, reason: typeof event.reason === "string" ? event.reason : undefined });
+					events.onOutput?.(`\n[Child compaction started: ${event.reason ?? "unknown"}]\n`);
+				}
 				if (event.type === "compaction_end") {
 					const result = event.result;
 					const status = event.aborted ? "aborted" : result ? "completed" : "failed";
 					const estimate = result?.estimatedTokensAfter ? `; estimatedTokensAfter=${result.estimatedTokensAfter}` : "";
 					const error = event.errorMessage ? `; error=${event.errorMessage}` : "";
+					const finishedAt = Date.now();
+					observe({
+						kind: "compaction.completed",
+						at: finishedAt,
+						success: !event.aborted && Boolean(result),
+						reason: typeof event.reason === "string" ? event.reason : undefined,
+						durationMs: compactionStartedAt ? finishedAt - compactionStartedAt : undefined,
+						error: event.errorMessage ? new Error(String(event.errorMessage)) : undefined,
+					});
+					compactionStartedAt = undefined;
 					events.onOutput?.(`\n[Child compaction ${status}: ${event.reason ?? "unknown"}${estimate}${error}]\n`);
 				}
 				if (event.type === "message_update") {
 					const delta = event.assistantMessageEvent;
 					if (delta?.type === "text_delta" && typeof delta.delta === "string") {
+						if (!sawFirstModelOutput) {
+							sawFirstModelOutput = true;
+							observe({ kind: "model.first_output", at: Date.now() });
+						}
 						outputChars += delta.delta.length;
+						turnOutputChars += delta.delta.length;
 						events.onOutput?.(delta.delta);
 					}
 					if (delta?.type === "error") {
-						if (isContextWindowError(delta.errorMessage)) sawContextOverflow = true;
+						const modelError = new Error(String(delta.errorMessage ?? "unknown model error"));
+						if (isContextWindowError(delta.errorMessage)) {
+							sawContextOverflow = true;
+							observe({ kind: "context_overflow.detected", at: Date.now() });
+						}
+						observe({ kind: "provider.error", at: Date.now(), error: modelError });
 						events.onOutput?.(`\n[Child model error: ${delta.errorMessage ?? "unknown error"}]\n`);
 					}
 				}
 				if (event.type === "tool_execution_start") {
+					turnToolCalls += 1;
+					const toolCallId = eventToolCallId(event, "start");
+					const startedAt = Date.now();
+					toolStartedAt.set(toolCallId, startedAt);
+					observe({ kind: "tool.started", at: startedAt, toolCallId, toolName: String(event.toolName ?? "tool") });
 					const preview = JSON.stringify(event.args ?? {});
 					events.onOutput?.(`\n→ ${event.toolName ?? "tool"} ${preview.length > 300 ? `${preview.slice(0, 300)}…` : preview}\n`);
 				}
 				if (event.type === "tool_execution_end") {
+					const toolCallId = eventToolCallId(event, "end");
+					const finishedAt = Date.now();
 					const toolText = textFromToolResult(event.result);
 					const status = event.isError ? " error" : " result";
 					const body = toolText ? `\n${truncateMiddle(toolText, TOOL_RESULT_TEXT_CAP)}` : "";
+					const resultTruncated = Boolean(event.result?.details?.subagentPolicy?.toolResultTruncated) || toolText.length > TOOL_RESULT_TEXT_CAP;
+					observe({
+						kind: "tool.completed",
+						at: finishedAt,
+						toolCallId,
+						toolName: String(event.toolName ?? "tool"),
+						durationMs: toolStartedAt.has(toolCallId) ? finishedAt - toolStartedAt.get(toolCallId)! : undefined,
+						success: !event.isError,
+						resultChars: toolText.length,
+						resultTruncated,
+						error: event.isError ? new Error("Child tool execution failed") : undefined,
+					});
+					toolStartedAt.delete(toolCallId);
 					events.onOutput?.(`\n← ${event.toolName ?? "tool"}${status}${body}\n`);
 				}
 				if (event.type === "message_end" && event.message?.role === "assistant") {
+					turnProviderRequests += 1;
 					lastAssistant = event.message;
 					lastAssistantText = textFromMessage(event.message);
 				}
 				if (event.type === "agent_end") {
 					sawTerminalResult = true;
 					const messages = Array.isArray(event.messages) ? event.messages : [];
+					const usage = aggregateAssistantUsage(messages);
 					lastAssistant = finalAssistantMessage(messages) ?? lastAssistant;
 					lastAssistantText = textFromMessage(lastAssistant) || lastAssistantText;
 					const stopReason = lastAssistant?.stopReason;
@@ -291,7 +391,14 @@ export class SubprocessRpcBackend implements AgentBackend {
 						status,
 						summary,
 						output: lastAssistantText,
-						metrics: { outputChars },
+						metrics: {
+							...usage,
+							outputChars: turnOutputChars,
+							turns: 1,
+							toolCalls: turnToolCalls,
+							providerRequests: Math.max(turnProviderRequests, usage.providerRequests ?? 0),
+							compactions: turnCompactions,
+						},
 					});
 				}
 			},
@@ -302,6 +409,8 @@ export class SubprocessRpcBackend implements AgentBackend {
 		});
 		proc.on("error", (error) => events.onError?.(error instanceof Error ? error : new Error(String(error))));
 		proc.on("close", (code, closeSignal) => {
+			const exitedAt = Date.now();
+			observe({ kind: "process.exited", at: exitedAt, exitCode: code, signal: closeSignal });
 			cleanupTemp(tempPrompt);
 			if (!sawTerminalResult && !overflowRecoveryActive && code !== 0) {
 				events.onError?.(new Error(stderrTail.trim() || `Child process exited before completion with code ${code}`));

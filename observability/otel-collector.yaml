@@ -1,0 +1,101 @@
+# Pi subagent metadata-only OTel Collector example.
+# Set JAEGER_OTLP_ENDPOINT (for example, localhost:4317) before starting.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+  # Defense in depth. The extension already uses strict attribute allowlists.
+  attributes/privacy:
+    actions:
+      - key: prompt
+        action: delete
+      - key: inherited_context
+        action: delete
+      - key: cwd
+        action: delete
+      - key: file.path
+        action: delete
+      - key: process.command_line
+        action: delete
+      - key: shell.command
+        action: delete
+      - key: tool.arguments
+        action: delete
+      - key: tool.output
+        action: delete
+      - key: error.message
+        action: delete
+      - key: exception.message
+        action: delete
+      - key: exception.stacktrace
+        action: delete
+      - key: http.request.header.authorization
+        action: delete
+      - key: http.request.header.cookie
+        action: delete
+
+  resource/privacy:
+    attributes:
+      - key: process.command_args
+        action: delete
+      - key: process.command_line
+        action: delete
+      - key: process.executable.path
+        action: delete
+      - key: host.name
+        action: delete
+      - key: user.id
+        action: delete
+
+  batch:
+    timeout: 2s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+exporters:
+  # Jaeger accepts OTLP/gRPC. Example: JAEGER_OTLP_ENDPOINT=localhost:4317
+  otlp/jaeger:
+    endpoint: ${env:JAEGER_OTLP_ENDPOINT}
+    tls:
+      # Change to false and configure certificates for a remote Jaeger endpoint.
+      insecure: true
+
+  # Configure Prometheus to scrape this endpoint.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    enable_open_metrics: true
+
+  # Replace this with an OTLP/Loki-compatible exporter for durable log storage.
+  debug/logs:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/privacy, resource/privacy, batch]
+      exporters: [otlp/jaeger]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/privacy, batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/privacy, resource/privacy, batch]
+      exporters: [debug/logs]

@@ -17,9 +17,25 @@ export interface ChildPolicyConfig {
 	maxOutputChars: number;
 }
 
+export type BackendObservation =
+	| { kind: "process.spawned"; at: number; pid?: number }
+	| { kind: "process.exited"; at: number; exitCode: number | null; signal: NodeJS.Signals | null }
+	| { kind: "rpc.started"; at: number; requestId: string; command: string }
+	| { kind: "rpc.completed"; at: number; requestId: string; command: string; durationMs: number; success: boolean; error?: Error }
+	| { kind: "model.first_output"; at: number }
+	| { kind: "tool.started"; at: number; toolCallId: string; toolName: string }
+	| { kind: "tool.completed"; at: number; toolCallId: string; toolName: string; durationMs?: number; success: boolean; resultChars: number; resultTruncated: boolean; error?: Error }
+	| { kind: "compaction.started"; at: number; reason?: string }
+	| { kind: "compaction.completed"; at: number; success: boolean; reason?: string; durationMs?: number; error?: Error }
+	| { kind: "context_overflow.detected"; at: number }
+	| { kind: "context_overflow.recovery"; at: number; phase: "started" | "completed"; success?: boolean; durationMs?: number; error?: Error }
+	| { kind: "rpc.malformed"; at: number; error: Error }
+	| { kind: "provider.error"; at: number; error: Error };
+
 export interface AgentBackendEvents {
 	onStarted?: () => void;
 	onOutput?: (text: string) => void;
+	onObservation?: (observation: BackendObservation) => void;
 	onResult?: (result: AgentResult) => void;
 	onError?: (error: Error) => void;
 	onExit?: (exitCode: number | null, signal: NodeJS.Signals | null) => void;

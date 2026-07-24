@@ -4,6 +4,7 @@ import type { AgentBackend, AgentBackendEvents, AgentHandle, BackendSpawnRequest
 import { AgentManager } from "../subagent/core/AgentManager.ts";
 import type { AgentResult } from "../subagent/core/AgentTypes.ts";
 import { StateStore } from "../subagent/core/StateStore.ts";
+import { NoopSubagentTelemetry } from "../subagent/telemetry/NoopTelemetry.ts";
 
 class FakeHandle implements AgentHandle {
 	readonly agentId: string;
@@ -59,7 +60,7 @@ function makeRecord(status: "queued" | "running" | "succeeded" | "failed" | "int
 	};
 }
 
-function manager(backend = new FakeBackend(), limits: any = {}) {
+function manager(backend = new FakeBackend(), limits: any = {}, telemetry?: NoopSubagentTelemetry) {
 	const entries: any[] = [];
 	return {
 		backend,
@@ -69,9 +70,39 @@ function manager(backend = new FakeBackend(), limits: any = {}) {
 			store: new StateStore({ appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }) }),
 			rootCwd: "/tmp",
 			limits: { maxAgentsRunning: 1, maxAgentsTotal: 4, maxOpenAgents: 4, ...limits },
+			telemetry,
 		}),
 	};
 }
+
+class RecordingTelemetry extends NoopSubagentTelemetry {
+	events: string[] = [];
+	override agentQueued(): void { this.events.push("agent.queued"); }
+	override agentStarted(): void { this.events.push("agent.started"); }
+	override turnStarted(): void { this.events.push("turn.started"); }
+	override rpcStarted(): void { this.events.push("rpc.started"); }
+	override rpcCompleted(): void { this.events.push("rpc.completed"); }
+	override toolStarted(): void { this.events.push("tool.started"); }
+	override toolCompleted(): void { this.events.push("tool.completed"); }
+	override turnCompleted(): void { this.events.push("turn.completed"); }
+	override agentCompleted(): void { this.events.push("agent.completed"); }
+}
+
+test("AgentManager maps backend observations into the telemetry lifecycle", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const telemetry = new RecordingTelemetry();
+	const h = manager(backend, {}, telemetry);
+	const record = await h.manager.spawnAgent({ taskName: "observed", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	backend.events.get(record.agentId)?.onObservation?.({ kind: "rpc.started", at: Date.now(), requestId: "rpc_1", command: "prompt" });
+	backend.events.get(record.agentId)?.onObservation?.({ kind: "rpc.completed", at: Date.now(), requestId: "rpc_1", command: "prompt", durationMs: 1, success: true });
+	backend.events.get(record.agentId)?.onObservation?.({ kind: "tool.started", at: Date.now(), toolCallId: "tool_1", toolName: "read" });
+	backend.events.get(record.agentId)?.onObservation?.({ kind: "tool.completed", at: Date.now(), toolCallId: "tool_1", toolName: "read", success: true, resultChars: 10, resultTruncated: false });
+	backend.events.get(record.agentId)?.onResult?.({ agentId: record.agentId, status: "succeeded", summary: "done", metrics: { turns: 1 } });
+	await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	assert.deepEqual(telemetry.events, ["agent.queued", "turn.started", "agent.started", "rpc.started", "rpc.completed", "tool.started", "tool.completed", "turn.completed", "agent.completed"]);
+});
 
 test("AgentManager lifecycle: spawn -> running -> succeeded", async () => {
 	const h = manager();
@@ -220,6 +251,38 @@ test("AgentManager live follow-up keeps existing process and ignores spawn overr
 	assert.equal(result.deliveryMode, "rpc_follow_up");
 	assert.equal(backend.requests.length, 1);
 	assert.deepEqual(backend.handles.get(parent.agentId)?.messages, ["live follow-up"]);
+});
+
+test("AgentManager accumulates token, cost, tool, and turn metrics across live follow-ups", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend, { maxAgentsRunning: 2 });
+	const record = await h.manager.spawnAgent({ taskName: "metrics", prompt: "first" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	backend.events.get(record.agentId)?.onResult?.({
+		agentId: record.agentId,
+		status: "succeeded",
+		summary: "first done",
+		output: "first",
+		metrics: { turns: 1, toolCalls: 2, providerRequests: 3, inputTokens: 100, outputTokens: 20, totalTokens: 120, costUsd: 0.01 },
+	});
+	await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	await h.manager.followupTask(record.agentId, "second", "live_if_supported");
+	backend.events.get(record.agentId)?.onResult?.({
+		agentId: record.agentId,
+		status: "succeeded",
+		summary: "second done",
+		output: "second",
+		metrics: { turns: 1, toolCalls: 1, providerRequests: 1, inputTokens: 40, outputTokens: 10, totalTokens: 50, costUsd: 0.005 },
+	});
+	const final = await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000, returnMode: "full" });
+	assert.equal(final.agents[0].metrics.turns, 2);
+	assert.equal(final.agents[0].metrics.toolCalls, 3);
+	assert.equal(final.agents[0].metrics.providerRequests, 4);
+	assert.equal(final.agents[0].metrics.inputTokens, 140);
+	assert.equal(final.agents[0].metrics.outputTokens, 30);
+	assert.equal(final.agents[0].metrics.totalTokens, 170);
+	assert.equal(final.agents[0].metrics.costUsd, 0.015);
 });
 
 test("AgentManager preserves tool output tail after successful final output", async () => {
