@@ -6,7 +6,7 @@ import { rolloutScopeKey } from "../storage/RouterStore.ts";
 import { createMetricHistogram, DEFAULT_HISTOGRAM_BOUNDARIES, histogramQuantile, observeMetric } from "../storage/histograms.ts";
 import type { RouterTelemetry, RouterTelemetryDimensions } from "../telemetry/RouterTelemetry.ts";
 import { sampleBeta, SeededRandom } from "./bandit.ts";
-import { applyPreviewDiscount, estimateModelCostUsd, filterConfiguredCandidates, modelRef, profileCandidate, thinkingLevelsFor } from "./candidates.ts";
+import { applyPreviewDiscount, estimateModelCostUsd, excludePreviewCandidates, filterConfiguredCandidates, modelRef, profileCandidate, thinkingLevelsFor } from "./candidates.ts";
 import { criticalArmHasEvidence, evaluateArmConstraints } from "./constraints.ts";
 import { assessTaskComplexity, classifyTaskIntent, cohortKey, estimateRoutingTokens } from "./features.ts";
 import { normalizeQualityLabel, qualityPosteriorUpdate, reliabilityUpdate } from "./feedback.ts";
@@ -155,7 +155,8 @@ export class ModelRoutingEngine {
 		const disabled = !this.config.enabled || request.forceMode === "off" || rollout.stage === "off";
 		const explainOnly = request.forceMode === "explain";
 
-		const candidates = filterConfiguredCandidates(request.candidates, this.config);
+		let candidates = filterConfiguredCandidates(request.candidates, this.config);
+		candidates = excludePreviewCandidates(candidates);
 		const profiles = candidates.map((c) => profileCandidate(c, this.config));
 		applyPreviewDiscount(profiles);
 		const evaluated: EvaluatedArm[] = [];

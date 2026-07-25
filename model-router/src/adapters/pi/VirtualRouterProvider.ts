@@ -12,7 +12,8 @@ import {
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ModelRoutingEngine } from "../../core/ModelRoutingEngine.ts";
 import type { RouteDecision, RoutingCandidate, RoutingProfile, ThinkingLevel } from "../../core/types.ts";
-import { PiModelSource, type PiModelLike, type PiModelRegistryLike } from "./PiModelSource.ts";
+import { ROUTE_ENTRY_TYPE, formatDecision, privacySafeRouteEntry, updateRouterStatus } from "./rendering.ts";
+import { type PiModelSource, type PiModelRegistryLike } from "./PiModelSource.ts";
 
 const PROVIDER = "model-router";
 const PROFILE_BY_MODEL: Record<string, RoutingProfile> = {
@@ -109,6 +110,11 @@ function errorMessage(model: Model<Api>, reason: string): AssistantMessage {
 	};
 }
 
+function publishRouteDecision(pi: ExtensionAPI, ctx: ExtensionContext, decision: RouteDecision): void {
+	pi.appendEntry(ROUTE_ENTRY_TYPE, privacySafeRouteEntry(decision));
+	updateRouterStatus(ctx, formatDecision(decision));
+}
+
 export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: VirtualRouterRuntimeGetter, options: VirtualRouterProviderOptions = {}): VirtualRouterProviderController {
 	let cacheAffinityModel: string | undefined;
 	const delegate = options.delegate ?? streamSimple;
@@ -154,6 +160,7 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 						explicitThinkingLevel: options?.reasoning as ThinkingLevel | undefined,
 						cacheAffinityModel,
 					});
+					publishRouteDecision(pi, runtime.context, decision);
 				} catch {
 					outer.push({ type: "error", reason: "error", error: errorMessage(routerModel, "model_router_decision_failed") });
 					outer.end();

@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { filterConfiguredCandidates, profileCandidate, thinkingLevelsFor } from "../model-router/src/core/candidates.ts";
+import { excludePreviewCandidates, filterConfiguredCandidates, profileCandidate, thinkingLevelsFor } from "../model-router/src/core/candidates.ts";
 import { assessTaskComplexity, classifyTaskIntent, estimateRoutingTokens } from "../model-router/src/core/features.ts";
 import { modelFingerprint } from "../model-router/src/core/modelFingerprint.ts";
 import { DEFAULT_ROUTER_CONFIG } from "../model-router/src/config/defaults.ts";
@@ -70,6 +70,42 @@ test("candidate filter excludes unauthenticated and synthetic router models", ()
 		{ provider: "model-router", id: "balanced", authenticated: true, available: true },
 	], DEFAULT_ROUTER_CONFIG);
 	assert.deepEqual(candidates.map((candidate) => candidate.id), ["local-model"]);
+});
+
+test("preview candidates are excluded when full version exists", () => {
+	const hy3: RoutingCandidate = {
+		provider: "openrouter",
+		id: "tencent/hy3",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 128_000,
+		maxTokens: 8_192,
+		cost: { input: 1, output: 2 },
+		authenticated: true,
+		available: true,
+	};
+	const hy3Preview: RoutingCandidate = {
+		...hy3,
+		id: "tencent/hy3-preview",
+	};
+	const filtered = excludePreviewCandidates([hy3, hy3Preview]);
+	assert.deepEqual(filtered.map((candidate) => candidate.id), ["tencent/hy3"]);
+});
+
+test("preview candidates are kept when no full version exists", () => {
+	const preview: RoutingCandidate = {
+		provider: "openrouter",
+		id: "tencent/hy3-preview",
+		reasoning: true,
+		input: ["text"],
+		contextWindow: 128_000,
+		maxTokens: 8_192,
+		cost: { input: 1, output: 2 },
+		authenticated: true,
+		available: true,
+	};
+	const filtered = excludePreviewCandidates([preview]);
+	assert.deepEqual(filtered.map((candidate) => candidate.id), ["tencent/hy3-preview"]);
 });
 
 test("fingerprint excludes secret metadata and changes on capability changes", () => {

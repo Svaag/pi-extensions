@@ -21,6 +21,7 @@ export interface PiRouteEntryData {
 	executedModel?: string;
 	executedThinkingLevel?: ThinkingLevel;
 	reason: string;
+	explanation?: string;
 }
 
 export interface PiObservationEntryData {
@@ -58,6 +59,7 @@ export function privacySafeRouteEntry(decision: RouteDecision): PiRouteEntryData
 		executedModel: decision.executedModel,
 		executedThinkingLevel: decision.executedThinkingLevel,
 		reason: decision.reason,
+		explanation: decision.explanation,
 	};
 }
 
@@ -66,7 +68,7 @@ export function formatDecision(decision: RouteDecision): string {
 		? `${decision.selectedModel}${decision.selectedThinkingLevel ? `:${decision.selectedThinkingLevel}` : ""}`
 		: "current model";
 	const verb = decision.applied ? "routed" : decision.stage === "shadow" ? "shadow recommends" : "kept";
-	return `router ${verb} ${recommended} · ${decision.profile} · ${decision.complexityTier}`;
+	return `router ${verb} ${recommended} · ${decision.profile} · ${decision.complexityTier} · ${decision.reason}`;
 }
 
 export function formatRouterStatus(status: RouterStatus, details: {
@@ -105,8 +107,12 @@ export function registerRouterEntryRenderers(pi: ExtensionAPI): void {
 			? `${data.recommendedModel}${data.recommendedThinkingLevel ? `:${data.recommendedThinkingLevel}` : ""}`
 			: "current model";
 		const label = data.applied ? theme.fg("success", "router") : theme.fg("accent", "router shadow");
-		let text = `${label} ${target} · ${data.profile} · ${data.complexityTier}`;
-		if (expanded) text += `\n${theme.fg("dim", `route ${data.routeId} · ${data.arm} · ${data.reason}`)}`;
+		let text = `${label} ${target} · ${data.profile} · ${data.complexityTier} · ${data.reason}`;
+		if (expanded) {
+			const details = [`route ${data.routeId} · ${data.arm}`];
+			if (data.explanation) details.push(data.explanation);
+			text += `\n${theme.fg("dim", details.join(" · "))}`;
+		}
 		return new Text(text, 0, 0);
 	});
 

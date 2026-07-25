@@ -42,7 +42,11 @@ function inner(model: any, fail: boolean, visibleBeforeFailure = false) {
 
 function setup(visibleBeforeFailure = false) {
 	let provider: any;
-	const pi = { registerProvider(_name: string, config: any) { provider = config; } } as any;
+	const entries: any[] = [];
+	const pi = {
+		registerProvider(_name: string, config: any) { provider = config; },
+		appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
+	} as any;
 	const store = new SqliteRouterStore({ path: ":memory:" });
 	const engine = new ModelRoutingEngine({ store });
 	let calls = 0;
@@ -58,7 +62,7 @@ function setup(visibleBeforeFailure = false) {
 	registerVirtualRouterProvider(pi, () => runtime, {
 		delegate(model: any) { calls += 1; return calls === 1 ? inner(model, true, visibleBeforeFailure) : inner(model, false); },
 	});
-	return { provider, store, engine, calls: () => calls };
+	return { provider, store, engine, calls: () => calls, entries };
 }
 
 const context: any = { systemPrompt: "system", messages: [{ role: "user", content: [{ type: "text", text: "Find TODO files" }] }], tools: [] };
@@ -69,6 +73,8 @@ test("virtual provider retries once before visible output and emits only fallbac
 	const events: any[] = [];
 	for await (const event of setupResult.provider.streamSimple(routerModel, context, { reasoning: "low" })) events.push(event);
 	assert.equal(setupResult.calls(), 2);
+	assert.equal(setupResult.entries.filter((entry) => entry.customType === "model-router.route.v1").length, 2);
+	assert.ok(setupResult.entries.some((entry) => entry.data?.executedModel && entry.data?.reason === "selected"));
 	assert.equal(events.filter((event) => event.type === "start").length, 1);
 	assert.equal(events.at(-1)?.type, "done");
 	const summary = setupResult.store.getSummary();
@@ -82,6 +88,8 @@ test("virtual provider never replays after visible content", async () => {
 	const events: any[] = [];
 	for await (const event of setupResult.provider.streamSimple(routerModel, context, {})) events.push(event);
 	assert.equal(setupResult.calls(), 1);
+	assert.equal(setupResult.entries.filter((entry) => entry.customType === "model-router.route.v1").length, 1);
+	assert.ok(setupResult.entries[0]?.data?.explanation?.includes("recommended"));
 	assert(events.some((event) => event.type === "text_delta"));
 	assert.equal(events.at(-1)?.type, "error");
 	await setupResult.engine.close();

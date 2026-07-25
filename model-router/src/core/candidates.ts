@@ -122,6 +122,33 @@ export function profileCandidate(candidate: RoutingCandidate, config: RouterConf
 }
 
 /** Detect models like "tencent/hy3-preview" / "gemini-3.1-pro-preview" that have a
+ *  released counterpart in the candidate set, and exclude the preview version.
+ *  No-op when no non-preview counterpart exists. */
+export function excludePreviewCandidates(candidates: RoutingCandidate[]): RoutingCandidate[] {
+	const previewRE = /(?<=[^a-z0-9]|^)preview(?=[^a-z0-9]|$)/i;
+	const previews = new Map<string, RoutingCandidate>();
+	const nonPreviews = new Set<string>();
+
+	for (const c of candidates) {
+		const ref = modelRef(c);
+		if (previewRE.test(ref)) {
+			previews.set(ref.replace(previewRE, "").replace(/-+/g, "-").replace(/-$/, "").replace(/^-/, "").toLowerCase(), c);
+		} else {
+			nonPreviews.add(ref.toLowerCase());
+		}
+	}
+
+	const excluded = new Set<RoutingCandidate>();
+	for (const [strippedRef, candidate] of previews) {
+		if (nonPreviews.has(strippedRef)) {
+			excluded.add(candidate);
+		}
+	}
+
+	return excluded.size > 0 ? candidates.filter((c) => !excluded.has(c)) : candidates;
+}
+
+/** Detect models like "tencent/hy3-preview" / "gemini-3.1-pro-preview" that have a
  *  released counterpart in the candidate set, and dock their quality so the router
  *  prefers the full version. No-op when no non-preview counterpart exists. */
 export function applyPreviewDiscount(profiles: ModelProfile[]): void {
