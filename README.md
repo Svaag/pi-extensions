@@ -9,6 +9,7 @@ Personal extensions for the [Pi coding agent](https://github.com/earendil-works/
 - `hyrule-loop/` — helper commands for running and inspecting the Hyrule Engineering Loop.
 - [`model-router/`](./model-router/README.md) — public telemetry-informed, self-learning model router with standalone Pi, virtual-provider, SDK, and Subagent adapters.
 - [`subagent/`](./subagent/README.md) — isolated RPC child-agent/swarm extension integrated with the shared router and metadata-only OTel.
+- `coding-conventions/` — deterministic `Assisted-by:` trailer on every commit + layered coding-conventions injection with ecosystem auto-detection.
 
 ## Install
 
@@ -22,6 +23,7 @@ ln -s "$PWD/pi-extensions/goal-mode" ~/.pi/agent/extensions/goal-mode
 ln -s "$PWD/pi-extensions/hyrule-loop" ~/.pi/agent/extensions/hyrule-loop
 ln -s "$PWD/pi-extensions/model-router" ~/.pi/agent/extensions/model-router
 ln -s "$PWD/pi-extensions/subagent" ~/.pi/agent/extensions/subagent
+ln -s "$PWD/pi-extensions/coding-conventions" ~/.pi/agent/extensions/coding-conventions
 npm install
 ```
 
