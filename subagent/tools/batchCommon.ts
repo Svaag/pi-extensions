@@ -5,6 +5,7 @@ import { interpolatePrompt } from "../core/BatchJobManager.ts";
 import type { BatchInputRow } from "../core/BatchTypes.ts";
 import type { RoutingMode, RoutingObjective, ThinkingLevel, WriteMode } from "../core/AgentTypes.ts";
 import { resolveRouting } from "./router.ts";
+import { downgradeSubagentThinking, parentThinkingLevel } from "./common.ts";
 
 export type BatchManagerGetter = (ctx: any) => any;
 
@@ -27,17 +28,24 @@ export const BatchCommonParams = {
 
 export async function resolveBatchRouting(ctx: any, params: any, sourceType: "csv" | "jsonl", rows: BatchInputRow[]) {
 	const samplePrompts = rows.slice(0, 3).map((row) => interpolatePrompt(params.promptTemplate, row.data));
-	return resolveRouting(ctx, {
+	const explicitThinkingLevel = params.thinkingLevel as ThinkingLevel | undefined;
+	const routed = await resolveRouting(ctx, {
 		taskName: params.name ?? `${sourceType}-batch`,
 		prompt: samplePrompts.join("\n\n--- sample worker prompt ---\n\n") || params.promptTemplate,
 		contextMode: params.contextMode,
 		writeMode: (params.writeMode ?? "read_only") as WriteMode,
 		batch: { sourceType, rowCount: rows.length, samplePrompts },
 		explicitModel: params.model,
-		explicitThinkingLevel: params.thinkingLevel as ThinkingLevel | undefined,
+		explicitThinkingLevel,
 		routingMode: params.routingMode as RoutingMode | undefined,
 		routingProfile: params.routingProfile as RoutingObjective | undefined,
 	});
+	const downgradedThinking = downgradeSubagentThinking(
+		parentThinkingLevel(ctx),
+		routed.thinkingLevel,
+		explicitThinkingLevel,
+	);
+	return { ...routed, thinkingLevel: downgradedThinking };
 }
 
 export function formatJobSummary(job: BatchJobSummary): string {

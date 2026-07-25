@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { RoutingMode, RoutingObjective, ThinkingLevel } from "../core/AgentTypes.ts";
-import { type ManagerGetter, preview, textResult } from "./common.ts";
+import { type ManagerGetter, downgradeSubagentThinking, parentThinkingLevel, preview, textResult } from "./common.ts";
 import { resolveInheritedRouting, resolveRouting } from "./router.ts";
 
 const FollowupTaskParams = Type.Object({
@@ -81,10 +81,15 @@ export function registerFollowupTaskTool(pi: ExtensionAPI, getManager: ManagerGe
 						routingMode: spawnRoutingMode as RoutingMode,
 						routingProfile: params.routingProfile as RoutingObjective | undefined,
 					});
+					const followupThinking = downgradeSubagentThinking(
+						parentThinkingLevel(ctx),
+						routed.thinkingLevel,
+						params.thinkingLevel as ThinkingLevel | undefined,
+					);
 					spawnOptions = {
 						contextMode,
 						model: routed.model,
-						thinkingLevel: routed.thinkingLevel,
+						thinkingLevel: followupThinking,
 						routingMode: spawnRoutingMode as RoutingMode,
 						routingProfile: params.routingProfile as RoutingObjective | undefined,
 						routingDecision: routed.decision,

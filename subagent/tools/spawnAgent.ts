@@ -8,7 +8,7 @@ import { discoverAgents, type AgentConfig, type AgentScope } from "../agents.ts"
 import type { AgentRecord, ContextMode, RoutingMode, RoutingObjective, ThinkingLevel, WriteMode } from "../core/AgentTypes.ts";
 import { sanitizeContextText } from "../core/ContextSanitizer.ts";
 import { renderAgentSummary } from "../render/renderAgent.ts";
-import { type ManagerGetter, preview, textResult } from "./common.ts";
+import { type ManagerGetter, downgradeSubagentThinking, parentThinkingLevel, preview, textResult } from "./common.ts";
 import { resolveRouting } from "./router.ts";
 import { expandSpawnParams } from "./spawnParams.ts";
 
@@ -135,6 +135,11 @@ async function spawnOne(ctx: any, manager: ReturnType<ManagerGetter>, params: an
 		routingMode,
 		routingProfile,
 	});
+	const downgradedThinking = downgradeSubagentThinking(
+		parentThinkingLevel(ctx),
+		routed.thinkingLevel,
+		explicitThinkingLevel,
+	);
 	return manager.spawnAgent({
 		taskName: params.taskName,
 		prompt: params.prompt,
@@ -152,7 +157,7 @@ async function spawnOne(ctx: any, manager: ReturnType<ManagerGetter>, params: an
 		timeoutMs: params.timeoutMs,
 		maxOutputChars: params.maxOutputChars,
 		model: routed.model,
-		thinkingLevel: routed.thinkingLevel,
+		thinkingLevel: downgradedThinking,
 		tools: agent?.tools,
 		routingMode,
 		routingProfile,
