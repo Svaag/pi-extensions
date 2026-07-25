@@ -6,7 +6,7 @@ import { rolloutScopeKey } from "../storage/RouterStore.ts";
 import { createMetricHistogram, DEFAULT_HISTOGRAM_BOUNDARIES, histogramQuantile, observeMetric } from "../storage/histograms.ts";
 import type { RouterTelemetry, RouterTelemetryDimensions } from "../telemetry/RouterTelemetry.ts";
 import { sampleBeta, SeededRandom } from "./bandit.ts";
-import { estimateModelCostUsd, filterConfiguredCandidates, modelRef, profileCandidate, thinkingLevelsFor } from "./candidates.ts";
+import { applyPreviewDiscount, estimateModelCostUsd, filterConfiguredCandidates, modelRef, profileCandidate, thinkingLevelsFor } from "./candidates.ts";
 import { criticalArmHasEvidence, evaluateArmConstraints } from "./constraints.ts";
 import { assessTaskComplexity, classifyTaskIntent, cohortKey, estimateRoutingTokens } from "./features.ts";
 import { normalizeQualityLabel, qualityPosteriorUpdate, reliabilityUpdate } from "./feedback.ts";
@@ -156,9 +156,12 @@ export class ModelRoutingEngine {
 		const explainOnly = request.forceMode === "explain";
 
 		const candidates = filterConfiguredCandidates(request.candidates, this.config);
+		const profiles = candidates.map((c) => profileCandidate(c, this.config));
+		applyPreviewDiscount(profiles);
 		const evaluated: EvaluatedArm[] = [];
-		for (const candidate of candidates) {
-			const modelProfile = profileCandidate(candidate, this.config);
+		for (let i = 0; i < candidates.length; i++) {
+			const candidate = candidates[i]!;
+			const modelProfile = profiles[i]!;
 			for (const thinkingLevel of thinkingLevelsFor(candidate, assessment.complexityTier, request.explicitModel && modelRef(candidate).toLowerCase() === request.explicitModel.toLowerCase() ? request.explicitThinkingLevel : undefined)) {
 				const key = armKey(modelProfile.fingerprint, thinkingLevel, cohort);
 				const projectKey = projectHash ? armKey(modelProfile.fingerprint, thinkingLevel, cohort, projectHash) : undefined;

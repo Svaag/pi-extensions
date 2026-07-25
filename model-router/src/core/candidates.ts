@@ -121,6 +121,30 @@ export function profileCandidate(candidate: RoutingCandidate, config: RouterConf
 	return profile;
 }
 
+/** Detect models like "tencent/hy3-preview" / "gemini-3.1-pro-preview" that have a
+ *  released counterpart in the candidate set, and dock their quality so the router
+ *  prefers the full version. No-op when no non-preview counterpart exists. */
+export function applyPreviewDiscount(profiles: ModelProfile[]): void {
+	const previewRE = /(?<=[^a-z0-9]|^)preview(?=[^a-z0-9]|$)/i;
+	const previews = new Map<string, ModelProfile>();
+	const nonPreviews = new Set<string>();
+
+	for (const p of profiles) {
+		if (previewRE.test(p.ref)) {
+			previews.set(p.ref.replace(previewRE, "").replace(/-+/g, "-").replace(/-$/, "").replace(/^-/, "").toLowerCase(), p);
+		} else {
+			nonPreviews.add(p.ref.toLowerCase());
+		}
+	}
+
+	for (const [strippedRef, profile] of previews) {
+		if (nonPreviews.has(strippedRef)) {
+			profile.quality = Math.max(0.1, profile.quality - 0.2);
+			profile.notes.push("preview discount (released counterpart available)");
+		}
+	}
+}
+
 export function filterConfiguredCandidates(candidates: RoutingCandidate[], config: RouterConfig): RoutingCandidate[] {
 	return candidates.filter((candidate) => {
 		if (candidate.provider === "model-router" || modelRef(candidate).startsWith("model-router/")) return false;
