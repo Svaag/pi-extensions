@@ -150,7 +150,9 @@ function currentModelRef(model: PiModelLike | undefined): string | undefined {
 }
 
 function forceMode(mode: LegacySubagentRoutingMode | undefined): RouteForceMode | undefined {
-	return mode;
+	if (mode === "off") return "off";
+	if (mode === "explain") return "explain";
+	return undefined; // "auto" / undefined -> respect rollout stage (shadow = observe only)
 }
 
 function normalizedBatch(batch: SubagentBatchTaskInput | undefined): RouteRequest["batch"] {

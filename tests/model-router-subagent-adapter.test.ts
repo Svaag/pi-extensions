@@ -28,16 +28,17 @@ const base: any = {
 	taskName: "lookup", prompt: "Find TODO files", writeMode: "read_only",
 };
 
-test("Subagent adapter maps managed/forced/explain modes and legacy decisions", async () => {
+test("Subagent adapter respects rollout stage for auto and explicit modes", async () => {
 	const { adapter, engine } = setup();
 	const managed = await adapter.resolve(base);
 	assert.equal(managed.decision.rolloutStage, "shadow");
 	assert.equal(managed.decision.applied, false);
 	assert.equal(managed.model, "anthropic/claude-sonnet-4-6");
 	assert(managed.decision.routeId);
-	const forced = await adapter.resolve({ ...base, routingMode: "auto" });
-	assert.equal(forced.decision.arm, "forced");
-	assert.equal(forced.model, "local-llamacpp/local-model");
+	const auto = await adapter.resolve({ ...base, routingMode: "auto" });
+	assert.equal(auto.decision.rolloutStage, "shadow");
+	assert.equal(auto.decision.applied, false);
+	assert.equal(auto.model, "anthropic/claude-sonnet-4-6");
 	const explained = await adapter.resolve({ ...base, routingMode: "explain" });
 	assert.equal(explained.decision.applied, false);
 	assert.equal(explained.decision.reason, "explain_only");

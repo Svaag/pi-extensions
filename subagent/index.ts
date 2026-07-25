@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ModelRoutingEngine, SqliteRouterStore, loadRouterConfig as loadSharedRouterConfig } from "@svaag/pi-model-router";
 import { SubagentRouterAdapter, loadSubagentRouterAdapterSettings } from "@svaag/pi-model-router/subagent";
-import { createRouterTelemetryPrivacy } from "@svaag/pi-model-router/telemetry";
+import { createOpenTelemetryRouterTelemetry, createRouterTelemetryPrivacy, NOOP_ROUTER_TELEMETRY } from "@svaag/pi-model-router/telemetry";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,9 +58,13 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				halfLifeDays: loaded.config.learning.halfLifeDays,
 				rawRetentionDays: loaded.config.learning.rawRetentionDays,
 			});
+			const routerTelemetry = loaded.config.telemetry.enabled
+				? await createOpenTelemetryRouterTelemetry({ enabled: true, requestedEnabled: true }, { privacy })
+				: NOOP_ROUTER_TELEMETRY;
 			routingEngine = new ModelRoutingEngine({
 				config: loaded.config,
 				store,
+				telemetry: routerTelemetry,
 				hashProject: (projectKey) => privacy.hashIdentifier("project", projectKey),
 			});
 			const adapterSettings = loadSubagentRouterAdapterSettings(ctx.cwd, { agentDir, configDirName: ".pi", projectTrusted: trusted });

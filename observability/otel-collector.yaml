@@ -73,9 +73,10 @@ exporters:
     endpoint: 0.0.0.0:8889
     enable_open_metrics: true
 
-  # Replace this with an OTLP/Loki-compatible exporter for durable log storage.
-  debug/logs:
-    verbosity: basic
+  # Durable log storage. Requires the otelcol-contrib image.
+  # Set LOKI_ENDPOINT (for example, http://loki:3100/otlp) in the collector environment.
+  otlp_http/loki:
+    endpoint: ${env:LOKI_ENDPOINT}
 
 extensions:
   health_check:
@@ -98,4 +99,4 @@ service:
     logs:
       receivers: [otlp]
       processors: [memory_limiter, attributes/privacy, resource/privacy, batch]
-      exporters: [debug/logs]
+      exporters: [otlp_http/loki]
