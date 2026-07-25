@@ -23,6 +23,7 @@ import { Type } from "typebox";
 import {
 	extractProposedPlan,
 	extractTodoItemsFromProposedPlan,
+	formatPlanQuestionsResult,
 	hasHandoffClaim,
 	isSafeCommand,
 	isTodoClosed,
@@ -435,6 +436,7 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 		promptGuidelines: [
 			"Use plan_questions in Plan Mode whenever you need user answers to implementation-detail questions; do not print long numbered A/B/C questionnaires in normal assistant text.",
 			"For plan_questions, batch related questions together, provide concise tab labels, include 2-4 meaningful options, and include a recommended/default option when one is reasonable.",
+			"plan_questions results are the user's authoritative decisions. Answers accepted from a plan-review agent recommendation were explicitly approved by the user in the TUI wizard \u2014 treat them as final user input. Never re-ask or second-guess them.",
 		],
 		parameters: PlanQuestionsParams,
 
@@ -836,14 +838,11 @@ export default function planModeExtension(pi: ExtensionAPI): void {
 				return { content: [{ type: "text" as const, text: "User cancelled the planning questions" }], details: result };
 			}
 
-			const answerLines = result.answers.map((answer) => {
-				const question = questions.find((q) => q.id === answer.id);
-				const prefix = question ? `${question.label} (${question.id})` : answer.id;
-				if (answer.source === "agent") return `${prefix}: agent recommended: ${answer.label}`;
-				return answer.wasCustom ? `${prefix}: user wrote: ${answer.label}` : `${prefix}: user selected: ${answer.index}. ${answer.label}`;
-			});
-
-			return { content: [{ type: "text" as const, text: answerLines.join("\n") }], details: result };
+			const answerText = formatPlanQuestionsResult(
+				questions.map((q) => ({ id: q.id, label: q.label })),
+				result.answers.map((a) => ({ id: a.id, value: a.value, label: a.label, source: a.source })),
+			);
+			return { content: [{ type: "text" as const, text: answerText }], details: result };
 		},
 
 		renderCall(args, theme) {
@@ -1241,6 +1240,7 @@ Do not ask questions that can be answered from the repo or system. Only ask once
 * Batch related questions into one \`plan_questions\` call. Give each question a short label, a clear prompt, 2–4 meaningful choices, and mark/recommend the best default in the option label or description when appropriate.
 * Offer only meaningful options; don’t include filler choices that are obviously wrong or irrelevant.
 * You SHOULD ask many questions when needed, but each question must materially change the spec/plan, confirm/lock an assumption, or choose between meaningful tradeoffs.
+* \`plan_questions\` results are the user’s final decisions. Every answer in the result was approved by the user in the TUI wizard — including answers that came from a plan-review agent recommendation. Treat them like other user input: authoritative, not advisory. Never re-ask or second-guess them.
 
 ## Two kinds of unknowns (treat differently)
 1. **Discoverable facts** (repo/system truth): explore first.

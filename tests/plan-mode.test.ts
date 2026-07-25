@@ -5,6 +5,7 @@ import {
 	extractDoneSteps,
 	extractProposedPlan,
 	extractTodoItemsFromProposedPlan,
+	formatPlanQuestionsResult,
 	hasHandoffClaim,
 	isSafeCommand,
 	isTodoClosed,
@@ -211,4 +212,81 @@ test("handoff claims are detected for review-ready language", () => {
 	assert.equal(hasHandoffClaim("PR is clean and ready for human review."), true);
 	assert.equal(hasHandoffClaim("CI is clean; leaving this for review."), true);
 	assert.equal(hasHandoffClaim("Implemented the parser and will continue with tests."), false);
+});
+
+test("formatPlanQuestionsResult produces a header line and decision bullets", () => {
+	const questions = [
+		{ id: "scope", label: "Approach" },
+		{ id: "tests", label: "Test scope" },
+	];
+	const answers = [
+		{ id: "scope", value: "hybrid", label: "Recommendation: Hybrid \u2014 verify + rename (option 3).", source: "agent" as const },
+		{ id: "tests", value: "both", label: "3. Both \u2014 new focused tests + extend existing where natural." },
+	];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	const expectedHeader = "The user answered your planning questions (final decisions \u2014 do not re-ask):";
+	assert.ok(output.startsWith(expectedHeader), `output should start with header; got: ${output.slice(0, 80)}`);
+
+	// Agent-accepted answer: stripped "Recommendation:" prefix
+	assert.ok(output.includes("Approach (scope): Hybrid \u2014 verify + rename (option 3)."), `missing agent line; got: ${output}`);
+	assert.ok(!output.includes("Recommendation:"), `"Recommendation:" should be stripped; got: ${output}`);
+	assert.ok(!output.includes("agent"), `"agent" provenance should not appear; got: ${output}`);
+
+	// User-selected answer: index preserved
+	assert.ok(output.includes("Test scope (tests): 3. Both"), `missing selected line; got: ${output}`);
+	assert.ok(!output.includes("selected"), `"selected" provenance should not appear; got: ${output}`);
+});
+
+test("formatPlanQuestionsResult handles agent answer without Recommendation prefix", () => {
+	const questions = [{ id: "q", label: "Q" }];
+	const answers = [{ id: "q", value: "custom", label: "Just do Y, because Z.", source: "agent" as const }];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	assert.ok(output.includes("Q (q): Just do Y, because Z."), `got: ${output}`);
+});
+
+test("formatPlanQuestionsResult handles user-typed custom answer", () => {
+	const questions = [{ id: "rollout", label: "Rollout" }];
+	const answers = [{ id: "rollout", value: "feature-flagged", label: "feature-flagged rollout" }];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	assert.ok(output.includes("- Rollout (rollout): feature-flagged rollout"), `got: ${output}`);
+	assert.ok(!output.includes("wrote"), `"wrote" provenance should not appear; got: ${output}`);
+});
+
+test("formatPlanQuestionsResult collapses multi-line agent labels", () => {
+	const questions = [{ id: "q", label: "Q" }];
+	const answers = [{ id: "q", value: "multiline", label: "Recommendation: A.\nBecause B.\nAdditional detail.", source: "agent" as const }];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	// Should be a single-line bullet: no newlines in output after the header
+	assert.ok(output.includes("A. Because B. Additional detail."), `got: ${output}`);
+	assert.equal(output.split("\n").length, 2, `should have exactly 2 lines: header + bullet; got ${output.split("\n").length} lines`);
+});
+
+test("formatPlanQuestionsResult handles empty answers array", () => {
+	const questions = [{ id: "q", label: "Q" }];
+	const answers: Array<{ id: string; value: string; label: string; source?: "agent" | "user" }> = [];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	assert.equal(output, "The user answered your planning questions (final decisions \u2014 do not re-ask):");
+});
+
+test("formatPlanQuestionsResult strips Recommend: variant", () => {
+	const questions = [{ id: "q", label: "Q" }];
+	const answers = [{ id: "q", value: "x", label: "Recommend: Do X.", source: "agent" as const }];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	assert.ok(output.includes("Q (q): Do X."), `got: ${output}`);
+	assert.ok(!output.includes("Recommend:"), `"Recommend:" should be stripped; got: ${output}`);
+});
+
+test("formatPlanQuestionsResult handles question without matching label gracefully", () => {
+	// Fallback: when a question isn't in the map, use the bare id as prefix
+	const questions: Array<{ id: string; label: string }> = [];
+	const answers = [{ id: "orphan", value: "v", label: "Some answer" }];
+
+	const output = formatPlanQuestionsResult(questions, answers);
+	assert.ok(output.includes("- orphan: Some answer"), `got: ${output}`);
 });

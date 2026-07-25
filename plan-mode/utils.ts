@@ -914,3 +914,45 @@ export function markCompletedSteps(text: string, items: TodoItem[]): number {
 
 	return marked;
 }
+
+export interface PlanQuestionForFormat {
+	id: string;
+	label: string;
+}
+
+export interface PlanAnswerForFormat {
+	id: string;
+	value: string;
+	label: string;
+	source?: "agent" | "user";
+}
+
+/**
+ * Format plan_questions answers as LLM-facing tool result text.
+ * All answers are rendered as authoritative user decisions with no
+ * internal provenance annotations.  Leading "Recommendation:" or
+ * "Recommend:" prefixes from agent responses are stripped, and
+ * embedded newlines are collapsed to produce a compact bullet list.
+ */
+export function formatPlanQuestionsResult(
+	questions: PlanQuestionForFormat[],
+	answers: PlanAnswerForFormat[],
+): string {
+	const lines = ["The user answered your planning questions (final decisions \u2014 do not re-ask):"];
+	const questionMap = new Map(questions.map((q) => [q.id, q]));
+
+	for (const answer of answers) {
+		const question = questionMap.get(answer.id);
+		const prefix = question ? `${question.label} (${question.id})` : answer.id;
+		let text = answer.label
+			// Strip leading "Recommendation:" / "Recommend:" prefix (best-effort)
+			.replace(/^\s*recommend(?:ation)?:\s*/i, "")
+			// Normalise embedded newlines and whitespace for LLM readability
+			.replace(/[\n\r]+/g, " ")
+			.replace(/\s+/g, " ")
+			.trim();
+		lines.push(`- ${prefix}: ${text}`);
+	}
+
+	return lines.join("\n");
+}

@@ -39,6 +39,8 @@ When a `plan_questions` question allows custom answers, the wizard shows:
 
 The agent answer can be accepted directly or edited before use.
 
+When the user accepts an answer (from any source), the LLM-facing tool result presents it as the user's authoritative decision in a uniform format without internal provenance annotations.  This prevents the plan-writing model from second-guessing whether an agent-accepted answer is "only advisory" — all answers are final.
+
 ## Usage
 
 1. Enable plan mode with `/plan` or `--plan` flag
