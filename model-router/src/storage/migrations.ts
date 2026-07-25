@@ -1,4 +1,4 @@
-import type { DatabaseSync } from "node:sqlite";
+import type { DatabaseSync } from "./sqlite.ts";
 
 export interface RouterMigration {
 	version: number;

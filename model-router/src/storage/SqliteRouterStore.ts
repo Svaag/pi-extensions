@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import { DatabaseSync } from "node:sqlite";
+import { DatabaseSync } from "./sqlite.ts";
 import type { ArmStatistics, QualityLabel, RolloutState, RouteDecision, RouteObservation } from "../core/types.ts";
 import {
 	rolloutScopeKey,
