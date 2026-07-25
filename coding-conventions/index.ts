@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 import {
 	applyRewrites,
 	assembleConventionBlock,
-	buildTrailer,
+	buildTrailerLines,
 	detectEcosystems,
 	DEFAULT_CONFIG,
 	findGitCommitSegments,
@@ -59,6 +59,14 @@ interface SessionState {
 	sessionEnabled: boolean; // toggled via /conventions on|off
 	gitRoot: string | null;
 	conventionsBlock: string;
+	/** Real model ids that produced assistant messages this session (first-seen order). */
+	sessionModels: string[];
+}
+
+/** Record a model id used this session, de-duplicated in first-seen order. */
+function recordSessionModel(state: SessionState, modelId: string): void {
+	if (!modelId || state.sessionModels.includes(modelId)) return;
+	state.sessionModels.push(modelId);
 }
 
 function loadConfig(): { config: ExtensionConfig; errors: string[] } {
@@ -204,6 +212,18 @@ function computeConventionsBlock(config: ConventionsConfig, ecosystems: Ecosyste
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+	// ---- Track real models used during the session ----
+	// The active model (ctx.model) is the virtual router profile (e.g. "balanced")
+	// when routing is enabled, so it cannot tell us which real model produced a
+	// given response. Each assistant message carries the actual model in
+	// message.model; collect those to attribute commits accurately.
+	pi.on("message_end", (event) => {
+		const msg = event.message as { role?: string; model?: unknown };
+		if (msg.role === "assistant" && typeof msg.model === "string" && msg.model.length > 0) {
+			recordSessionModel(state, msg.model);
+		}
+	});
+
 	// ---- Session state ---
 	let state: SessionState = {
 		config: DEFAULT_CONFIG,
@@ -211,6 +231,7 @@ export default function (pi: ExtensionAPI) {
 		sessionEnabled: true,
 		gitRoot: null,
 		conventionsBlock: "",
+		sessionModels: [],
 	};
 
 	// ---- session_start: load config, detect ecosystems ----
@@ -228,6 +249,8 @@ export default function (pi: ExtensionAPI) {
 		// Detect git root + ecosystems
 		state.gitRoot = resolveGitRoot(ctx.cwd);
 		state.ecosystems = [];
+		// Fresh session: reset the recorded models used so far.
+		state.sessionModels = [];
 
 		if (state.gitRoot && config.conventions.ecosystemDetection) {
 			const fs = makeFsAccess(state.gitRoot);
@@ -238,13 +261,17 @@ export default function (pi: ExtensionAPI) {
 		state.conventionsBlock = computeConventionsBlock(config.conventions, state.ecosystems);
 
 		if (ctx.hasUI) {
-			const trailer = buildTrailer(
-				config.attribution,
-				ctx.model?.id,
-			);
+			// Before any model has produced output we can't know the real models
+			// used yet (and the active model is just the router profile id, e.g.
+			// "balanced"). Show the current selection's friendly display name as a
+			// placeholder; once models have responded we list the real model ids.
+			const modelDisplay =
+				state.sessionModels.length > 0
+					? state.sessionModels.join(", ")
+					: (ctx.model?.name ?? ctx.model?.id ?? "unknown");
 
 			const parts: string[] = ["coding-conventions loaded"];
-			if (config.attribution.enabled) parts.push(`trailer: ${trailer}`);
+			if (config.attribution.enabled) parts.push(`models: ${modelDisplay}`);
 			if (config.conventions.enabled) {
 				if (state.ecosystems.length > 0)
 					parts.push(`ecosystems: ${state.ecosystems.join(", ")}`);
@@ -260,17 +287,20 @@ export default function (pi: ExtensionAPI) {
 		if (!state.config.attribution.enabled || !state.sessionEnabled) return;
 		if (!isToolCallEventType("bash", event)) return;
 
-		const trailer = buildTrailer(state.config.attribution, ctx.model?.id);
-		if (!trailer) return;
+		const trailers = buildTrailerLines(state.config.attribution, ctx.model?.id, state.sessionModels);
+		if (trailers.length === 0) return;
 
 		const segments = findGitCommitSegments(event.input.command);
 		if (segments.length === 0) return;
 
-		const rewritten = applyRewrites(event.input.command, segments, trailer);
+		const rewritten = applyRewrites(event.input.command, segments, trailers);
 		event.input.command = rewritten;
 
 		if (ctx.hasUI) {
-			ctx.ui.notify(`Added Assisted-by trailer to ${segments.length} git commit(s)`, "info");
+			ctx.ui.notify(
+				`Added Assisted-by trailer (${trailers.length} model${trailers.length === 1 ? "" : "s"}) to ${segments.length} git commit(s)`,
+				"info",
+			);
 		}
 	});
 
@@ -279,18 +309,18 @@ export default function (pi: ExtensionAPI) {
 		if (!state.config.attribution.enabled || !state.sessionEnabled) return;
 		if (!state.config.attribution.includeUserBash) return;
 
-		const trailer = buildTrailer(state.config.attribution, ctx.model?.id);
-		if (!trailer) return;
+		const trailers = buildTrailerLines(state.config.attribution, ctx.model?.id, state.sessionModels);
+		if (trailers.length === 0) return;
 
 		const segments = findGitCommitSegments(event.command);
 		if (segments.length === 0) return;
 
-		const rewritten = applyRewrites(event.command, segments, trailer);
+		const rewritten = applyRewrites(event.command, segments, trailers);
 		const local = createLocalBashOperations();
 
 		if (ctx.hasUI) {
 			ctx.ui.notify(
-				`Added Assisted-by trailer to ${segments.length} git commit(s)`,
+				`Added Assisted-by trailer (${trailers.length} model${trailers.length === 1 ? "" : "s"}) to ${segments.length} git commit(s)`,
 				"info",
 			);
 		}
@@ -361,8 +391,8 @@ export default function (pi: ExtensionAPI) {
 
 			if (normalized === "trailer") {
 				if (ctx.hasUI) {
-					const trailer = buildTrailer(state.config.attribution, ctx.model?.id);
-					ctx.ui.notify(`Trailer: ${trailer || "(disabled)"}`, "info");
+					const trailers = buildTrailerLines(state.config.attribution, ctx.model?.id, state.sessionModels);
+					ctx.ui.notify(trailers.length ? trailers.join("\n") : "(disabled)", "info");
 				}
 				return;
 			}
@@ -374,7 +404,7 @@ export default function (pi: ExtensionAPI) {
 }
 
 function showStatus(state: SessionState, ctx: ExtensionContext) {
-	const trailer = buildTrailer(state.config.attribution, ctx.model?.id);
+	const trailers = buildTrailerLines(state.config.attribution, ctx.model?.id, state.sessionModels);
 
 	const lines: string[] = [];
 	lines.push(`Enabled: ${state.sessionEnabled ? "yes" : "no (session override)"}`);
@@ -383,7 +413,14 @@ function showStatus(state: SessionState, ctx: ExtensionContext) {
 	lines.push("");
 	lines.push("--- Attribution ---");
 	lines.push(`Active: ${state.config.attribution.enabled ? "yes" : "no"}`);
-	lines.push(`Trailer: ${trailer || "(disabled)"}`);
+	lines.push(`Active model: ${ctx.model?.id ?? "(unknown)"}`);
+	lines.push(`Models used this session: ${state.sessionModels.length > 0 ? state.sessionModels.join(", ") : "(none yet)"}`);
+	if (trailers.length > 0) {
+		lines.push("Trailer:");
+		for (const t of trailers) lines.push(`  ${t}`);
+	} else {
+		lines.push(`Trailer: (disabled)`);
+	}
 	lines.push(`User-bash: ${state.config.attribution.includeUserBash ? "yes" : "no"}`);
 	lines.push(`Model version: ${state.config.attribution.modelVersion}`);
 

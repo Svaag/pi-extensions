@@ -45,7 +45,7 @@ export const DEFAULT_CONFIG: ExtensionConfig = {
 	},
 };
 
-const VALID_VALUE_RE = /^[A-Za-z0-9 ._:/\-]+$/;
+const VALID_VALUE_RE = /^[A-Za-z0-9 ._:/,-]+$/;
 
 function isValidValue(v: string): boolean {
 	return VALID_VALUE_RE.test(v);
@@ -111,11 +111,50 @@ export function parseConfig(raw: unknown): { config: ExtensionConfig; errors: st
  * Build the Assisted-by trailer string per kernel doc format.
  * Example: "Assisted-by: pi-coding-agent:claude-opus-4-5 coccinelle sparse"
  */
-export function buildTrailer(cfg: AttributionConfig, modelId: string | undefined): string {
-	if (!cfg.enabled) return "";
-	const version = cfg.modelVersion === "auto" ? (modelId || "unknown") : cfg.modelVersion;
+/**
+ * Resolve the model-version token(s) used in the Assisted-by trailer.
+ *
+ * - Static `modelVersion`: a single pinned token.
+ * - "auto": the real models used during the session (first-seen order). This is
+ *   what makes the trailer reflect the actual model(s) routed to, instead of a
+ *   virtual router profile id like "balanced". Falls back to the active model id
+ *   when no session models have been recorded yet (e.g. before the first model
+ *   response).
+ */
+export function resolveTrailerVersions(
+	cfg: AttributionConfig,
+	modelId: string | undefined,
+	sessionModels?: string[],
+): string[] {
+	if (cfg.modelVersion !== "auto") return [cfg.modelVersion];
+	if (sessionModels && sessionModels.length > 0) return [...sessionModels];
+	return [modelId || "unknown"];
+}
+
+/**
+ * Build one Assisted-by trailer line per model used this session, in Linux-kernel
+ * style (one trailer per contributor). Tools are attached to the first line only.
+ */
+export function buildTrailerLines(
+	cfg: AttributionConfig,
+	modelId: string | undefined,
+	sessionModels?: string[],
+): string[] {
+	if (!cfg.enabled) return [];
+	const versions = resolveTrailerVersions(cfg, modelId, sessionModels);
 	const toolsPart = cfg.tools.length > 0 ? " " + cfg.tools.join(" ") : "";
-	return `Assisted-by: ${cfg.agentName}:${version}${toolsPart}`;
+	return versions.map((v, i) => {
+		const suffix = i === 0 ? toolsPart : "";
+		return `Assisted-by: ${cfg.agentName}:${v}${suffix}`;
+	});
+}
+
+export function buildTrailer(
+	cfg: AttributionConfig,
+	modelId: string | undefined,
+	sessionModels?: string[],
+): string {
+	return buildTrailerLines(cfg, modelId, sessionModels).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -396,31 +435,44 @@ function consumeGitGlobalOptions(s: string, pos: number, end: number): number {
 }
 
 /**
- * Apply rewrite positions to a command string, inserting -c trailer.ifExists=doNothing
- * and --trailer flags. Trailer value is single-quoted, with any internal single quotes escaped.
+ * Apply rewrite positions to a command string, inserting -c trailer.ifExists=addIfDifferent
+ * and one --trailer flag per model line. Trailer values are single-quoted, with any
+ * internal single quotes escaped.
+ *
+ * `addIfDifferent` (rather than `doNothing`) keeps the trailer idempotent across
+ * --amend while still allowing several distinct Assisted-by lines (one per model
+ * used this session) to be added to a single commit.
  */
 export function applyRewrites(
 	command: string,
 	segments: CommandRewrite[],
-	trailer: string,
+	trailer: string | string[],
 ): string {
 	if (segments.length === 0) return command;
 
-	// Escape single quotes in trailer value: replace ' with '\'' (close quote, escaped quote, reopen)
-	const escapedTrailer = trailer.replace(/'/g, "'\\''");
+	// Normalize to an array of trailer lines.
+	const lines = Array.isArray(trailer) ? trailer : [trailer];
+
+	// Build the combined --trailer insertion (one flag per line, in order).
+	const insert = lines
+		.map((line) => {
+			// Escape single quotes in trailer value: replace ' with '\'' (close quote, escaped quote, reopen)
+			const escaped = line.replace(/'/g, "'\\''");
+			return ` --trailer '${escaped}'`;
+		})
+		.join("");
 
 	// Sort segments by insertion positions descending so earlier insertions don't shift later ones
 	const sorted = [...segments].sort((a, b) => b.configInsertPos - a.configInsertPos);
 
 	let result = command;
 	for (const seg of sorted) {
-		// Insert --trailer after 'commit' (before the trailer insert goes after config insert, but we process
-		// trailerInsertPos first since it's later in the string)
-		const trailerInsert = ` --trailer '${escapedTrailer}'`;
-		result = result.slice(0, seg.trailerInsertPos) + trailerInsert + result.slice(seg.trailerInsertPos);
+		// Insert --trailer after 'commit' (note: trailerInsertPos is later in the string,
+		// so we process it before the config insert to keep offsets stable)
+		result = result.slice(0, seg.trailerInsertPos) + insert + result.slice(seg.trailerInsertPos);
 
 		// Insert -c flag right before 'commit'
-		result = result.slice(0, seg.configInsertPos) + "-c trailer.ifExists=doNothing " + result.slice(seg.configInsertPos);
+		result = result.slice(0, seg.configInsertPos) + "-c trailer.ifExists=addIfDifferent " + result.slice(seg.configInsertPos);
 	}
 
 	return result;

@@ -4,11 +4,13 @@ import {
 	applyRewrites,
 	assembleConventionBlock,
 	buildTrailer,
+	buildTrailerLines,
 	detectEcosystems,
 	DEFAULT_CONFIG,
 	findGitCommitSegments,
 	parseConfig,
 	resolveConventionLayer,
+	resolveTrailerVersions,
 	type ConventionLayer,
 	type Ecosystem,
 	type FsAccess,
@@ -163,6 +165,50 @@ test("buildTrailer with custom agentName", () => {
 });
 
 // ---------------------------------------------------------------------------
+// resolveTrailerVersions / buildTrailerLines
+// ---------------------------------------------------------------------------
+
+test("resolveTrailerVersions auto uses active model when no session models", () => {
+	const cfg = { ...DEFAULT_CONFIG.attribution };
+	assert.deepStrictEqual(resolveTrailerVersions(cfg, "balanced", []), ["balanced"]);
+	assert.deepStrictEqual(resolveTrailerVersions(cfg, undefined, []), ["unknown"]);
+});
+
+test("resolveTrailerVersions auto lists all session models in first-seen order", () => {
+	const cfg = { ...DEFAULT_CONFIG.attribution };
+	const result = resolveTrailerVersions(cfg, "balanced", ["anthropic/claude-sonnet-4-5", "openai/gpt-5"]);
+	assert.deepStrictEqual(result, ["anthropic/claude-sonnet-4-5", "openai/gpt-5"]);
+});
+
+test("resolveTrailerVersions static ignores session models", () => {
+	const cfg = { ...DEFAULT_CONFIG.attribution, modelVersion: "pinned-v1" };
+	assert.deepStrictEqual(resolveTrailerVersions(cfg, "balanced", ["a", "b"]), ["pinned-v1"]);
+});
+
+test("buildTrailerLines emits one Assisted-by per model (kernel style)", () => {
+	const cfg = { ...DEFAULT_CONFIG.attribution };
+	const lines = buildTrailerLines(cfg, "balanced", ["anthropic/claude-sonnet-4-5", "openai/gpt-5"]);
+	assert.deepStrictEqual(lines, [
+		"Assisted-by: pi-coding-agent:anthropic/claude-sonnet-4-5",
+		"Assisted-by: pi-coding-agent:openai/gpt-5",
+	]);
+});
+
+test("buildTrailerLines attaches tools only to the first line", () => {
+	const cfg = { ...DEFAULT_CONFIG.attribution, tools: ["coccinelle", "sparse"] };
+	const lines = buildTrailerLines(cfg, "balanced", ["a", "b"]);
+	assert.deepStrictEqual(lines, [
+		"Assisted-by: pi-coding-agent:a coccinelle sparse",
+		"Assisted-by: pi-coding-agent:b",
+	]);
+});
+
+test("buildTrailerLines returns empty when disabled", () => {
+	const cfg = { ...DEFAULT_CONFIG.attribution, enabled: false };
+	assert.deepStrictEqual(buildTrailerLines(cfg, "x", ["a", "b"]), []);
+});
+
+// ---------------------------------------------------------------------------
 // findGitCommitSegments — basic cases
 // ---------------------------------------------------------------------------
 
@@ -286,7 +332,7 @@ test("applyRewrites inserts trailer and dedup flag", () => {
 		"Assisted-by: pi-coding-agent:claude-opus-4-5",
 	);
 	// Should contain the dedup flag and the trailer flag
-	assert.match(result, /-c trailer\.ifExists=doNothing/);
+	assert.match(result, /-c trailer\.ifExists=addIfDifferent/);
 	assert.match(result, /--trailer 'Assisted-by: pi-coding-agent:claude-opus-4-5'/);
 	// Original args preserved
 	assert.match(result, /-m "hello"/);
@@ -316,12 +362,27 @@ test("applyRewrites handles global options", () => {
 		"Assisted-by: agent:model",
 	);
 	// -c for dedup inserted before commit
-	assert.match(result, /git -C \/tmp -c user\.name=x -c trailer\.ifExists=doNothing commit --trailer/);
+	assert.match(result, /git -C \/tmp -c user\.name=x -c trailer\.ifExists=addIfDifferent commit --trailer/);
 });
 
 test("applyRewrites with empty segments returns original", () => {
 	const result = applyRewrites("echo hello", [], "Assisted-by: x");
 	assert.equal(result, "echo hello");
+});
+
+test("applyRewrites accepts multiple trailer lines (one --trailer each)", () => {
+	const segments = findGitCommitSegments('git commit -m "hello"');
+	assert.equal(segments.length, 1);
+	const result = applyRewrites(
+		'git commit -m "hello"',
+		segments,
+		["Assisted-by: pi-coding-agent:a", "Assisted-by: pi-coding-agent:b"],
+	);
+	const trailerCount = (result.match(/--trailer/g) || []).length;
+	assert.equal(trailerCount, 2);
+	// Both models appear, in order
+	assert.match(result, /--trailer 'Assisted-by: pi-coding-agent:a' --trailer 'Assisted-by: pi-coding-agent:b'/);
+	assert.match(result, /-c trailer\.ifExists=addIfDifferent/);
 });
 
 test("applyRewrites escapes single quotes in trailer", () => {

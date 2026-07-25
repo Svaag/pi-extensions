@@ -12,8 +12,21 @@ Intercepts every `git commit` command run through Pi (both agent `bash` tool cal
 Assisted-by: pi-coding-agent:claude-opus-4-5
 ```
 
-- Uses the **active model id** at commit time — automatically reflects `/model` switches.
-- Deduplicates via `trailer.ifExists=doNothing` — safe to `--amend`.
+When more than one model produced assistant responses during the session, one
+`Assisted-by` line is added per model (Linux-kernel style — one trailer per
+contributor):
+
+```
+Assisted-by: pi-coding-agent:anthropic/claude-sonnet-4-5
+Assisted-by: pi-coding-agent:openai/gpt-5
+```
+
+- Attributes the **real model(s) used this session**, tracked from each assistant
+  message's `model` field — so with the model-router the trailer lists the actual
+  routed model(s) (e.g. `anthropic/claude-sonnet-4-5`) instead of the virtual
+  profile id (`balanced`).
+- Deduplicates via `trailer.ifExists=addIfDifferent` — safe to `--amend`, while
+  still allowing several distinct model lines on one commit.
 - Skips commands that already contain `Assisted-by` (idempotent).
 - Covers subagent/swarm commits (global install → child Pi processes inherit the extension).
 
@@ -66,7 +79,7 @@ Optional: `~/.pi/agent/coding-conventions.json` (created automatically with defa
 | `attribution.enabled` | `true` | Master toggle for the commit trailer |
 | `attribution.agentName` | `"pi-coding-agent"` | AGENT_NAME in the trailer |
 | `attribution.tools` | `[]` | Optional specialized analysis tools (space-separated, per kernel doc) |
-| `attribution.modelVersion` | `"auto"` | `"auto"` uses the active model id; pin a static string otherwise |
+| `attribution.modelVersion` | `"auto"` | `"auto"` lists the real model(s) used this session (one `Assisted-by` line each); pin a static string to override |
 | `attribution.includeUserBash` | `true` | Also rewrite `!git commit` typed in the TUI |
 | `conventions.enabled` | `true` | Master toggle for convention injection |
 | `conventions.global` | `true` | Inject the global base layer |
