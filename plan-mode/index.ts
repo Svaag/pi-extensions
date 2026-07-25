@@ -1426,7 +1426,8 @@ If you only partially complete the plan, include exactly which step numbers are 
 				// ctx.newSession is only available in ExtensionCommandContext, not event handlers.
 				// Hand off to the /plan-start-empty-context command so the replacement runs safely.
 				pendingEmptyContextPlanPath = savedPlanPath;
-				pi.sendUserMessage("/plan-start-empty-context");
+				// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
+				pi.sendUserMessage("/plan-start-empty-context", { deliverAs: "followUp" });
 				return;
 			}
 
@@ -1450,15 +1451,17 @@ If you only partially complete the plan, include exactly which step numbers are 
 				persistState();
 
 				const execMessage = `Execute the plan saved at ${savedPlanPath}. Start with: ${todoItems[0].text}`;
+				// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
 				pi.sendMessage(
 					{ customType: "plan-mode-execute", content: execMessage, display: true },
-					{ triggerTurn: true },
+					{ triggerTurn: true, deliverAs: "followUp" },
 				);
 				ctx.ui.notify("Started implementation in the current session. Use /todos to view or repair progress.", "info");
 			} else if (choice?.startsWith("Refine the plan")) {
 				const refinement = await ctx.ui.editor("Provide feedback to refine the plan:", "");
 				if (refinement?.trim()) {
-					pi.sendUserMessage(refinement.trim());
+					// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
+					pi.sendUserMessage(refinement.trim(), { deliverAs: "followUp" });
 				}
 			} else {
 				ctx.ui.notify("Plan accepted UI dismissed; staying in Plan Mode with the proposed plan available for refinement.", "info");

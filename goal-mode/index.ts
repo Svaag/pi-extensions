@@ -189,10 +189,12 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					return;
 				}
 				enterGoalMode(input.trim(), ctx);
-				pi.sendUserMessage(input.trim());
+				// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
+				pi.sendUserMessage(input.trim(), { deliverAs: "followUp" });
 			} else {
 				enterGoalMode(goal, ctx);
-				pi.sendUserMessage(goal);
+				// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
+				pi.sendUserMessage(goal, { deliverAs: "followUp" });
 			}
 		},
 	});
