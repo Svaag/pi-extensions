@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	buildPersistentGoalContext,
 	buildPlanModeCoordinationPrompt,
 	extractProgressItems,
+	getGoalDeliveryMode,
+	GOAL_MODE_CONTEXT_TYPE,
 	isGoalCompleteSignal,
 	mergeProgressItems,
+	replaceGoalModeContext,
 } from "../goal-mode/utils.ts";
 
 test("extractProgressItems extracts done and pending checklist items", () => {
@@ -36,11 +40,48 @@ test("mergeProgressItems preserves done status and merges case-insensitively", (
 	]);
 });
 
-test("isGoalCompleteSignal recognizes completion markers", () => {
+test("isGoalCompleteSignal recognizes only whole-goal completion markers", () => {
 	assert.equal(isGoalCompleteSignal("[GOAL COMPLETE]"), true);
 	assert.equal(isGoalCompleteSignal("[TASK COMPLETE]"), true);
 	assert.equal(isGoalCompleteSignal("Goal complete."), true);
+	assert.equal(isGoalCompleteSignal("Delivered and verified.\n[GOAL COMPLETE]"), true);
+	assert.equal(isGoalCompleteSignal("[DONE] Add tests"), false);
+	assert.equal(isGoalCompleteSignal('Do not say "Goal complete." until verification.'), false);
 	assert.equal(isGoalCompleteSignal("Still working."), false);
+});
+
+test("buildPersistentGoalContext identifies the authoritative persisted goal", () => {
+	const context = buildPersistentGoalContext("Ship the Redis rate limiter", 3);
+
+	assert.match(context, /Active Goal \(persisted by Goal Mode\)/);
+	assert.match(context, /Revision: 3/);
+	assert.match(context, /Ship the Redis rate limiter/);
+	assert.match(context, /remains active across turns, tool calls, and context compaction/);
+	assert.match(context, /Only include \[GOAL COMPLETE\]/);
+});
+
+test("replaceGoalModeContext replaces stale contexts after a context rebuild", () => {
+	const latest = { role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 3" };
+	const messages = replaceGoalModeContext(
+		[
+			{ role: "compactionSummary", content: "older work" },
+			{ role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 1" },
+			{ role: "user", content: "continue" },
+			{ role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 2" },
+		],
+		latest,
+	);
+
+	assert.deepEqual(messages, [
+		{ role: "compactionSummary", content: "older work" },
+		{ role: "user", content: "continue" },
+		latest,
+	]);
+});
+
+test("getGoalDeliveryMode steers busy agents and starts immediately when idle", () => {
+	assert.equal(getGoalDeliveryMode(false), "steer");
+	assert.equal(getGoalDeliveryMode(true), "immediate");
 });
 
 test("buildPlanModeCoordinationPrompt points to the first unfinished plan step", () => {
