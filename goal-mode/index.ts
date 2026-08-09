@@ -1,8 +1,8 @@
 /**
  * Goal Mode Extension — Codex "execute" collaboration style for Pi.
  *
- * /goal <description>   Enter execute (goal) mode and begin autonomous work.
- * /no-goal              Exit goal mode.
+ * /goal <description>   Start or replace a persistent autonomous goal.
+ * /goal, /no-goal       Exit goal mode when active.
  * /goal-status          Show current goal and progress.
  *
  * In goal mode the agent executes end-to-end, makes assumptions when
@@ -18,10 +18,14 @@ import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Key } from "@earendil-works/pi-tui";
 import {
+	buildPersistentGoalContext,
 	buildPlanModeCoordinationPrompt,
 	extractProgressItems,
+	getGoalDeliveryMode,
+	GOAL_MODE_CONTEXT_TYPE,
 	isGoalCompleteSignal,
 	mergeProgressItems,
+	replaceGoalModeContext,
 	type PlanModeState,
 } from "./utils.js";
 
@@ -86,7 +90,7 @@ function getTextContent(message: AssistantMessage): string {
 }
 
 function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
-	const entries = ctx.sessionManager.getEntries();
+	const entries = ctx.sessionManager.getBranch();
 	const planEntry = entries
 		.filter((e: any) => e.type === "custom" && e.customType === "plan-mode")
 		.pop() as any;
@@ -102,13 +106,16 @@ function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
 export default function goalModeExtension(pi: ExtensionAPI): void {
 	let goalModeEnabled = false;
 	let currentGoal = "";
+	let goalRevision = 0;
 	let turnCount = 0;
+	let turnGoalRevision: number | undefined;
 	let progressItems: { text: string; done: boolean }[] = [];
 
 	function persistState(): void {
 		pi.appendEntry("goal-mode", {
 			enabled: goalModeEnabled,
 			goal: currentGoal,
+			revision: goalRevision,
 			turns: turnCount,
 			progress: progressItems,
 		});
@@ -118,7 +125,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		if (goalModeEnabled && currentGoal) {
 			ctx.ui.setStatus(
 				"goal-mode",
-				ctx.ui.theme.fg("accent", "⚡ goal"),
+				ctx.ui.theme.fg("accent", "⚡ goal • persisted"),
 			);
 		} else {
 			ctx.ui.setStatus("goal-mode", undefined);
@@ -127,6 +134,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		if (goalModeEnabled && currentGoal) {
 			const lines: string[] = [
 				ctx.ui.theme.fg("accent", "Goal: ") + currentGoal,
+				ctx.ui.theme.fg("dim", "Persisted in this session • re-injected after compaction"),
 			];
 			if (turnCount > 0) {
 				lines.push(ctx.ui.theme.fg("dim", `Turns: ${turnCount}`));
@@ -154,16 +162,51 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	function enterGoalMode(goal: string, ctx: ExtensionContext): void {
 		goalModeEnabled = true;
 		currentGoal = goal;
+		goalRevision++;
 		turnCount = 0;
+		turnGoalRevision = undefined;
 		progressItems = [];
 		persistState();
 		updateStatus(ctx);
+	}
+
+	function submitGoal(goal: string, ctx: ExtensionContext): void {
+		const replacing = goalModeEnabled;
+		const deliveryMode = getGoalDeliveryMode(ctx.isIdle());
+		enterGoalMode(goal, ctx);
+
+		const submission = [
+			`Goal Mode revision ${goalRevision}${replacing ? " (replaces the previous goal)" : ""}:`,
+			goal,
+		].join("\n\n");
+
+		try {
+			if (deliveryMode === "steer") {
+				// Steer the active run at its next model call instead of waiting for the
+				// entire existing task to finish.
+				pi.sendUserMessage(submission, { deliverAs: "steer" });
+			} else {
+				pi.sendUserMessage(submission);
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			ctx.ui.notify(`Goal was persisted, but delivery failed: ${message}`, "error");
+			return;
+		}
+
+		const action = replacing ? "replaced" : "saved";
+		const delivery = deliveryMode === "steer" ? "sent to the running agent" : "started";
+		ctx.ui.notify(
+			`Goal ${action} and ${delivery}. It will be re-injected after compaction.`,
+			"info",
+		);
 	}
 
 	function exitGoalMode(ctx: ExtensionContext): void {
 		goalModeEnabled = false;
 		currentGoal = "";
 		turnCount = 0;
+		turnGoalRevision = undefined;
 		progressItems = [];
 		persistState();
 		updateStatus(ctx);
@@ -172,37 +215,35 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	// ── /goal command ──────────────────────────────────────────────────────────
 
 	pi.registerCommand("goal", {
-		description: "Toggle goal (execute) mode",
+		description: "Set or replace a persistent autonomous goal (bare /goal exits)",
 		handler: async (args, ctx) => {
-			// Toggle: if already active, exit cleanly
+			const goal = args.trim();
+
+			// A goal argument always starts or replaces the active goal. Keep the
+			// toggle behavior only for a bare /goal while already active.
+			if (goal) {
+				submitGoal(goal, ctx);
+				return;
+			}
 			if (goalModeEnabled) {
 				exitGoalMode(ctx);
 				ctx.ui.notify("Goal mode exited. Collaboration style restored.", "info");
 				return;
 			}
 
-			const goal = args.trim();
-			if (!goal) {
-				const input = await ctx.ui.input("Goal:", "Describe the task you want executed autonomously");
-				if (!input?.trim()) {
-					ctx.ui.notify("No goal provided. Goal mode not activated.", "warning");
-					return;
-				}
-				enterGoalMode(input.trim(), ctx);
-				// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
-				pi.sendUserMessage(input.trim(), { deliverAs: "followUp" });
-			} else {
-				enterGoalMode(goal, ctx);
-				// Queue behind any in-flight agent run instead of racing the runtime prompt queue.
-				pi.sendUserMessage(goal, { deliverAs: "followUp" });
+			const input = await ctx.ui.input("Goal:", "Describe the task you want executed autonomously");
+			if (!input?.trim()) {
+				ctx.ui.notify("No goal provided. Goal mode not activated.", "warning");
+				return;
 			}
+			submitGoal(input.trim(), ctx);
 		},
 	});
 
 	// ── /no-goal command (legacy alias) ────────────────────────────────────────
 
 	pi.registerCommand("no-goal", {
-		description: "Exit goal mode (legacy alias; /goal toggles)",
+		description: "Exit goal mode (legacy alias; bare /goal also exits)",
 		handler: async (_args, ctx) => {
 			if (!goalModeEnabled) {
 				ctx.ui.notify("Not in goal mode.", "info");
@@ -225,8 +266,10 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 			const doneCount = progressItems.filter((i) => i.done).length;
 			const status = [
 				`Goal: ${currentGoal}`,
+				`Revision: ${goalRevision}`,
 				`Turns: ${turnCount}`,
 				`Progress: ${doneCount}/${progressItems.length}`,
+				"Persistence: saved in this session and re-injected on every model call",
 			].join("\n");
 			ctx.ui.notify(status, "info");
 		},
@@ -251,27 +294,38 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!goalModeEnabled) return;
 
-		// Append the execute collaboration-style instructions to the system prompt
+		// Append the execute collaboration-style instructions to the system prompt.
 		let systemPrompt = event.systemPrompt + "\n\n" + EXECUTE_SYSTEM_PROMPT;
 
-		// Coordinate with active plan-mode todos so progress keeps updating
+		// Coordinate with active plan-mode todos so progress keeps updating.
 		const planState = getPlanModeState(ctx);
 		if (planState) {
 			systemPrompt += "\n\n" + buildPlanModeCoordinationPrompt(planState);
 		}
 
-		return { systemPrompt };
+		return {
+			systemPrompt,
+			// Store a durable context checkpoint for this run. The context hook below
+			// canonicalizes these checkpoints to the latest revision before each call.
+			message: {
+				customType: GOAL_MODE_CONTEXT_TYPE,
+				content: buildPersistentGoalContext(currentGoal, goalRevision),
+				display: false,
+				details: { revision: goalRevision },
+			},
+		};
 	});
 
 	// ── turn tracking ──────────────────────────────────────────────────────────
 
 	pi.on("turn_start", async (_event, _ctx) => {
-		if (!goalModeEnabled) return;
+		turnGoalRevision = goalModeEnabled ? goalRevision : undefined;
+		if (turnGoalRevision === undefined) return;
 		turnCount++;
 	});
 
 	pi.on("turn_end", async (event, ctx) => {
-		if (!goalModeEnabled) return;
+		if (!goalModeEnabled || turnGoalRevision !== goalRevision) return;
 		if (!isAssistantMessage(event.message)) return;
 
 		const text = getTextContent(event.message);
@@ -289,7 +343,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 	// ── agent_end: auto-exit on completion signal ──────────────────────────────
 
 	pi.on("agent_end", async (event, ctx) => {
-		if (!goalModeEnabled) return;
+		if (!goalModeEnabled || turnGoalRevision !== goalRevision) return;
 
 		// Check if the assistant signaled goal/task completion
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
@@ -310,24 +364,28 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// ── filter stale goal context when not in goal mode ────────────────────────
+	// ── keep exactly one authoritative goal in every model context ─────────────
 
 	pi.on("context", async (event) => {
-		if (goalModeEnabled) return;
+		const activeContext: AgentMessage | undefined =
+			goalModeEnabled && currentGoal
+				? {
+						role: "custom",
+						customType: GOAL_MODE_CONTEXT_TYPE,
+						content: buildPersistentGoalContext(currentGoal, goalRevision),
+						display: false,
+						details: { revision: goalRevision },
+						timestamp: Date.now(),
+					}
+				: undefined;
 
-		return {
-			messages: event.messages.filter((m) => {
-				const msg = m as AgentMessage & { customType?: string };
-				if (msg.customType === "goal-mode-context") return false;
-				return true;
-			}),
-		};
+		return { messages: replaceGoalModeContext(event.messages, activeContext) };
 	});
 
 	// ── session start: restore state ───────────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
-		const entries = ctx.sessionManager.getEntries();
+		const entries = ctx.sessionManager.getBranch();
 		const goalEntry = entries
 			.filter(
 				(e: { type: string; customType?: string }) =>
@@ -338,6 +396,7 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 					data?: {
 						enabled: boolean;
 						goal?: string;
+						revision?: number;
 						turns?: number;
 						progress?: { text: string; done: boolean }[];
 					};
@@ -347,12 +406,16 @@ export default function goalModeExtension(pi: ExtensionAPI): void {
 		if (goalEntry?.data) {
 			goalModeEnabled = goalEntry.data.enabled;
 			currentGoal = goalEntry.data.goal ?? "";
+			goalRevision = goalEntry.data.revision ?? (goalModeEnabled ? 1 : 0);
 			turnCount = goalEntry.data.turns ?? 0;
+			turnGoalRevision = undefined;
 			progressItems = goalEntry.data.progress ?? [];
 		} else {
 			goalModeEnabled = false;
 			currentGoal = "";
+			goalRevision = 0;
 			turnCount = 0;
+			turnGoalRevision = undefined;
 			progressItems = [];
 		}
 

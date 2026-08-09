@@ -3,8 +3,40 @@
  * Extracted for testability without loading Pi extension runtime packages.
  */
 
-/** Tag that signals the agent considers the goal complete. */
-const GOAL_COMPLETE_PATTERN = /\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|\[DONE\]|Goal complete\./i;
+/** Message type used for the authoritative, LLM-visible goal context. */
+export const GOAL_MODE_CONTEXT_TYPE = "goal-mode-context";
+
+/** Unambiguous tags that signal the agent considers the whole goal complete. */
+const GOAL_COMPLETE_PATTERN = /^\s*(?:\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|Goal complete\.)\s*$/im;
+
+/** Choose how a submitted goal reaches the agent. */
+export function getGoalDeliveryMode(isIdle: boolean): "immediate" | "steer" {
+	return isIdle ? "immediate" : "steer";
+}
+
+/** Remove stale goal contexts and optionally append the authoritative one. */
+export function replaceGoalModeContext<T>(messages: readonly T[], activeContext?: T): T[] {
+	const filtered = messages.filter(
+		(message) =>
+			(message as { customType?: unknown }).customType !== GOAL_MODE_CONTEXT_TYPE,
+	);
+	if (activeContext !== undefined) filtered.push(activeContext);
+	return filtered;
+}
+
+/** Build the authoritative context re-injected for every model call. */
+export function buildPersistentGoalContext(goal: string, revision: number): string {
+	return [
+		"## Active Goal (persisted by Goal Mode)",
+		`Revision: ${revision}`,
+		"",
+		goal,
+		"",
+		"This is the authoritative active goal. It supersedes earlier Goal Mode goals and remains active across turns, tool calls, and context compaction.",
+		"Continue executing it independently. Do not treat a compaction summary or the end of one turn as completion.",
+		"Only include [GOAL COMPLETE] after the entire goal has been delivered and verified.",
+	].join("\n");
+}
 
 export interface PlanModeState {
 	executing: boolean;
