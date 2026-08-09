@@ -14,11 +14,13 @@ export function renderAgentList(summaries: AgentSummary[], theme: any, expanded 
 		const meta = [duration, output ? `${output} out` : "", expanded && route ? `routed:${route}` : ""].filter(Boolean).join(" · ");
 		const label = expanded ? summary.taskPath : shortTaskLabel(summary.taskPath);
 		lines.push(`${icon} ${theme.fg("accent", label)} ${theme.fg("muted", `[${summary.status}]`)}${meta ? ` ${theme.fg("dim", meta)}` : ""}`.trim());
-		if (summary.summary) {
+		if (expanded && summary.output) {
+			lines.push(summary.output);
+		} else if (summary.summary) {
 			const brief = expanded ? summary.summary : `${summary.summary.replace(/\s+/g, " ").slice(0, 180)}${summary.summary.length > 180 ? "…" : ""}`;
 			lines.push(`  ${expanded ? brief : theme.fg("dim", brief)}`);
 		} else if (summary.error) lines.push(`  ${theme.fg("error", summary.error)}`);
-		else if (expanded && summary.outputTail) lines.push(`  ${theme.fg("dim", summary.outputTail.replace(/\s+/g, " ").slice(0, 300))}`);
+		else if (expanded && summary.outputTail) lines.push(summary.outputTail);
 		if (expanded) lines.push(`  ${theme.fg("dim", `${summary.agentId} · parent=${summary.parentAgentId ?? "root"} · ${summary.controllable ? "controllable" : "not controllable"}`)}`);
 	}
 	return new Text(lines.join("\n"), 0, 0);
