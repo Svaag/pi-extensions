@@ -2,7 +2,7 @@ import type { AgentProcessState, AgentStatus, ComplexityTier, ContextMode, Routi
 
 export type TelemetryOutcome = "succeeded" | "failed" | "interrupted" | "cancelled" | "lost" | "closed" | "timeout" | "unknown";
 export type TelemetryTurnKind = "initial" | "live_followup" | "spawned_followup" | "recovery";
-export type TelemetryRecoveryType = "context_overflow" | "runtime_timeout" | "compaction";
+export type TelemetryRecoveryType = "context_overflow" | "runtime_timeout" | "compaction" | "provider_retry";
 export type TelemetryMessageKind = "message" | "correction" | "constraint" | "note" | "followup";
 export type TelemetryDeliveryMode = "rpc_steer" | "rpc_follow_up" | "rpc_prompt" | "spawn_followup" | "mailbox_only" | "unavailable";
 export type TelemetryBatchSource = "csv" | "jsonl";

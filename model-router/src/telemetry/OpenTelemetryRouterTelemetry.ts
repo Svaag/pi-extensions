@@ -287,11 +287,9 @@ export class OpenTelemetryRouterTelemetry implements RouterTelemetry {
 	private safe(operation: () => void): void { try { operation(); } catch { this.#health.degraded = true; this.#health.lastErrorCategory = "internal"; this.#health.droppedRecords += 1; } }
 }
 
-const dynamicImport = (specifier: string): Promise<any> => Function("specifier", "return import(specifier)")(specifier);
-
 async function createRuntime(config: OpenTelemetryRouterConfig, exporters: CreateOpenTelemetryRouterOptions["exporters"], health: RouterTelemetryExportHealth): Promise<RouterOpenTelemetryRuntime> {
 	const [api, traceExporterModule, metricExporterModule, resources, metricsSdk, traceSdk, conventions] = await Promise.all([
-		dynamicImport("@opentelemetry/api"), dynamicImport("@opentelemetry/exporter-trace-otlp-http"), dynamicImport("@opentelemetry/exporter-metrics-otlp-http"), dynamicImport("@opentelemetry/resources"), dynamicImport("@opentelemetry/sdk-metrics"), dynamicImport("@opentelemetry/sdk-trace-node"), dynamicImport("@opentelemetry/semantic-conventions"),
+		import("@opentelemetry/api"), import("@opentelemetry/exporter-trace-otlp-http"), import("@opentelemetry/exporter-metrics-otlp-http"), import("@opentelemetry/resources"), import("@opentelemetry/sdk-metrics"), import("@opentelemetry/sdk-trace-node"), import("@opentelemetry/semantic-conventions"),
 	]);
 	const serviceName = normalizeRouterTelemetryLabel(config.serviceName ?? "pi-model-router", 128);
 	const resource = resources.resourceFromAttributes({ [conventions.ATTR_SERVICE_NAME ?? "service.name"]: serviceName, [conventions.ATTR_SERVICE_VERSION ?? "service.version"]: VERSION });

@@ -70,6 +70,18 @@ function executedModelRef(message: any): string | undefined {
 	return provider && !model.startsWith(`${provider}/`) ? `${provider}/${model}` : model;
 }
 
+/** Single-line note shown while the child backs off from a transient provider error (e.g. Mistral 429). */
+export function formatRetryNote(attempt: number, maxAttempts: number, delayMs: number, errorMessage: string | undefined): string {
+	const delaySecs = Number.isFinite(delayMs) ? Math.max(0, delayMs / 1000).toFixed(1) : "?";
+	const reason = errorMessage?.trim() ? `: ${compactErrorSummary(errorMessage)}` : "";
+	return `[Child transient provider error${reason}; retrying in ${delaySecs}s (attempt ${attempt}/${maxAttempts})]`;
+}
+
+function compactErrorSummary(message: string): string {
+	const single = message.replace(/\s+/g, " ").trim();
+	return single.length > 160 ? `${single.slice(0, 157)}…` : single;
+}
+
 export function textFromToolResult(result: any): string {
 	const text = textFromContentParts(result?.content).trimEnd();
 	const fullOutputPath = result?.details?.fullOutputPath;
@@ -319,7 +331,22 @@ export class SubprocessRpcBackend implements AgentBackend {
 						error: event.errorMessage ? new Error(String(event.errorMessage)) : undefined,
 					});
 					compactionStartedAt = undefined;
-					events.onOutput?.(`\n[Child compaction ${status}: ${event.reason ?? "unknown"}${estimate}${error}]\n`);
+					events.onOutput?.("\n[Child compaction " + status + ": " + (event.reason ?? "unknown") + estimate + error + "]\n");
+				}
+				if (event.type === "auto_retry_start") {
+					const attempt = Number(event.attempt ?? 1);
+					const maxAttempts = Number(event.maxAttempts ?? 1);
+					const delayMs = Number(event.delayMs ?? 0);
+					const errorMessage = typeof event.errorMessage === "string" ? event.errorMessage : undefined;
+					observe({ kind: "provider.retry.start", at: Date.now(), attempt, maxAttempts, delayMs, error: new Error(errorMessage ?? "transient provider error") });
+					events.onOutput?.("\n" + formatRetryNote(attempt, maxAttempts, delayMs, errorMessage) + "\n");
+				}
+				if (event.type === "auto_retry_end") {
+					const success = Boolean(event.success);
+					const attempt = Number(event.attempt ?? 0);
+					const finalError = typeof event.finalError === "string" ? event.finalError : undefined;
+					observe({ kind: "provider.retry.end", at: Date.now(), success, attempt, error: success ? undefined : new Error(finalError ?? "retry did not succeed") });
+					if (!success && finalError) events.onOutput?.("\n[Child retry did not recover; " + compactErrorSummary(finalError) + "]\n");
 				}
 				if (event.type === "message_update") {
 					const delta = event.assistantMessageEvent;

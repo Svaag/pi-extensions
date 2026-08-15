@@ -836,6 +836,13 @@ export class AgentManager {
 					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.providerError = true;
 					telemetry.providerError({ agentId, turnId, at: observation.at, error: observation.error });
 					break;
+				case "provider.retry.start":
+					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.providerError = true;
+					telemetry.recovery({ agentId, turnId, type: "provider_retry", phase: "started", at: observation.at, error: observation.error });
+					break;
+				case "provider.retry.end":
+					telemetry.recovery({ agentId, turnId, type: "provider_retry", phase: "completed", at: observation.at, outcome: observation.success ? "succeeded" : "failed", error: observation.error });
+					break;
 			}
 		});
 	}
