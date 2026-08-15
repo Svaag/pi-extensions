@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildSubprocessRpcArgs, isContextWindowError, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
+import { buildSubprocessRpcArgs, formatRetryNote, isChildProcessAlive, isContextWindowError, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
 
 test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	const args = buildSubprocessRpcArgs({
@@ -45,4 +45,22 @@ test("textFromToolResult extracts text content and full-output path", () => {
 		details: { fullOutputPath: "/tmp/full.log" },
 	});
 	assert.equal(text, "hello\nworld\n[Full output saved by child at /tmp/full.log]");
+});
+
+test("formatRetryNote surfaces backoff attempt, delay, and compacted provider error", () => {
+	const note = formatRetryNote(2, 3, 4000, 'Mistral API error (429): {"object":"error","message":"Rate limit exceeded"}');
+	assert.match(note, /\(attempt 2\/3\)/);
+	assert.match(note, /retrying in 4\.0s/);
+	assert.match(note, /Mistral API error \(429\)/);
+	assert.ok(note.length < 200, "note should stay single-line compact");
+});
+
+test("formatRetryNote handles missing error and non-finite delay", () => {
+	assert.match(formatRetryNote(1, 3, Number.NaN, undefined), /\(attempt 1\/3\)/);
+});
+
+test("isChildProcessAlive does not mistake a sent signal for process exit", () => {
+	assert.equal(isChildProcessAlive({ exitCode: null, signalCode: null, killed: true } as any), true);
+	assert.equal(isChildProcessAlive({ exitCode: 0, signalCode: null } as any), false);
+	assert.equal(isChildProcessAlive({ exitCode: null, signalCode: "SIGTERM" } as any), false);
 });

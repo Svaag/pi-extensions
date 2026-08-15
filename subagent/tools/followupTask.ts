@@ -10,7 +10,7 @@ const FollowupTaskParams = Type.Object({
 	agentId: Type.String({ description: "Target agent id." }),
 	prompt: Type.String({ description: "Follow-up task prompt." }),
 	mode: Type.Optional(StringEnum(["live_if_supported", "spawn_followup"] as const, { description: "Use the live child if possible, or spawn a follow-up child when unavailable." })),
-	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Reserved for spawned follow-up context." })),
+	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Sanitized context mode for a spawned follow-up. Defaults to summary." })),
 	spawnRoutingMode: Type.Optional(StringEnum(["inherit", "auto", "off", "explain"] as const, { description: "For mode=spawn_followup: inherit the original model/thinking, reroute, disable routing, or explain only. Defaults to inherit." })),
 	routingProfile: Type.Optional(StringEnum(["balanced", "cost_first", "quality_first", "latency_first"] as const, { description: "Router objective for spawned follow-up rerouting." })),
 	model: Type.Optional(Type.String({ description: "Explicit model override for spawned follow-up agents." })),

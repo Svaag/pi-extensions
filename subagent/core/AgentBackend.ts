@@ -31,7 +31,9 @@ export type BackendObservation =
 	| { kind: "context_overflow.detected"; at: number }
 	| { kind: "context_overflow.recovery"; at: number; phase: "started" | "completed"; success?: boolean; durationMs?: number; error?: Error }
 	| { kind: "rpc.malformed"; at: number; error: Error }
-	| { kind: "provider.error"; at: number; error: Error };
+	| { kind: "provider.error"; at: number; error: Error }
+	| { kind: "provider.retry.start"; at: number; attempt: number; maxAttempts: number; delayMs: number; error: Error }
+	| { kind: "provider.retry.end"; at: number; success: boolean; attempt: number; error?: Error };
 
 export interface AgentBackendEvents {
 	onStarted?: () => void;

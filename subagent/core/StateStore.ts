@@ -34,6 +34,12 @@ function reconcileRecordOnRestore(record: AgentRecord): AgentRecord {
 		restored.controllable = false;
 		restored.updatedAt = nowMs();
 		restored.error = restored.error ?? "Agent was running before extension/session restart and cannot be reattached.";
+	} else if (restored.controllable || restored.processState === "live_idle" || restored.processState === "live_running") {
+		// Terminal history may have belonged to a reusable RPC child, but no
+		// subprocess handle survives a reload or session restart.
+		restored.processState = "unknown";
+		restored.controllable = false;
+		restored.updatedAt = nowMs();
 	}
 	return restored;
 }

@@ -6,7 +6,7 @@ import { resolve } from "node:path";
 import { Type } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "../agents.ts";
 import type { AgentRecord, ContextMode, RoutingMode, RoutingObjective, ThinkingLevel, WriteMode } from "../core/AgentTypes.ts";
-import { sanitizeContextText } from "../core/ContextSanitizer.ts";
+import { buildVisibleSessionContext } from "../core/ContextSanitizer.ts";
 import { renderAgentSummary } from "../render/renderAgent.ts";
 import { type ManagerGetter, downgradeSubagentThinking, parentThinkingLevel, preview, textResult } from "./common.ts";
 import { resolveRouting } from "./router.ts";
@@ -24,9 +24,9 @@ const SpawnAgentCommonParams = {
 	confirmProjectAgents: Type.Optional(Type.Boolean({ description: "Prompt before using project-local agent definitions. Defaults to true." })),
 	agentDefinition: Type.Optional(Type.String({ description: "Inline extra system prompt for this child." })),
 	agentDefinitionFile: Type.Optional(Type.String({ description: "File containing extra system prompt for this child." })),
-	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Context inheritance mode. Defaults to fresh." })),
-	contextTurns: Type.Optional(Type.Number({ description: "Reserved for last_n_turns context mode." })),
-	contextSummary: Type.Optional(Type.String({ description: "Explicit inherited summary when contextMode=summary." })),
+	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Sanitized context inheritance mode. Defaults to fresh." })),
+	contextTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 50, description: "Number of visible user turns inherited by last_n_turns. Defaults to 3." })),
+	contextSummary: Type.Optional(Type.String({ description: "Explicit inherited context text. Sanitized before it reaches the child." })),
 	writeMode: Type.Optional(StringEnum(["read_only", "disjoint_scope", "git_worktree"] as const, { description: "Child write policy. Defaults to read_only." })),
 	allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "Allowed paths for disjoint_scope write mode." })),
 	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task. Values below 300000ms are ignored and use the default 30-minute runtime." })),
@@ -49,33 +49,6 @@ const SpawnAgentParams = Type.Object({
 	tasks: Type.Optional(Type.Array(SpawnAgentTaskParams, { description: "Spawn multiple independent subagents in one tool call. Top-level fields are defaults; per-task fields override them. Prefer this over emitting several spawn_agent calls in one assistant response." })),
 	...SpawnAgentCommonParams,
 });
-
-function textFromMessageContent(content: any): string {
-	if (typeof content === "string") return content;
-	if (!Array.isArray(content)) return "";
-	return content
-		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
-		.map((part: any) => part.text)
-		.join("\n");
-}
-
-function buildVisibleSessionSummary(ctx: any, maxChars = 16_000): string {
-	const entries = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
-	const lines: string[] = [];
-	for (const entry of entries.slice(-24)) {
-		const message = entry?.message;
-		if (!message) continue;
-		if (message.role === "user") {
-			const text = textFromMessageContent(message.content);
-			if (text.trim()) lines.push(`User: ${text.trim()}`);
-		} else if (message.role === "assistant") {
-			const text = textFromMessageContent(message.content);
-			if (text.trim()) lines.push(`Assistant: ${text.trim()}`);
-		}
-	}
-	if (lines.length === 0) return "";
-	return sanitizeContextText(`Recent visible parent conversation excerpt (not hidden reasoning, not tool results):\n\n${lines.join("\n\n")}`, maxChars);
-}
 
 async function resolveAgentDefinition(ctx: any, params: any): Promise<{ definition?: string; agent?: AgentConfig }> {
 	let definition = params.agentDefinition?.trim() || "";
@@ -116,7 +89,9 @@ async function confirmWriteCapability(ctx: any, spawnParams: any[]): Promise<voi
 async function spawnOne(ctx: any, manager: ReturnType<ManagerGetter>, params: any, signal?: AbortSignal): Promise<AgentRecord> {
 	const { definition, agent } = await resolveAgentDefinition(ctx, params);
 	const contextMode = (params.contextMode ?? "fresh") as ContextMode;
-	const contextSummary = params.contextSummary ?? (contextMode === "summary" ? buildVisibleSessionSummary(ctx) : undefined);
+	const branch = typeof ctx.sessionManager?.getBranch === "function" ? ctx.sessionManager.getBranch() : [];
+	const generatedContext = buildVisibleSessionContext(branch, { mode: contextMode, contextTurns: params.contextTurns });
+	const contextSummary = (params.contextSummary ?? generatedContext) || undefined;
 	const explicitModel = params.model ?? agent?.model;
 	const explicitThinkingLevel = (params.thinkingLevel ?? agent?.thinkingLevel) as ThinkingLevel | undefined;
 	const routingMode = (params.routingMode ?? agent?.routingMode) as RoutingMode | undefined;

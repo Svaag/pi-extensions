@@ -30,6 +30,8 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - `edit`/`write` are blocked unless `writeMode: "disjoint_scope"` and the path is under `allowedPaths`.
 - `writeMode: "git_worktree"` is reserved for a later phase and currently rejected.
 - Running agents are killed on session shutdown/reload.
+- Completed RPC children remain reusable for live follow-ups for up to 30 minutes, then close automatically; they are also reaped early when process capacity is needed, and explicit `close_agent` calls release them sooner.
+- Session history has no agent-count cap. Safety limits apply only to queued/running/live child processes, not completed or closed records.
 - Explicit per-agent `timeoutMs` values below 5 minutes are ignored and normalized to the default 30-minute runtime to avoid accidental 120s cutoffs.
 - On runtime timeout, the manager first asks the child to stop tools and emit a partial final summary, then hard-aborts after a bounded recovery grace period while preserving output tails.
 - After restart/reload, previously running agents are reconstructed as `lost`, persisted with explicit `agent.lost` / `graph.edge_lost` events, and not claimed as controllable.
@@ -185,7 +187,7 @@ Project-local agent definitions require confirmation by default.
 
 ### Single research subagent
 
-With `contextMode: "summary"`, the extension includes a capped, sanitized excerpt of recent visible parent conversation when no explicit `contextSummary` is provided. Because `model` and `routingMode` are omitted, the child follows managed rollout (current-model control while the default stage is shadow).
+With `contextMode: "summary"`, the extension includes a capped, sanitized excerpt of recent visible parent conversation when no explicit `contextSummary` is provided. `last_n_turns` selects the requested number of visible user turns, while `full_sanitized` considers the full visible conversation before applying the context cap. Hidden reasoning and tool results are excluded from all generated context. Because `model` and `routingMode` are omitted, the child follows managed rollout (current-model control while the default stage is shadow).
 
 ```json
 {
@@ -281,7 +283,6 @@ Then use:
 - Batch job state is restored after reload, but in-flight queued/running workers are conservatively marked lost/failed rather than resumed.
 - `report_agent_job_result` and output-schema validation are not implemented yet; the MVP records each worker's final summary/output/error.
 - Worktree isolation and merge workflows are not implemented yet.
-- `last_n_turns` and `full_sanitized` context modes are intentionally rejected until a stronger sanitizer/summarizer exists.
 
 ## Install
 

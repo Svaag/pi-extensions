@@ -46,6 +46,20 @@ test("StateStore restore marks previously running agents as lost", () => {
 	assert.deepEqual(restored.lostAgentIds, ["agent_1"]);
 });
 
+test("StateStore restore makes terminal live children uncontrollable", () => {
+	const restored = StateStore.restore([
+		{
+			type: "custom",
+			customType: SUBAGENT_AGENT_STATE_ENTRY,
+			data: { record: { ...record("succeeded"), processState: "live_idle", controllable: true } },
+		},
+	]);
+	assert.equal(restored.records[0].status, "succeeded");
+	assert.equal(restored.records[0].processState, "unknown");
+	assert.equal(restored.records[0].controllable, false);
+	assert.deepEqual(restored.lostAgentIds, []);
+});
+
 test("StateStore restore preserves routing decisions", () => {
 	const r = {
 		...record("succeeded"),

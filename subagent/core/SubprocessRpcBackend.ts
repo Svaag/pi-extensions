@@ -11,6 +11,10 @@ import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 const STDERR_TAIL_CAP = 16_384;
 const TOOL_RESULT_TEXT_CAP = 4_000;
 
+export function isChildProcessAlive(proc: Pick<ChildProcessWithoutNullStreams, "exitCode" | "signalCode">): boolean {
+	return proc.exitCode === null && proc.signalCode === null;
+}
+
 export function isContextWindowError(message: unknown): boolean {
 	if (typeof message !== "string") return false;
 	return /context window|context length|maximum context|too many tokens|input exceeds/i.test(message);
@@ -70,6 +74,18 @@ function executedModelRef(message: any): string | undefined {
 	return provider && !model.startsWith(`${provider}/`) ? `${provider}/${model}` : model;
 }
 
+/** Single-line note shown while the child backs off from a transient provider error (e.g. Mistral 429). */
+export function formatRetryNote(attempt: number, maxAttempts: number, delayMs: number, errorMessage: string | undefined): string {
+	const delaySecs = Number.isFinite(delayMs) ? Math.max(0, delayMs / 1000).toFixed(1) : "?";
+	const reason = errorMessage?.trim() ? `: ${compactErrorSummary(errorMessage)}` : "";
+	return `[Child transient provider error${reason}; retrying in ${delaySecs}s (attempt ${attempt}/${maxAttempts})]`;
+}
+
+function compactErrorSummary(message: string): string {
+	const single = message.replace(/\s+/g, " ").trim();
+	return single.length > 160 ? `${single.slice(0, 157)}…` : single;
+}
+
 export function textFromToolResult(result: any): string {
 	const text = textFromContentParts(result?.content).trimEnd();
 	const fullOutputPath = result?.details?.fullOutputPath;
@@ -120,6 +136,7 @@ class SubprocessRpcHandle implements AgentHandle {
 	private readonly proc: ChildProcessWithoutNullStreams;
 	private readonly rpc: RpcClient;
 	private readonly tempPrompt: { dir: string; filePath: string } | undefined;
+	private closePromise: Promise<void> | undefined;
 
 	constructor(
 		agentId: string,
@@ -155,17 +172,46 @@ class SubprocessRpcHandle implements AgentHandle {
 		if (this.isAlive()) this.proc.kill("SIGTERM");
 	}
 
-	async close(reason?: string): Promise<void> {
-		await this.interrupt(reason);
-		this.rpc.closeInput();
-		setTimeout(() => {
-			if (this.isAlive()) this.proc.kill("SIGKILL");
-		}, 5_000).unref?.();
-		cleanupTemp(this.tempPrompt);
+	close(reason?: string): Promise<void> {
+		if (!this.closePromise) this.closePromise = this.closeProcess(reason);
+		return this.closePromise;
+	}
+
+	private async closeProcess(reason?: string): Promise<void> {
+		try {
+			await this.interrupt(reason);
+			this.rpc.closeInput();
+			await this.waitForExit();
+		} finally {
+			cleanupTemp(this.tempPrompt);
+		}
+	}
+
+	private waitForExit(): Promise<void> {
+		if (!this.isAlive()) return Promise.resolve();
+		return new Promise((resolve) => {
+			let settled = false;
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(killTimeout);
+				clearTimeout(settleTimeout);
+				this.proc.removeListener("close", finish);
+				resolve();
+			};
+			const killTimeout = setTimeout(() => {
+				if (this.isAlive()) this.proc.kill("SIGKILL");
+			}, 5_000);
+			const settleTimeout = setTimeout(finish, 6_000);
+			this.proc.once("close", finish);
+			if (!this.isAlive()) finish();
+		});
 	}
 
 	isAlive(): boolean {
-		return this.proc.exitCode === null && !this.proc.killed;
+		// `ChildProcess.killed` only means a signal was sent. The process may
+		// still be alive and require the delayed SIGKILL fallback.
+		return isChildProcessAlive(this.proc);
 	}
 }
 
@@ -319,7 +365,22 @@ export class SubprocessRpcBackend implements AgentBackend {
 						error: event.errorMessage ? new Error(String(event.errorMessage)) : undefined,
 					});
 					compactionStartedAt = undefined;
-					events.onOutput?.(`\n[Child compaction ${status}: ${event.reason ?? "unknown"}${estimate}${error}]\n`);
+					events.onOutput?.("\n[Child compaction " + status + ": " + (event.reason ?? "unknown") + estimate + error + "]\n");
+				}
+				if (event.type === "auto_retry_start") {
+					const attempt = Number(event.attempt ?? 1);
+					const maxAttempts = Number(event.maxAttempts ?? 1);
+					const delayMs = Number(event.delayMs ?? 0);
+					const errorMessage = typeof event.errorMessage === "string" ? event.errorMessage : undefined;
+					observe({ kind: "provider.retry.start", at: Date.now(), attempt, maxAttempts, delayMs, error: new Error(errorMessage ?? "transient provider error") });
+					events.onOutput?.("\n" + formatRetryNote(attempt, maxAttempts, delayMs, errorMessage) + "\n");
+				}
+				if (event.type === "auto_retry_end") {
+					const success = Boolean(event.success);
+					const attempt = Number(event.attempt ?? 0);
+					const finalError = typeof event.finalError === "string" ? event.finalError : undefined;
+					observe({ kind: "provider.retry.end", at: Date.now(), success, attempt, error: success ? undefined : new Error(finalError ?? "retry did not succeed") });
+					if (!success && finalError) events.onOutput?.("\n[Child retry did not recover; " + compactErrorSummary(finalError) + "]\n");
 				}
 				if (event.type === "message_update") {
 					const delta = event.assistantMessageEvent;
@@ -435,10 +496,13 @@ export class SubprocessRpcBackend implements AgentBackend {
 
 		if (signal) {
 			const abort = () => {
-				if (proc.exitCode === null) proc.kill("SIGTERM");
+				if (isChildProcessAlive(proc)) proc.kill("SIGTERM");
 			};
 			if (signal.aborted) abort();
-			else signal.addEventListener("abort", abort, { once: true });
+			else {
+				signal.addEventListener("abort", abort, { once: true });
+				proc.once("close", () => signal.removeEventListener("abort", abort));
+			}
 		}
 
 		const handle = new SubprocessRpcHandle(record.agentId, proc, rpc, tempPrompt);
@@ -450,6 +514,9 @@ export class SubprocessRpcBackend implements AgentBackend {
 		try {
 			await handle.prompt(userPrompt);
 		} catch (error) {
+			await handle.close("initial prompt failed").catch((closeError) => {
+				events.onOutput?.(`\n[Failed to close child after initial prompt error: ${closeError instanceof Error ? closeError.message : String(closeError)}]\n`);
+			});
 			if (!sawFirstModelOutput && proc.exitCode !== null) {
 				const hostError = error instanceof Error ? error : new Error(String(error));
 				(hostError as Error & { failureDomain?: string }).failureDomain = "host";
