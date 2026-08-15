@@ -22,6 +22,19 @@ export interface SanitizedContextOptions {
 	maxChars?: number;
 }
 
+export interface VisibleSessionEntryLike {
+	message?: {
+		role?: string;
+		content?: unknown;
+	};
+}
+
+export interface VisibleSessionContextOptions {
+	mode: ContextMode;
+	contextTurns?: number;
+	maxChars?: number;
+}
+
 export function redactSecrets(text: string): string {
 	let output = text;
 	for (const [pattern, replacement] of SECRET_PATTERNS) output = output.replace(pattern, replacement);
@@ -41,6 +54,66 @@ export function sanitizeContextText(text: string, maxChars = DEFAULT_CONTEXT_CAP
 	return truncateMiddle(summarized, maxChars);
 }
 
+function textFromMessageContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.filter((part: any) => part?.type === "text" && typeof part.text === "string")
+		.map((part: any) => part.text)
+		.join("\n");
+}
+
+function visibleMessages(entries: VisibleSessionEntryLike[]): Array<{ role: "user" | "assistant"; text: string }> {
+	const messages: Array<{ role: "user" | "assistant"; text: string }> = [];
+	for (const entry of entries) {
+		const role = entry.message?.role;
+		if (role !== "user" && role !== "assistant") continue;
+		const text = textFromMessageContent(entry.message?.content).trim();
+		if (text) messages.push({ role, text });
+	}
+	return messages;
+}
+
+function lastTurns(messages: Array<{ role: "user" | "assistant"; text: string }>, requestedTurns: number | undefined): Array<{ role: "user" | "assistant"; text: string }> {
+	const turns = typeof requestedTurns === "number" && Number.isFinite(requestedTurns) && requestedTurns > 0
+		? Math.min(50, Math.floor(requestedTurns))
+		: 3;
+	let usersSeen = 0;
+	let start = messages.length;
+	for (let index = messages.length - 1; index >= 0; index -= 1) {
+		start = index;
+		if (messages[index]?.role === "user") {
+			usersSeen += 1;
+			if (usersSeen === turns) break;
+		}
+	}
+	return messages.slice(start);
+}
+
+export function buildVisibleSessionContext(entries: VisibleSessionEntryLike[], options: VisibleSessionContextOptions): string {
+	if (options.mode === "fresh") return "";
+	const messages = visibleMessages(entries);
+	if (messages.length === 0) return "";
+
+	let selected = messages;
+	let label = "Visible parent conversation";
+	if (options.mode === "summary") {
+		selected = messages.slice(-24);
+		label = "Recent visible parent conversation excerpt";
+	} else if (options.mode === "last_n_turns") {
+		selected = lastTurns(messages, options.contextTurns);
+		label = "Recent visible parent conversation turns";
+	} else if (options.mode === "full_sanitized") {
+		label = "Sanitized visible parent conversation";
+	}
+
+	const text = selected.map((message) => `${message.role === "user" ? "User" : "Assistant"}: ${message.text}`).join("\n\n");
+	return sanitizeContextText(
+		`${label} (hidden reasoning and tool results omitted):\n\n${text}`,
+		options.maxChars ?? (options.mode === "summary" ? 16_000 : DEFAULT_CONTEXT_CAP),
+	);
+}
+
 function parentRecordContext(records: AgentRecord[] | undefined): string {
 	if (!records?.length) return "";
 	const lines: string[] = [];
@@ -56,9 +129,6 @@ function parentRecordContext(records: AgentRecord[] | undefined): string {
 export function buildInheritedContext(options: SanitizedContextOptions): string {
 	const maxChars = options.maxChars ?? DEFAULT_CONTEXT_CAP;
 	if (options.mode === "fresh") return "";
-	if (options.mode === "last_n_turns" || options.mode === "full_sanitized") {
-		throw new Error(`${options.mode} context is not implemented yet; use fresh or summary for now.`);
-	}
 
 	const parts: string[] = [];
 	if (options.contextSummary?.trim()) parts.push(options.contextSummary.trim());

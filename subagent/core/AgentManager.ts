@@ -165,6 +165,7 @@ export class AgentManager {
 	private readonly waiters = new Set<() => void>();
 	private readonly timeoutHandles = new Map<string, NodeJS.Timeout>();
 	private readonly timeoutRecoveryHandles = new Map<string, NodeJS.Timeout>();
+	private readonly idleCloseHandles = new Map<string, NodeJS.Timeout>();
 	private readonly lastOutputPersistAt = new Map<string, number>();
 	private readonly activeTurnIds = new Map<string, string>();
 	private readonly activeTurnKinds = new Map<string, TelemetryTurnKind>();
@@ -175,10 +176,12 @@ export class AgentManager {
 	private readonly runtimeRecoveryStartedAt = new Map<string, number>();
 	private readonly routeSignals = new Map<string, RouteRuntimeSignals>();
 	private readonly pendingFollowupRoutes = new Map<string, RoutingDecision[]>();
+	private readonly closingAgentIds = new Set<string>();
 	private readonly observedRouteIds = new Set<string>();
 	private readonly telemetry: SubagentTelemetry;
 	private readonly onChange?: (manager: AgentManager) => void;
 	private readonly onRouteTerminal?: AgentManagerOptions["onRouteTerminal"];
+	private shuttingDown = false;
 
 	constructor(options: AgentManagerOptions) {
 		this.backend = options.backend;
@@ -216,10 +219,7 @@ export class AgentManager {
 	}
 
 	async spawnAgent(request: SpawnAgentRequest, signal?: AbortSignal): Promise<AgentRecord> {
-		const now = nowMs();
-		const openCount = [...this.records.values()].filter((record) => record.status !== "closed").length;
-		if (this.records.size >= this.limits.maxAgentsTotal) throw new Error(`maxAgentsTotal reached (${this.limits.maxAgentsTotal})`);
-		if (openCount >= this.limits.maxOpenAgents) throw new Error(`maxOpenAgents reached (${this.limits.maxOpenAgents})`);
+		if (this.shuttingDown) throw new Error("AgentManager is shutting down and cannot spawn new agents.");
 		if (request.writeMode === "git_worktree") throw new Error("writeMode=git_worktree is not implemented yet.");
 
 		const parent = request.parentAgentId ? this.records.get(request.parentAgentId) : undefined;
@@ -234,6 +234,13 @@ export class AgentManager {
 		let tools = request.tools ? [...request.tools] : undefined;
 		if (writeMode === "read_only" && tools) tools = tools.filter((tool) => tool !== "edit" && tool !== "write");
 		const timeoutMs = normalizeRuntimeTimeoutMs(request.timeoutMs, this.limits);
+
+		await this.reapIdleAgentsForCapacity();
+		if (this.shuttingDown) throw new Error("AgentManager is shutting down and cannot spawn new agents.");
+		const openCount = this.openAgentCount();
+		if (openCount >= this.limits.maxOpenAgents) throw new Error(`maxOpenAgents reached (${this.limits.maxOpenAgents})`);
+
+		const now = nowMs();
 		const agentId = createId("agent");
 		const record: AgentRecord = {
 			agentId,
@@ -351,6 +358,7 @@ export class AgentManager {
 			return { agentId, delivered: true, queued: true, deliveryMode: "rpc_follow_up", message: "Follow-up queued via RPC follow_up." };
 		}
 		if (mode === "live_if_supported" && (record.status === "succeeded" || record.status === "failed") && handle?.isAlive()) {
+			this.clearIdleClose(agentId);
 			const startedAt = nowMs();
 			if (spawnOptions.routingDecision) applyRoutingFields(record, spawnOptions.routingDecision);
 			this.transition(record, "running", { processState: "live_running", controllable: true, startedAt, finishedAt: undefined, error: undefined });
@@ -392,9 +400,15 @@ export class AgentManager {
 	async interruptAgent(agentId: string, reason?: string): Promise<AgentRecord> {
 		const record = this.requireRecord(agentId);
 		const handle = this.handles.get(agentId);
-		if (handle?.isAlive()) await handle.interrupt(reason);
-		this.clearAgentTimeout(agentId);
 		this.handles.delete(agentId);
+		this.clearAgentTimeout(agentId);
+		this.clearIdleClose(agentId);
+		this.closingAgentIds.add(agentId);
+		try {
+			if (handle?.isAlive()) await handle.close(reason);
+		} finally {
+			this.closingAgentIds.delete(agentId);
+		}
 		const finishedAt = nowMs();
 		const previousMetrics = record.result?.metrics;
 		const turnMetrics = this.completedTurnMetrics(record, undefined, finishedAt);
@@ -412,6 +426,7 @@ export class AgentManager {
 			this.store.appendEvent("graph.edge_closed", { agentId, parentAgentId: record.parentAgentId, childAgentId: agentId, taskPath: record.taskPath, data: { edge } });
 			this.store.appendEdgeState(edge);
 		}
+		this.clearRetainedRuntimeState(agentId);
 		void this.startQueued();
 		return shallowCloneRecord(record);
 	}
@@ -419,9 +434,15 @@ export class AgentManager {
 	async closeAgent(agentId: string, reason?: string): Promise<AgentRecord> {
 		const record = this.requireRecord(agentId);
 		const handle = this.handles.get(agentId);
-		if (handle?.isAlive()) await handle.close(reason);
-		this.clearAgentTimeout(agentId);
 		this.handles.delete(agentId);
+		this.clearAgentTimeout(agentId);
+		this.clearIdleClose(agentId);
+		this.closingAgentIds.add(agentId);
+		try {
+			if (handle?.isAlive()) await handle.close(reason);
+		} finally {
+			this.closingAgentIds.delete(agentId);
+		}
 		const hadActiveTurn = this.activeTurnIds.has(agentId);
 		const closedAt = hadActiveTurn ? nowMs() : record.finishedAt ?? nowMs();
 		const turnMetrics = this.completedTurnMetrics(record, undefined, closedAt);
@@ -438,33 +459,44 @@ export class AgentManager {
 			this.store.appendEvent("graph.edge_closed", { agentId, parentAgentId: record.parentAgentId, childAgentId: agentId, taskPath: record.taskPath, data: { edge } });
 			this.store.appendEdgeState(edge);
 		}
+		this.clearRetainedRuntimeState(agentId);
 		void this.startQueued();
 		return shallowCloneRecord(record);
 	}
 
 	async shutdownAll(reason = "session shutdown"): Promise<void> {
+		this.shuttingDown = true;
 		const handles = [...this.handles.entries()];
+		this.handles.clear();
+		for (const [agentId] of handles) this.closingAgentIds.add(agentId);
 		await Promise.allSettled(handles.map(async ([agentId, handle]) => {
-			if (handle.isAlive()) await handle.close(reason);
-			const record = this.records.get(agentId);
-			if (record && record.status === "running") {
-				const lostAt = nowMs();
-				const turnMetrics = this.completedTurnMetrics(record, undefined, lostAt);
-				if (this.activeTurnIds.has(record.agentId)) {
-					record.result = { agentId, status: "interrupted", summary: reason, output: record.outputTail, metrics: mergeCumulativeAgentMetrics(record.result?.metrics, turnMetrics, { outputChars: record.outputChars }) };
-				}
-				this.transition(record, "lost", { processState: "unknown", controllable: false, finishedAt: lostAt, error: reason });
-				this.recordRouteTerminal(record, "aborted", lostAt, turnMetrics, reason, "user");
-				this.finishRuntimeRecovery(record, "lost", lostAt, reason);
-				this.finishTurn(record, "lost", lostAt, reason, turnMetrics);
-				this.recordAgentCompletion(record, "lost", lostAt, reason);
+			try {
+				if (handle.isAlive()) await handle.close(reason);
+			} finally {
+				this.closingAgentIds.delete(agentId);
 			}
 		}));
-		this.handles.clear();
+		for (const record of this.records.values()) {
+			if (record.status !== "running" && record.status !== "queued") continue;
+			const lostAt = nowMs();
+			const turnMetrics = this.completedTurnMetrics(record, undefined, lostAt);
+			if (this.activeTurnIds.has(record.agentId)) {
+				record.result = { agentId: record.agentId, status: "interrupted", summary: reason, output: record.outputTail, metrics: mergeCumulativeAgentMetrics(record.result?.metrics, turnMetrics, { outputChars: record.outputChars }) };
+			}
+			this.transition(record, "lost", { processState: "unknown", controllable: false, finishedAt: lostAt, error: reason });
+			this.recordRouteTerminal(record, "aborted", lostAt, turnMetrics, reason, "user");
+			this.finishRuntimeRecovery(record, "lost", lostAt, reason);
+			this.finishTurn(record, "lost", lostAt, reason, turnMetrics);
+			this.recordAgentCompletion(record, "lost", lostAt, reason);
+		}
+
 		for (const timeout of this.timeoutHandles.values()) clearTimeout(timeout);
 		this.timeoutHandles.clear();
 		for (const timeout of this.timeoutRecoveryHandles.values()) clearTimeout(timeout);
 		this.timeoutRecoveryHandles.clear();
+		for (const timeout of this.idleCloseHandles.values()) clearTimeout(timeout);
+		this.idleCloseHandles.clear();
+		for (const agentId of this.records.keys()) this.clearRetainedRuntimeState(agentId);
 	}
 
 	async wait(options: WaitAgentOptions): Promise<WaitAgentResult> {
@@ -511,7 +543,7 @@ export class AgentManager {
 	}
 
 	private async startQueued(signal?: AbortSignal): Promise<void> {
-		while (this.runningCount() < this.limits.maxAgentsRunning) {
+		while (!this.shuttingDown && this.runningCount() < this.limits.maxAgentsRunning) {
 			const next = [...this.records.values()].find((record) => record.status === "queued");
 			if (!next) return;
 			await this.startAgent(next, signal);
@@ -562,7 +594,13 @@ export class AgentManager {
 				onError: (error) => this.failAgent(record.agentId, error),
 				onExit: (exitCode, closeSignal) => this.onExit(record.agentId, exitCode, closeSignal),
 			}, signal);
-			this.handles.set(record.agentId, handle);
+			const current = this.records.get(record.agentId);
+			if (this.shuttingDown || !current || current.status === "closed" || current.status === "interrupted" || current.status === "lost" || current.processState === "exited" || current.processState === "killed") {
+				await handle.close("agent completed before its handle was registered");
+			} else {
+				this.handles.set(record.agentId, handle);
+				if (current.status === "succeeded" || current.status === "failed") this.scheduleIdleClose(current);
+			}
 		} catch (error) {
 			this.failAgent(record.agentId, error instanceof Error ? error : new Error(String(error)));
 		}
@@ -571,6 +609,7 @@ export class AgentManager {
 	private markStarted(agentId: string): void {
 		const record = this.records.get(agentId);
 		if (!record) return;
+		this.clearIdleClose(agentId);
 		const pending = this.pendingFollowupRoutes.get(agentId);
 		if (record.status !== "running") {
 			if (!pending?.length || (record.status !== "succeeded" && record.status !== "failed")) return;
@@ -611,7 +650,8 @@ export class AgentManager {
 
 	private completeAgent(agentId: string, result: AgentResult): void {
 		const record = this.records.get(agentId);
-		if (!record) return;
+		if (!record || this.closingAgentIds.has(agentId)) return;
+		if (record.status !== "running" && !this.activeTurnIds.has(agentId)) return;
 		this.clearAgentTimeout(agentId);
 		const status: AgentStatus = result.status;
 		const finishedAt = nowMs();
@@ -642,6 +682,8 @@ export class AgentManager {
 				this.store.appendEdgeState(edge);
 			}
 		}
+		this.lastOutputPersistAt.delete(agentId);
+		this.scheduleIdleClose(record);
 		void this.startQueued();
 	}
 
@@ -678,9 +720,9 @@ export class AgentManager {
 
 	private failAgent(agentId: string, error: Error): void {
 		const record = this.records.get(agentId);
-		if (!record) return;
+		if (!record || this.closingAgentIds.has(agentId)) return;
 		this.clearAgentTimeout(agentId);
-		if (record.status === "closed" || record.status === "interrupted" || record.status === "failed") return;
+		if (isTerminalStatus(record.status)) return;
 		const failedAt = nowMs();
 		const turnMetrics = this.completedTurnMetrics(record, undefined, failedAt);
 		if (this.activeTurnIds.has(record.agentId)) {
@@ -703,14 +745,19 @@ export class AgentManager {
 			this.store.appendEvent("graph.edge_closed", { agentId, parentAgentId: record.parentAgentId, childAgentId: agentId, taskPath: record.taskPath, data: { edge } });
 			this.store.appendEdgeState(edge);
 		}
+		this.lastOutputPersistAt.delete(agentId);
+		this.scheduleIdleClose(record);
 		void this.startQueued();
 	}
 
 	private onExit(agentId: string, exitCode: number | null, closeSignal: NodeJS.Signals | null): void {
 		const record = this.records.get(agentId);
 		if (!record) return;
+		this.handles.delete(agentId);
+		this.clearIdleClose(agentId);
+		const expectedExit = this.closingAgentIds.has(agentId);
 		record.exitCode = exitCode ?? undefined;
-		const exitError = record.status === "running" || record.status === "queued" ? new Error(`Child process exited before completion (${closeSignal ?? exitCode ?? "unknown"})`) : undefined;
+		const exitError = !expectedExit && (record.status === "running" || record.status === "queued") ? new Error(`Child process exited before completion (${closeSignal ?? exitCode ?? "unknown"})`) : undefined;
 		if (exitError) this.failAgent(agentId, exitError);
 		record.processState = record.processState === "killed" ? "killed" : "exited";
 		record.controllable = false;
@@ -718,6 +765,7 @@ export class AgentManager {
 		record.updatedAt = nowMs();
 		this.observeTelemetry((telemetry) => telemetry.processExited({ agentId, status: record.status, processState: record.processState, controllable: false, at: record.updatedAt, exitCode: exitCode ?? undefined, signal: closeSignal ?? undefined, error: exitError }));
 		this.store.appendAgentState(record);
+		if (!expectedExit) this.clearRetainedRuntimeState(agentId);
 		this.notifyChange();
 	}
 
@@ -989,9 +1037,12 @@ export class AgentManager {
 		forcedDomain?: FailureDomain,
 	): void {
 		const routeId = record.routeId ?? record.routingDecision?.routeId;
-		if (!routeId || this.observedRouteIds.has(routeId)) return;
-		this.observedRouteIds.add(routeId);
 		const signals = this.routeSignals.get(record.agentId);
+		if (!routeId || this.observedRouteIds.has(routeId)) {
+			this.routeSignals.delete(record.agentId);
+			return;
+		}
+		this.observedRouteIds.add(routeId);
 		const failureDomain = outcome === "succeeded" ? undefined : this.routeFailureDomain(record, error, forcedDomain);
 		record.failureDomain = failureDomain;
 		if (record.routingDecision) record.routingDecision.failureDomain = failureDomain;
@@ -1054,6 +1105,53 @@ export class AgentManager {
 		this.timeoutRecoveryHandles.delete(agentId);
 	}
 
+	private clearIdleClose(agentId: string): void {
+		const timeout = this.idleCloseHandles.get(agentId);
+		if (timeout) clearTimeout(timeout);
+		this.idleCloseHandles.delete(agentId);
+	}
+
+	private scheduleIdleClose(record: AgentRecord): void {
+		this.clearIdleClose(record.agentId);
+		const idleTtlMs = this.limits.idleTtlMs;
+		if (!Number.isFinite(idleTtlMs) || idleTtlMs <= 0) return;
+		if (record.status !== "succeeded" && record.status !== "failed" && record.status !== "interrupted") return;
+
+		const timeout = setTimeout(() => {
+			this.idleCloseHandles.delete(record.agentId);
+			const current = this.records.get(record.agentId);
+			const handle = this.handles.get(record.agentId);
+			if (!current || (current.status !== "succeeded" && current.status !== "failed" && current.status !== "interrupted")) return;
+			if (!handle?.isAlive()) {
+				this.handles.delete(record.agentId);
+				return;
+			}
+			void this.closeAgent(record.agentId, `idle TTL expired after ${idleTtlMs} ms`).catch((error) => {
+				console.warn(`subagent: failed to close idle agent ${record.agentId}: ${error instanceof Error ? error.message : String(error)}`);
+			});
+		}, idleTtlMs);
+		timeout.unref?.();
+		this.idleCloseHandles.set(record.agentId, timeout);
+	}
+
+	private clearRetainedRuntimeState(agentId: string): void {
+		this.pendingStart.delete(agentId);
+		this.lastOutputPersistAt.delete(agentId);
+		this.pendingFollowupRoutes.delete(agentId);
+		this.processSpawnedAt.delete(agentId);
+		this.runtimeRecoveryStartedAt.delete(agentId);
+		this.routeSignals.delete(agentId);
+		this.clearIdleClose(agentId);
+		const turnId = this.activeTurnIds.get(agentId);
+		if (turnId) {
+			this.activeTurnIds.delete(agentId);
+			this.activeTurnKinds.delete(agentId);
+			this.activeTurnStartedAt.delete(turnId);
+			this.firstProgressTurnIds.delete(turnId);
+			this.firstProgressAt.delete(turnId);
+		}
+	}
+
 	private transition(record: AgentRecord, status: AgentStatus, patch: Partial<AgentRecord> = {}): void {
 		Object.assign(record, patch);
 		record.status = status;
@@ -1064,6 +1162,26 @@ export class AgentManager {
 
 	private runningCount(): number {
 		return [...this.records.values()].filter((record) => record.status === "running").length;
+	}
+
+	private openAgentCount(): number {
+		return [...this.records.values()].filter((record) => {
+			if (record.status === "queued" || record.status === "running") return true;
+			return this.handles.get(record.agentId)?.isAlive() ?? false;
+		}).length;
+	}
+
+	private async reapIdleAgentsForCapacity(): Promise<void> {
+		let openCount = this.openAgentCount();
+		if (openCount < this.limits.maxOpenAgents) return;
+		const idleRecords = [...this.records.values()]
+			.filter((record) => (record.status === "succeeded" || record.status === "failed" || record.status === "interrupted") && this.handles.get(record.agentId)?.isAlive())
+			.sort((a, b) => (a.finishedAt ?? a.updatedAt) - (b.finishedAt ?? b.updatedAt));
+		for (const record of idleRecords) {
+			await this.closeAgent(record.agentId, "closed to free subagent process capacity");
+			openCount = this.openAgentCount();
+			if (openCount < this.limits.maxOpenAgents) return;
+		}
 	}
 
 	private resolveWaitTargets(options: WaitAgentOptions): string[] {

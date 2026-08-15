@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildSubprocessRpcArgs, formatRetryNote, isContextWindowError, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
+import { buildSubprocessRpcArgs, formatRetryNote, isChildProcessAlive, isContextWindowError, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
 
 test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	const args = buildSubprocessRpcArgs({
@@ -57,4 +57,10 @@ test("formatRetryNote surfaces backoff attempt, delay, and compacted provider er
 
 test("formatRetryNote handles missing error and non-finite delay", () => {
 	assert.match(formatRetryNote(1, 3, Number.NaN, undefined), /\(attempt 1\/3\)/);
+});
+
+test("isChildProcessAlive does not mistake a sent signal for process exit", () => {
+	assert.equal(isChildProcessAlive({ exitCode: null, signalCode: null, killed: true } as any), true);
+	assert.equal(isChildProcessAlive({ exitCode: 0, signalCode: null } as any), false);
+	assert.equal(isChildProcessAlive({ exitCode: null, signalCode: "SIGTERM" } as any), false);
 });

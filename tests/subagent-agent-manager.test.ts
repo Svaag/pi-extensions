@@ -39,6 +39,44 @@ class FakeBackend implements AgentBackend {
 	}
 }
 
+class DeferredBackend implements AgentBackend {
+	handle: FakeHandle | undefined;
+	release: (() => void) | undefined;
+
+	async spawn(request: BackendSpawnRequest, events: AgentBackendEvents): Promise<AgentHandle> {
+		events.onStarted?.();
+		this.handle = new FakeHandle(request.record.agentId);
+		await new Promise<void>((resolve) => { this.release = resolve; });
+		events.onResult?.({ agentId: request.record.agentId, status: "succeeded", summary: "late result" });
+		return this.handle;
+	}
+}
+
+class ExitOnCloseHandle extends FakeHandle {
+	private readonly onExitCallback: () => void;
+	constructor(agentId: string, onExit: () => void) {
+		super(agentId);
+		this.onExitCallback = onExit;
+	}
+	override close(): Promise<void> {
+		this.closed = true;
+		this.onExitCallback();
+		return Promise.resolve();
+	}
+}
+
+class ExitOnCloseBackend extends FakeBackend {
+	override autoComplete = false;
+	override async spawn(request: BackendSpawnRequest, events: AgentBackendEvents): Promise<AgentHandle> {
+		this.requests.push(request);
+		this.events.set(request.record.agentId, events);
+		events.onStarted?.();
+		const handle = new ExitOnCloseHandle(request.record.agentId, () => events.onExit?.(null, "SIGTERM"));
+		this.handles.set(request.record.agentId, handle);
+		return handle;
+	}
+}
+
 function makeRecord(status: "queued" | "running" | "succeeded" | "failed" | "interrupted" | "closed" | "lost" = "running") {
 	return {
 		agentId: "agent_restored",
@@ -69,7 +107,7 @@ function manager(backend = new FakeBackend(), limits: any = {}, telemetry?: Noop
 			backend,
 			store: new StateStore({ appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }) }),
 			rootCwd: "/tmp",
-			limits: { maxAgentsRunning: 1, maxAgentsTotal: 4, maxOpenAgents: 4, ...limits },
+			limits: { maxAgentsRunning: 1, maxOpenAgents: 4, ...limits },
 			telemetry,
 		}),
 	};
@@ -112,6 +150,96 @@ test("AgentManager lifecycle: spawn -> running -> succeeded", async () => {
 	assert.equal(waited.timedOut, false);
 	assert.equal(waited.agents[0].status, "succeeded");
 	assert.equal(waited.agents[0].summary, "done");
+});
+
+test("AgentManager starts full_sanitized follow-ups instead of rejecting the context mode", async () => {
+	const h = manager();
+	const record = await h.manager.spawnAgent({
+		taskName: "sanitized",
+		prompt: "do it",
+		contextMode: "full_sanitized",
+		contextSummary: "TOKEN=secret-value useful parent finding",
+	});
+	const waited = await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	assert.equal(waited.agents[0].status, "succeeded");
+	assert.match(h.backend.requests[0].systemPrompt, /useful parent finding/);
+	assert.doesNotMatch(h.backend.requests[0].systemPrompt, /secret-value/);
+});
+
+test("AgentManager does not cap closed session history", async () => {
+	const h = manager(new FakeBackend(), { maxOpenAgents: 1 });
+	for (let index = 0; index < 40; index += 1) {
+		const record = await h.manager.spawnAgent({ taskName: `history-${index}`, prompt: "do it" });
+		await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+		await h.manager.closeAgent(record.agentId, "test cleanup");
+	}
+	assert.equal(h.manager.listRecords({ includeClosed: true }).length, 40);
+});
+
+test("AgentManager reaps idle children before enforcing open-process capacity", async () => {
+	const backend = new FakeBackend();
+	const h = manager(backend, { maxOpenAgents: 1 });
+	const first = await h.manager.spawnAgent({ taskName: "first", prompt: "do it" });
+	await h.manager.wait({ agentId: first.agentId, timeoutMs: 1000 });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	const second = await h.manager.spawnAgent({ taskName: "second", prompt: "do it" });
+	assert.equal(h.manager.getRecord(first.agentId)?.status, "closed");
+	assert.notEqual(second.status, "closed");
+});
+
+test("AgentManager validates spawn requests before reaping idle children", async () => {
+	const backend = new FakeBackend();
+	const h = manager(backend, { maxOpenAgents: 1 });
+	const first = await h.manager.spawnAgent({ taskName: "first", prompt: "do it" });
+	await h.manager.wait({ agentId: first.agentId, timeoutMs: 1000 });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await assert.rejects(() => h.manager.spawnAgent({ taskName: "invalid", prompt: "no", writeMode: "git_worktree" }), /not implemented/);
+	assert.equal(h.manager.getRecord(first.agentId)?.status, "succeeded");
+	assert.equal(backend.handles.get(first.agentId)?.isAlive(), true);
+});
+
+test("AgentManager automatically closes idle completed children", async () => {
+	const backend = new FakeBackend();
+	const h = manager(backend, { idleTtlMs: 10 });
+	const record = await h.manager.spawnAgent({ taskName: "idle", prompt: "do it" });
+	await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	await new Promise((resolve) => setTimeout(resolve, 30));
+	assert.equal(h.manager.getRecord(record.agentId)?.status, "closed");
+	assert.equal(backend.handles.get(record.agentId)?.closed, true);
+});
+
+test("AgentManager suppresses expected exit failures while interrupting and shutting down", async () => {
+	const interrupted = manager(new ExitOnCloseBackend());
+	const interruptedRecord = await interrupted.manager.spawnAgent({ taskName: "interrupt", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await interrupted.manager.interruptAgent(interruptedRecord.agentId, "stop");
+	assert.equal(interrupted.manager.getRecord(interruptedRecord.agentId)?.status, "interrupted");
+	assert.equal(interrupted.entries.some((entry) => entry.data?.type === "agent.failed"), false);
+
+	const stopped = manager(new ExitOnCloseBackend());
+	const stoppedRecord = await stopped.manager.spawnAgent({ taskName: "shutdown", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await stopped.manager.shutdownAll("test shutdown");
+	assert.equal(stopped.manager.getRecord(stoppedRecord.agentId)?.status, "lost");
+	assert.equal(stopped.entries.some((entry) => entry.data?.type === "agent.failed"), false);
+});
+
+test("AgentManager closes a handle that resolves after shutdown", async () => {
+	const backend = new DeferredBackend();
+	const current = new AgentManager({
+		backend,
+		store: new StateStore({ appendEntry: () => undefined }),
+		rootCwd: "/tmp",
+	});
+	const record = await current.spawnAgent({ taskName: "late", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	await current.shutdownAll("test shutdown");
+	assert.equal(current.getRecord(record.agentId)?.status, "lost");
+	backend.release?.();
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	assert.equal(backend.handle?.closed, true);
+	assert.equal(current.getRecord(record.agentId)?.status, "lost");
+	await assert.rejects(() => current.spawnAgent({ taskName: "too-late", prompt: "no" }), /shutting down/);
 });
 
 test("AgentManager ignores too-short runtime timeouts", async () => {

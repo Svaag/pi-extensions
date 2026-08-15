@@ -1,5 +1,4 @@
 export interface SubagentLimits {
-	maxAgentsTotal: number;
 	maxOpenAgents: number;
 	maxAgentsRunning: number;
 	maxDepth: number;
@@ -17,7 +16,6 @@ export interface SubagentLimits {
 }
 
 export const DEFAULT_SUBAGENT_LIMITS: SubagentLimits = {
-	maxAgentsTotal: 32,
 	maxOpenAgents: 12,
 	maxAgentsRunning: 4,
 	maxDepth: 3,

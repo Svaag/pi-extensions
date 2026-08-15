@@ -11,6 +11,10 @@ import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 const STDERR_TAIL_CAP = 16_384;
 const TOOL_RESULT_TEXT_CAP = 4_000;
 
+export function isChildProcessAlive(proc: Pick<ChildProcessWithoutNullStreams, "exitCode" | "signalCode">): boolean {
+	return proc.exitCode === null && proc.signalCode === null;
+}
+
 export function isContextWindowError(message: unknown): boolean {
 	if (typeof message !== "string") return false;
 	return /context window|context length|maximum context|too many tokens|input exceeds/i.test(message);
@@ -132,6 +136,7 @@ class SubprocessRpcHandle implements AgentHandle {
 	private readonly proc: ChildProcessWithoutNullStreams;
 	private readonly rpc: RpcClient;
 	private readonly tempPrompt: { dir: string; filePath: string } | undefined;
+	private closePromise: Promise<void> | undefined;
 
 	constructor(
 		agentId: string,
@@ -167,17 +172,46 @@ class SubprocessRpcHandle implements AgentHandle {
 		if (this.isAlive()) this.proc.kill("SIGTERM");
 	}
 
-	async close(reason?: string): Promise<void> {
-		await this.interrupt(reason);
-		this.rpc.closeInput();
-		setTimeout(() => {
-			if (this.isAlive()) this.proc.kill("SIGKILL");
-		}, 5_000).unref?.();
-		cleanupTemp(this.tempPrompt);
+	close(reason?: string): Promise<void> {
+		if (!this.closePromise) this.closePromise = this.closeProcess(reason);
+		return this.closePromise;
+	}
+
+	private async closeProcess(reason?: string): Promise<void> {
+		try {
+			await this.interrupt(reason);
+			this.rpc.closeInput();
+			await this.waitForExit();
+		} finally {
+			cleanupTemp(this.tempPrompt);
+		}
+	}
+
+	private waitForExit(): Promise<void> {
+		if (!this.isAlive()) return Promise.resolve();
+		return new Promise((resolve) => {
+			let settled = false;
+			const finish = () => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(killTimeout);
+				clearTimeout(settleTimeout);
+				this.proc.removeListener("close", finish);
+				resolve();
+			};
+			const killTimeout = setTimeout(() => {
+				if (this.isAlive()) this.proc.kill("SIGKILL");
+			}, 5_000);
+			const settleTimeout = setTimeout(finish, 6_000);
+			this.proc.once("close", finish);
+			if (!this.isAlive()) finish();
+		});
 	}
 
 	isAlive(): boolean {
-		return this.proc.exitCode === null && !this.proc.killed;
+		// `ChildProcess.killed` only means a signal was sent. The process may
+		// still be alive and require the delayed SIGKILL fallback.
+		return isChildProcessAlive(this.proc);
 	}
 }
 
@@ -462,10 +496,13 @@ export class SubprocessRpcBackend implements AgentBackend {
 
 		if (signal) {
 			const abort = () => {
-				if (proc.exitCode === null) proc.kill("SIGTERM");
+				if (isChildProcessAlive(proc)) proc.kill("SIGTERM");
 			};
 			if (signal.aborted) abort();
-			else signal.addEventListener("abort", abort, { once: true });
+			else {
+				signal.addEventListener("abort", abort, { once: true });
+				proc.once("close", () => signal.removeEventListener("abort", abort));
+			}
 		}
 
 		const handle = new SubprocessRpcHandle(record.agentId, proc, rpc, tempPrompt);
@@ -477,6 +514,9 @@ export class SubprocessRpcBackend implements AgentBackend {
 		try {
 			await handle.prompt(userPrompt);
 		} catch (error) {
+			await handle.close("initial prompt failed").catch((closeError) => {
+				events.onOutput?.(`\n[Failed to close child after initial prompt error: ${closeError instanceof Error ? closeError.message : String(closeError)}]\n`);
+			});
 			if (!sawFirstModelOutput && proc.exitCode !== null) {
 				const hostError = error instanceof Error ? error : new Error(String(error));
 				(hostError as Error & { failureDomain?: string }).failureDomain = "host";
