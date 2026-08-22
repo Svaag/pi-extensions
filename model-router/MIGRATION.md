@@ -2,6 +2,10 @@
 
 The promoted Subagent Extension previously owned `RouterConfig`, `ScopedModels`, and `SmartRouter`. Production routing now goes through `@svaag/pi-model-router`; the old deterministic modules remain temporarily as compatibility/reference code for historical tests.
 
+## v1.1: subscription-first profile
+
+v1.1 adds an opt-in `subscription_first` profile and the `model-router/subscription` virtual model with deterministic family ranking and same-turn whole-family failover (`POLICY_VERSION` 1.1.0). Defaults are unchanged: new and existing installations stay on `balanced` with the shadow rollout until they explicitly enable the policy in `subscriptionPolicy`.
+
 ## Configuration
 
 Old locations are still read:

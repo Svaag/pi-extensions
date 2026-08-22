@@ -11,7 +11,7 @@ import type {
 	RoutingProfile,
 	ThinkingLevel,
 } from "../../core/types.ts";
-import { PiModelSource, piModelRef, type PiModelLike } from "./PiModelSource.ts";
+import { PiModelSource, piModelRef, type PiModelLike, type PiModelRegistryLike } from "./PiModelSource.ts";
 import {
 	OBSERVATION_ENTRY_TYPE,
 	PREFERENCES_ENTRY_TYPE,
@@ -75,9 +75,10 @@ interface AssistantLike {
 	content?: Array<{ type?: string; text?: string }>;
 }
 
-const ROUTING_PROFILES: readonly RoutingProfile[] = ["balanced", "quality_first", "cost_first", "latency_first"];
+const ROUTING_PROFILES: readonly RoutingProfile[] = ["balanced", "quality_first", "cost_first", "latency_first", "subscription_first"];
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const SUPPRESSION_WINDOW_MS = 5_000;
+const SUBSCRIPTION_VIRTUAL_REF = "model-router/subscription";
 
 function finite(value: unknown): number | undefined {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
@@ -181,6 +182,12 @@ export class PiRunRouter {
 		const currentModel = modelRef(ctx.model as PiModelLike | undefined);
 		if (currentModel?.startsWith("model-router/")) {
 			updateRouterStatus(ctx, `router request/${currentModel.slice("model-router/".length)}`);
+			return;
+		}
+		// The subscription profile is deterministic and immediate: point the
+		// session at the virtual model right away unless the user pinned a model.
+		if (await this.autoSelectSubscriptionModel(ctx)) {
+			updateRouterStatus(ctx, "router request/subscription");
 			return;
 		}
 		const currentThinking = THINKING_LEVELS.includes(ctx.thinkingLevel as ThinkingLevel) ? ctx.thinkingLevel as ThinkingLevel : undefined;
@@ -305,7 +312,13 @@ export class PiRunRouter {
 		this.modelPin = undefined;
 		this.thinkingPin = undefined;
 		this.persistPreferences();
-		if (ctx) this.refreshFooter(ctx);
+		if (ctx) {
+			this.refreshFooter(ctx);
+			// Returning to subscription_first re-selects its virtual model.
+			void this.autoSelectSubscriptionModel(ctx).then((applied) => {
+				if (applied) this.refreshFooter(ctx);
+			});
+		}
 	}
 
 	setProfile(profile: RoutingProfile, ctx?: ExtensionContext): boolean {
@@ -347,6 +360,28 @@ export class PiRunRouter {
 		if (this.currentContext) updateRouterStatus(this.currentContext, undefined);
 		this.currentContext = undefined;
 		await this.engine.close();
+	}
+
+	/**
+	 * Point the session at model-router/subscription when the subscription
+	 * profile is active and no user model pin exists. Uses the same suppression
+	 * window as applyDecision so the resulting model_select cannot create a pin.
+	 */
+	private async autoSelectSubscriptionModel(ctx: ExtensionContext): Promise<boolean> {
+		if (this.profile !== "subscription_first" || this.modelPin) return false;
+		const current = modelRef(ctx.model as PiModelLike | undefined);
+		if (current === SUBSCRIPTION_VIRTUAL_REF) return false;
+		try {
+			const target = (ctx.modelRegistry as unknown as PiModelRegistryLike).find("model-router", "subscription");
+			if (!target) {
+				this.addWarning("subscription_model_unavailable");
+				return false;
+			}
+			return await this.applyDecision(target as PiModelLike, undefined, ctx);
+		} catch {
+			this.addWarning("model_application_failed");
+			return false;
+		}
 	}
 
 	private async applyDecision(model: PiModelLike, thinking: ThinkingLevel | undefined, ctx: ExtensionContext): Promise<boolean> {

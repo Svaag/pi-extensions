@@ -37,6 +37,22 @@ export interface RouterProfileConfig {
 	};
 }
 
+export interface RouterFamilyConfig {
+	preferred?: string;
+	/** Exact model refs or existing * / ? patterns, walked in list order. */
+	members: string[];
+}
+
+export interface RouterSubscriptionPolicy {
+	enabled: boolean;
+	/** Family ids in strict pick order; every entry must have a families entry. */
+	ranking: string[];
+	includedProviders: string[];
+	meteredProviders: string[];
+	families: Record<string, RouterFamilyConfig>;
+	familyCooldownMs: number;
+}
+
 export interface RouterConfig {
 	version: 1;
 	enabled: boolean;
@@ -53,6 +69,7 @@ export interface RouterConfig {
 		reliabilityFloor: RouterTierFloor;
 	};
 	profiles: Record<RoutingProfile, RouterProfileConfig>;
+	subscriptionPolicy: RouterSubscriptionPolicy;
 	modelProfiles: Record<string, RouterModelProfileOverride>;
 	classifier: {
 		enabled: boolean;

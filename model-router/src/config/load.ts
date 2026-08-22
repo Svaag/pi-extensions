@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { COMPLEXITY_TIERS, ROUTING_PROFILES, TASK_INTENTS } from "../core/types.ts";
 import { DEFAULT_ROUTER_CONFIG } from "./defaults.ts";
 import { migrateLegacyRouterConfig } from "./migrateLegacy.ts";
-import type { LoadRouterConfigOptions, RouterConfig, RouterModelProfileOverride } from "./schema.ts";
+import type { LoadRouterConfigOptions, RouterConfig, RouterFamilyConfig, RouterModelProfileOverride, RouterSubscriptionPolicy } from "./schema.ts";
 
 const ROUTER_FILE = "model-router.json";
 const LEGACY_FILE = "subagent-router.json";
@@ -103,6 +103,51 @@ function sanitizeModelProfiles(value: unknown, fallback: Record<string, RouterMo
 	return result;
 }
 
+function sanitizeSubscriptionPolicy(value: unknown, base: RouterConfig["subscriptionPolicy"]): RouterConfig["subscriptionPolicy"] {
+	const raw = isObject(value) ? value : {};
+	// Only ranking entries with a configured family survive; families not
+	// referenced by the ranking are dropped so the policy stays self-consistent.
+	const familiesRaw = isObject(raw.families) ? raw.families : {};
+	const rankingList = raw.ranking === undefined ? base.ranking : Array.isArray(raw.ranking) ? raw.ranking : [];
+	const ranking: string[] = [];
+	const families: Record<string, RouterFamilyConfig> = {};
+	for (const entry of rankingList) {
+		if (typeof entry !== "string") continue;
+		const familyId = entry.trim();
+		if (!familyId || ranking.includes(familyId)) continue;
+		const familyRaw = isObject(familiesRaw[familyId]) ? familiesRaw[familyId] : undefined;
+		if (!familyRaw) continue;
+		const membersSource = Array.isArray(familyRaw.members) ? familyRaw.members : [];
+		const members = membersSource
+			.filter((member): member is string => typeof member === "string" && member.trim().length > 0)
+			.map((member) => member.trim());
+		if (members.length === 0) continue;
+		const preferred = typeof familyRaw.preferred === "string" && familyRaw.preferred.trim().length > 0
+			? familyRaw.preferred.trim()
+			: undefined;
+		families[familyId] = preferred ? { preferred, members } : { members };
+		ranking.push(familyId);
+	}
+	const providerIds = (value: unknown): string[] => {
+		if (!Array.isArray(value)) return [];
+		const seen = new Set<string>();
+		for (const item of value) {
+			if (typeof item !== "string") continue;
+			const id = item.trim();
+			if (id) seen.add(id);
+		}
+		return [...seen];
+	};
+	return {
+		enabled: boolean(raw.enabled, base.enabled),
+		ranking,
+		includedProviders: raw.includedProviders === undefined ? [...base.includedProviders] : providerIds(raw.includedProviders),
+		meteredProviders: raw.meteredProviders === undefined ? [...base.meteredProviders] : providerIds(raw.meteredProviders),
+		families,
+		familyCooldownMs: integer(raw.familyCooldownMs, base.familyCooldownMs, 0),
+	};
+}
+
 export function mergeRouterConfig(base: RouterConfig, patchValue: unknown): RouterConfig {
 	if (!isObject(patchValue)) return clone(base);
 	const patch = patchValue;
@@ -135,6 +180,9 @@ export function mergeRouterConfig(base: RouterConfig, patchValue: unknown): Rout
 	next.complexity.qualityFloor = unitRecord(complexity.qualityFloor ?? complexity.tierQualityFloor, base.complexity.qualityFloor) as RouterConfig["complexity"]["qualityFloor"];
 	next.complexity.reliabilityFloor = unitRecord(complexity.reliabilityFloor, base.complexity.reliabilityFloor) as RouterConfig["complexity"]["reliabilityFloor"];
 	next.profiles = sanitizeProfiles(patch.profiles, base.profiles);
+	next.subscriptionPolicy = patch.subscriptionPolicy === undefined
+		? clone(base.subscriptionPolicy)
+		: sanitizeSubscriptionPolicy(patch.subscriptionPolicy, base.subscriptionPolicy);
 	next.modelProfiles = sanitizeModelProfiles(patch.modelProfiles, base.modelProfiles);
 	next.classifier = {
 		enabled: boolean(classifier.enabled, base.classifier.enabled),

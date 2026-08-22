@@ -8,6 +8,7 @@ import type { RouterTelemetry, RouterTelemetryDimensions } from "../telemetry/Ro
 import { sampleBeta, SeededRandom } from "./bandit.ts";
 import { applyPreviewDiscount, estimateModelCostUsd, excludePreviewCandidates, filterConfiguredCandidates, modelRef, profileCandidate, thinkingLevelsFor } from "./candidates.ts";
 import { criticalArmHasEvidence, evaluateArmConstraints } from "./constraints.ts";
+import { annotateSubscriptionScores, familyIdForRef, filterFamilyCandidates, isSubscriptionPolicyConfigured, pickSubscriptionArm } from "./families.ts";
 import { assessTaskComplexity, classifyTaskIntent, cohortKey, estimateRoutingTokens } from "./features.ts";
 import { normalizeQualityLabel, qualityPosteriorUpdate, reliabilityUpdate } from "./feedback.ts";
 import { objectiveScore } from "./objectives.ts";
@@ -32,7 +33,7 @@ import type {
 	ThinkingLevel,
 } from "./types.ts";
 
-const POLICY_VERSION = "1.0.0";
+const POLICY_VERSION = "1.1.0";
 const CIRCUIT_COOLDOWN_MS = 15 * 60_000;
 
 export interface ModelRoutingEngineOptions {
@@ -135,6 +136,9 @@ export class ModelRoutingEngine {
 			this.storeAvailable = initialized.ok;
 			if (!initialized.ok) this.warnings.push("router_store_unavailable");
 		}
+		if (this.config.profile === "subscription_first" && !isSubscriptionPolicyConfigured(this.config.subscriptionPolicy)) {
+			this.warnings.push("subscription_policy_unconfigured");
+		}
 	}
 
 	async route(request: import("./types.ts").RouteRequest): Promise<RouteDecision> {
@@ -154,9 +158,12 @@ export class ModelRoutingEngine {
 		const baselineThinking = request.explicitThinkingLevel ?? request.currentThinkingLevel;
 		const disabled = !this.config.enabled || request.forceMode === "off" || rollout.stage === "off";
 		const explainOnly = request.forceMode === "explain";
+		const subscriptionReady = profileName === "subscription_first" && isSubscriptionPolicyConfigured(this.config.subscriptionPolicy);
+		const unconfiguredSubscription = profileName === "subscription_first" && !subscriptionReady;
 
 		let candidates = filterConfiguredCandidates(request.candidates, this.config);
 		candidates = excludePreviewCandidates(candidates);
+		if (subscriptionReady) candidates = filterFamilyCandidates(candidates, this.config.subscriptionPolicy);
 		const profiles = candidates.map((c) => profileCandidate(c, this.config));
 		applyPreviewDiscount(profiles);
 		const evaluated: EvaluatedArm[] = [];
@@ -207,6 +214,7 @@ export class ModelRoutingEngine {
 					modality: request.modality ?? "text",
 					routingProfile: profileName,
 					circuitOpen,
+					mode: subscriptionReady ? "subscription" : "standard",
 				}, this.config);
 				current.decision.eligible = constraint.eligible;
 				current.decision.notes.push(...constraint.reasons);
@@ -227,51 +235,90 @@ export class ModelRoutingEngine {
 			modality: request.modality ?? "text",
 			routingProfile: profileName,
 			circuitOpen: this.isCircuitOpen(arm.profile.fingerprint, now),
+			mode: subscriptionReady ? "subscription" : "standard",
 		}, this.config));
 		for (let index = 0; index < evaluated.length; index += 1) evaluated[index]!.decision.eligible = constraints[index]!.eligible;
 		let eligible = evaluated.filter((arm) => arm.decision.eligible);
-		if (assessment.complexityTier === "critical") {
+		if (assessment.complexityTier === "critical" && !subscriptionReady) {
 			eligible = eligible.filter((arm) => arm.profile.ref === baselineModel || criticalArmHasEvidence(arm.prediction, this.config, baselineArm?.prediction));
 		}
 		const baseline = baselineArm ? { costUsd: baselineArm.prediction.estimatedCostUsd, p95LatencyMs: baselineArm.prediction.estimatedP95LatencyMs } : undefined;
-		for (const arm of eligible) {
-			arm.score = objectiveScore({
-				profile: arm.profile,
-				prediction: arm.prediction,
-				rolePreferred: arm.profile.preferredIntents.includes(classification.intent),
-				tierPreferred: arm.profile.preferredTiers.includes(assessment.complexityTier),
-				cacheAffinity: arm.profile.ref === request.cacheAffinityModel,
-			}, profileName, this.config, baseline, this.config.complexity.qualityFloor[assessment.complexityTier]);
-			arm.decision.score = arm.score;
-		}
 		const random = new SeededRandom(routeId);
 		const managedTreatment = rollout.stage === "auto" || (rollout.stage === "explore" && assessment.complexityTier !== "critical" && random.next() < this.config.rollout.exploreTreatmentRate);
-		const usePosteriorSample = managedTreatment && assessment.complexityTier !== "critical" && (rollout.stage === "explore" || random.next() < this.config.learning.autoExplorationRate);
-		if (usePosteriorSample) {
+		if (subscriptionReady) {
+			// Deterministic ranking: display scores come from family rank/billing,
+			// never from learned posteriors or objective weights.
+			const annotations = annotateSubscriptionScores(
+				evaluated.map((arm) => ({ model: arm.profile.ref, provider: arm.candidate.provider, name: arm.candidate.name, eligible: arm.decision.eligible })),
+				this.config.subscriptionPolicy,
+				request.cacheAffinityModel,
+			);
+			evaluated.forEach((arm, index) => {
+				const annotation = annotations[index]!;
+				arm.score = annotation.score;
+				arm.decision.score = annotation.score;
+				arm.decision.notes.push(...annotation.notes);
+			});
+		} else {
 			for (const arm of eligible) {
-				const qn = Math.max(2, arm.prediction.qualitySamples + this.config.learning.qualityPriorStrength);
-				const rn = Math.max(2, arm.prediction.reliabilitySamples + this.config.learning.reliabilityPriorStrength);
-				const sampled = { ...arm.prediction,
-					qualityMean: sampleBeta(arm.prediction.qualityMean * qn, (1 - arm.prediction.qualityMean) * qn, random),
-					reliabilityMean: sampleBeta(arm.prediction.reliabilityMean * rn, (1 - arm.prediction.reliabilityMean) * rn, random),
-				};
-				arm.score = objectiveScore({ profile: arm.profile, prediction: sampled, rolePreferred: arm.profile.preferredIntents.includes(classification.intent), tierPreferred: arm.profile.preferredTiers.includes(assessment.complexityTier), cacheAffinity: arm.profile.ref === request.cacheAffinityModel }, profileName, this.config, baseline, this.config.complexity.qualityFloor[assessment.complexityTier]);
+				arm.score = objectiveScore({
+					profile: arm.profile,
+					prediction: arm.prediction,
+					rolePreferred: arm.profile.preferredIntents.includes(classification.intent),
+					tierPreferred: arm.profile.preferredTiers.includes(assessment.complexityTier),
+					cacheAffinity: arm.profile.ref === request.cacheAffinityModel,
+				}, profileName, this.config, baseline, this.config.complexity.qualityFloor[assessment.complexityTier]);
 				arm.decision.score = arm.score;
-				arm.decision.notes.push("conservative-thompson-sample");
+			}
+			const usePosteriorSample = managedTreatment && assessment.complexityTier !== "critical" && (rollout.stage === "explore" || random.next() < this.config.learning.autoExplorationRate);
+			if (usePosteriorSample) {
+				for (const arm of eligible) {
+					const qn = Math.max(2, arm.prediction.qualitySamples + this.config.learning.qualityPriorStrength);
+					const rn = Math.max(2, arm.prediction.reliabilitySamples + this.config.learning.reliabilityPriorStrength);
+					const sampled = { ...arm.prediction,
+						qualityMean: sampleBeta(arm.prediction.qualityMean * qn, (1 - arm.prediction.qualityMean) * qn, random),
+						reliabilityMean: sampleBeta(arm.prediction.reliabilityMean * rn, (1 - arm.prediction.reliabilityMean) * rn, random),
+					};
+					arm.score = objectiveScore({ profile: arm.profile, prediction: sampled, rolePreferred: arm.profile.preferredIntents.includes(classification.intent), tierPreferred: arm.profile.preferredTiers.includes(assessment.complexityTier), cacheAffinity: arm.profile.ref === request.cacheAffinityModel }, profileName, this.config, baseline, this.config.complexity.qualityFloor[assessment.complexityTier]);
+					arm.decision.score = arm.score;
+					arm.decision.notes.push("conservative-thompson-sample");
+				}
 			}
 		}
 		eligible.sort((a, b) => b.score - a.score || (a.prediction.estimatedCostUsd ?? Infinity) - (b.prediction.estimatedCostUsd ?? Infinity) || a.profile.ref.localeCompare(b.profile.ref));
-		const recommended = eligible[0] ?? baselineArm;
+		let recommended = eligible[0] ?? baselineArm;
+		let subscriptionPick: ReturnType<typeof pickSubscriptionArm<{ source: EvaluatedArm; model: string; provider?: string; name?: string; eligible: boolean }>> | undefined;
+		if (subscriptionReady) {
+			// Hard family ranking over hard-eligible arms only. No posteriors,
+			// sampling, explore coins, or rollout gating participate here.
+			subscriptionPick = pickSubscriptionArm(
+				evaluated.map((arm) => ({ source: arm, model: arm.profile.ref, provider: arm.candidate.provider, name: arm.candidate.name, eligible: arm.decision.eligible })),
+				this.config.subscriptionPolicy,
+				request.cacheAffinityModel,
+			);
+			recommended = subscriptionPick?.arm.source;
+			if (recommended && request.explicitThinkingLevel) {
+				// A user thinking pin still wins inside the deterministic ranking.
+				recommended.thinkingLevel = request.explicitThinkingLevel;
+				recommended.decision.thinkingLevel = request.explicitThinkingLevel;
+			}
+		}
 		const criticalExploitationAllowed = assessment.complexityTier === "critical" && rollout.stage === "auto" && Boolean(recommended && criticalArmHasEvidence(recommended.prediction, this.config, baselineArm?.prediction));
 		const applyManaged = managedTreatment && rollout.stage !== "shadow" && (assessment.complexityTier !== "critical" || criticalExploitationAllowed);
 		const applyForced = request.forceMode === "auto" && !request.explicitModel;
-		const applied = !disabled && !explainOnly && Boolean(recommended) && (forced || applyManaged || applyForced);
+		const applySubscription = subscriptionReady && Boolean(subscriptionPick) && !request.explicitModel;
+		const applied = !disabled && !explainOnly && Boolean(recommended)
+			&& (unconfiguredSubscription ? false : subscriptionReady ? applySubscription : Boolean(forced || applyManaged || applyForced));
 		const selectedModel = request.explicitModel ?? recommended?.profile.ref ?? baselineModel;
 		const selectedThinking = request.explicitThinkingLevel ?? recommended?.thinkingLevel ?? baselineThinking;
 		const executedModel = applied ? selectedModel : baselineModel;
 		const executedThinking = applied ? selectedThinking : baselineThinking;
-		const routeArm = forced ? "forced" : applyManaged ? "treatment" : "control";
-		const reason = disabled ? "disabled" : explainOnly ? "explain_only" : candidates.length === 0 ? "no_available_models" : applied ? "selected" : "shadow_recommendation";
+		const routeArm = forced || subscriptionPick ? "forced" : applyManaged ? "treatment" : "control";
+		const reason = disabled ? "disabled"
+			: unconfiguredSubscription ? "subscription_policy_unconfigured"
+			: explainOnly ? "explain_only"
+			: candidates.length === 0 ? "no_available_models"
+			: applied ? "selected" : "shadow_recommendation";
 		const decision: RouteDecision = {
 			schemaVersion: 1,
 			routeId,
@@ -301,7 +348,9 @@ export class ModelRoutingEngine {
 			estimatedP95LatencyMs: recommended?.prediction.estimatedP95LatencyMs,
 			candidates: evaluated.map((arm) => arm.decision).sort((a, b) => b.score - a.score),
 			constraints,
-			explanation: `${classification.reason}; ${reason}; ${recommended ? `recommended ${recommended.profile.ref}:${recommended.thinkingLevel}` : "no safe candidate"}.`,
+			explanation: subscriptionPick
+				? `${classification.reason}; ${reason}; selected ${subscriptionPick.arm.model}:${selectedThinking} [${subscriptionPick.notes.join(" ")}].`
+				: `${classification.reason}; ${reason}; ${recommended ? `recommended ${recommended.profile.ref}:${recommended.thinkingLevel}` : "no safe candidate"}.`,
 			projectHash,
 			cohortKey: cohort,
 			forced,
@@ -352,6 +401,27 @@ export class ModelRoutingEngine {
 
 	recordFallback(decision: RouteDecision, fallback: string, outcome: import("./types.ts").RouteOutcome): void {
 		try { this.telemetry?.recordFallback({ ...this.dimensions(decision), routeId: decision.routeId, fallback, outcome, at: this.clock.now() }); } catch { /* non-fatal */ }
+	}
+
+	/**
+	 * Open the circuit breaker for every fingerprint of a family seen on the
+	 * failed decision, so later routes skip the whole family until the cooldown
+	 * expires. Safe no-op when the store is unavailable.
+	 */
+	suppressFamily(familyId: string, decision: RouteDecision, untilMs?: number): void {
+		if (!this.storeAvailable) return;
+		const now = this.clock.now();
+		const openUntil = untilMs ?? now + this.config.subscriptionPolicy.familyCooldownMs;
+		const fingerprints = new Set(
+			decision.candidates
+				.filter((entry) => familyIdForRef(entry.model, this.config.subscriptionPolicy) === familyId)
+				.map((entry) => entry.fingerprint),
+		);
+		for (const fingerprint of fingerprints) {
+			const saved = this.store!.setCircuitBreaker({ key: fingerprint, failureCount: 3, openedAt: now, openUntil, updatedAt: now, reason: `family:${familyId}` });
+			if (!saved.ok) this.degradeStore();
+		}
+		try { this.telemetry?.recordCircuitBreaker({ model: `family:${familyId}`, outcome: "opened", failureDomain: "provider", at: now }); } catch { /* non-fatal */ }
 	}
 
 	async getDecision(routeId: string): Promise<RouteDecision | undefined> {

@@ -17,7 +17,7 @@ import { registerRouterEntryRenderers } from "./rendering.ts";
 import { registerVirtualRouterProvider } from "./VirtualRouterProvider.ts";
 import { registerAnalyzeModelRouterTelemetryTool } from "./analyzeTelemetryTool.ts";
 
-const PROFILES: readonly RoutingProfile[] = ["balanced", "quality_first", "cost_first", "latency_first"];
+const PROFILES: readonly RoutingProfile[] = ["balanced", "quality_first", "cost_first", "latency_first", "subscription_first"];
 const MODES: readonly PiRouterMode[] = ["off", "managed", "shadow"];
 
 /** Shared runtime exposed to the opt-in model-router/* virtual provider. */
@@ -53,7 +53,7 @@ export default function piModelRouterExtension(pi: ExtensionAPI): void {
 		type: "string",
 	});
 	pi.registerFlag("router-profile", {
-		description: "Router profile: balanced, quality_first, cost_first, or latency_first",
+		description: "Router profile: balanced, quality_first, cost_first, latency_first, or subscription_first",
 		type: "string",
 	});
 

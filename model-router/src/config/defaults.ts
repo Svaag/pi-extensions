@@ -34,6 +34,18 @@ export const DEFAULT_ROUTER_CONFIG: RouterConfig = {
 			maxP95LatencyRatio: 2,
 			weights: { quality: 0.7, reliability: 0.2, cost: 0.05, latency: 0.05 },
 		},
+		subscription_first: {
+			// Deterministic family ranking ignores these weights entirely.
+			weights: { quality: 0, reliability: 0, cost: 1, latency: 0 },
+		},
+	},
+	subscriptionPolicy: {
+		enabled: false,
+		ranking: [],
+		includedProviders: [],
+		meteredProviders: [],
+		families: {},
+		familyCooldownMs: 900_000,
 	},
 	modelProfiles: {},
 	classifier: {

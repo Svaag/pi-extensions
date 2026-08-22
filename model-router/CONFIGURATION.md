@@ -106,6 +106,55 @@ Legacy `subagent-router.json` files are read first and migrated in memory; the n
 
 Unknown/invalid values fall back safely. Judge sampling is capped at 5% even if a larger number is supplied.
 
+## Subscription policy
+
+The `subscription_first` profile is driven by a `subscriptionPolicy` object in the router config.
+It is sanitized on load: ranking entries without a configured family are dropped, family configs
+not referenced by the ranking are dropped, empty/invalid members are dropped, provider ids are
+trimmed and de-duplicated, and `familyCooldownMs` falls back to `900000`. If the profile is
+selected but the policy is disabled or has no usable ranking, routing is skipped with the
+`subscription_policy_unconfigured` warning and the current model is kept.
+
+```json
+{
+  "profile": "subscription_first",
+  "subscriptionPolicy": {
+    "enabled": true,
+    "ranking": ["codex", "claude", "grok", "kimi", "glm"],
+    "includedProviders": ["openai-codex", "kimi-coding", "zai-official", "anthropic", "xai"],
+    "meteredProviders": ["venice", "openrouter"],
+    "familyCooldownMs": 900000,
+    "families": {
+      "codex": {
+        "preferred": "openai-codex/gpt-5.6-sol",
+        "members": ["openai-codex/gpt-5.6-sol", "openai-codex/gpt-5.6-luna", "openai-codex/gpt-5.6-terra"]
+      },
+      "claude": { "preferred": "anthropic/claude-sonnet-5", "members": ["anthropic/claude-sonnet-*"] },
+      "grok": { "preferred": "xai/grok-4.6", "members": ["xai/grok-4.6", "xai/grok-4.5"] },
+      "kimi": { "preferred": "kimi-coding/k3", "members": ["kimi-coding/k3", "kimi-coding/k3-256k", "openrouter/moonshotai/kimi-k3"] },
+      "glm": { "preferred": "zai-official/glm-5.3", "members": ["zai-official/glm-5.3", "venice/zai-org-glm-5-2"] }
+    }
+  }
+}
+```
+
+Semantics:
+
+- **Included first**: a family is *included* when any eligible member's provider is in
+  `includedProviders`; included families always beat metered ones regardless of rank.
+- **Family membership anchors on the full `provider/id` ref**, so endpoint mirrors such as
+  `openrouter/anthropic/claude-*` are not part of the official `anthropic` family.
+- **Member walk**: the `preferred` member if still eligible, else members in list order. This is
+  what promotes `kimi-coding/k3-256k` when `k3` fails the context check.
+- **Failover**: only `model-router/subscription` retries within a turn. A pre-output failure
+  removes every remaining candidate of that family (not just the one model) and walks the next
+  family in rank order until visible output or exhaustion.
+- **Hard constraints only**: modality, context window, max output tokens, and circuit/family
+  cooldowns. Quality floors, reliability floors, cost/latency caps, Thompson sampling, explore
+  coins, and critical-task lockout do not apply to this profile.
+- **Pins win**: `/model` and `/router pin` override the policy; `/router unpin` re-selects
+  `model-router/subscription`.
+
 ## Profile caps
 
 Each entry under `profiles` supports:

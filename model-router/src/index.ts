@@ -5,6 +5,7 @@ export * from "./core/features.ts";
 export * from "./core/modelFingerprint.ts";
 export * from "./core/bandit.ts";
 export * from "./core/constraints.ts";
+export * from "./core/families.ts";
 export * from "./core/objectives.ts";
 export * from "./core/priors.ts";
 export * from "./core/rollout.ts";

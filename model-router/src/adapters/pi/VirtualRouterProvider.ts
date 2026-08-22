@@ -10,6 +10,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { familyIdForRef, uniqueFamilyIds } from "../../core/families.ts";
 import type { ModelRoutingEngine } from "../../core/ModelRoutingEngine.ts";
 import type { RouteDecision, RoutingCandidate, RoutingProfile, ThinkingLevel } from "../../core/types.ts";
 import { ROUTE_ENTRY_TYPE, formatDecision, privacySafeRouteEntry, updateRouterStatus } from "./rendering.ts";
@@ -21,6 +22,7 @@ const PROFILE_BY_MODEL: Record<string, RoutingProfile> = {
 	quality: "quality_first",
 	cost: "cost_first",
 	latency: "latency_first",
+	subscription: "subscription_first",
 };
 
 export interface VirtualRouterRuntime {
@@ -117,6 +119,9 @@ function publishRouteDecision(pi: ExtensionAPI, ctx: ExtensionContext, decision:
 
 export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: VirtualRouterRuntimeGetter, options: VirtualRouterProviderOptions = {}): VirtualRouterProviderController {
 	let cacheAffinityModel: string | undefined;
+	// Session-scoped family suppression so a store outage still skips cooled-
+	// down families; reset together with the cache affinity.
+	const suppressedFamilies = new Set<string>();
 	const delegate = options.delegate ?? streamSimple;
 
 	const stream = (routerModel: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream => {
@@ -129,6 +134,8 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 				return;
 			}
 			const profile = PROFILE_BY_MODEL[routerModel.id] ?? "balanced";
+			const isSubscription = routerModel.id === "subscription";
+			const policy = isSubscription ? runtime.engine.config.subscriptionPolicy : undefined;
 			let snapshot;
 			try {
 				snapshot = await runtime.modelSource.snapshot({
@@ -142,7 +149,27 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 				return;
 			}
 			let remaining: RoutingCandidate[] = [...snapshot.candidates];
-			const attempts = Math.max(1, runtime.engine.config.virtualProvider.maxFallbacksBeforeOutput + 1);
+			if (isSubscription && policy) {
+				remaining = remaining.filter((candidate) => {
+					const familyId = familyIdForRef(`${candidate.provider}/${candidate.id}`, policy);
+					return !familyId || !suppressedFamilies.has(familyId);
+				});
+			}
+			// Subscription failover walks whole families, so its attempt budget is
+			// the number of remaining families; other virtual models keep 1 fallback.
+			const attempts = Math.max(1,
+				isSubscription && policy ? uniqueFamilyIds(remaining, policy).length : runtime.engine.config.virtualProvider.maxFallbacksBeforeOutput + 1);
+			const removeFromRemaining = (decision: RouteDecision) => {
+				if (!decision.selectedModel) return;
+				const familyId = isSubscription && policy ? familyIdForRef(decision.selectedModel, policy) : undefined;
+				if (familyId) {
+					suppressedFamilies.add(familyId);
+					runtime.engine.suppressFamily(familyId, decision);
+					remaining = remaining.filter((candidate) => familyIdForRef(`${candidate.provider}/${candidate.id}`, policy!) !== familyId);
+					return;
+				}
+				remaining = remaining.filter((candidate) => `${candidate.provider}/${candidate.id}` !== decision.selectedModel);
+			};
 			for (let attempt = 0; attempt < attempts; attempt += 1) {
 				let decision: RouteDecision;
 				try {
@@ -157,7 +184,9 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 						candidates: remaining,
 						profile,
 						forceMode: "auto",
-						explicitThinkingLevel: options?.reasoning as ThinkingLevel | undefined,
+						// The subscription profile owns thinking via complexity mapping;
+						// freezing it at the session level would defeat that.
+						explicitThinkingLevel: isSubscription ? undefined : options?.reasoning as ThinkingLevel | undefined,
 						cacheAffinityModel,
 					});
 					publishRouteDecision(pi, runtime.context, decision);
@@ -177,9 +206,9 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 				try { auth = await (runtime.context.modelRegistry as unknown as PiModelRegistryLike).getApiKeyAndHeaders(target); }
 				catch { auth = { ok: false }; }
 				if (!auth.ok) {
-					runtime.engine.recordFallback(decision, "provider", "failed");
+					runtime.engine.recordFallback(decision, isSubscription ? "family" : "provider", "failed");
 					await runtime.engine.observe({ routeId: decision.routeId, outcome: "failed", failureDomain: "provider", providerRequests: 1 });
-					remaining = remaining.filter((candidate) => `${candidate.provider}/${candidate.id}` !== decision.selectedModel);
+					removeFromRemaining(decision);
 					continue;
 				}
 
@@ -206,9 +235,9 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 				}
 				const failed = !terminal || terminal.type === "error";
 				if (failed && !visible && attempt + 1 < attempts) {
-					runtime.engine.recordFallback(decision, "pre_output", "failed");
+					runtime.engine.recordFallback(decision, isSubscription ? "family" : "pre_output", "failed");
 					await runtime.engine.observe(usageObservation(decision, terminal ? finalMessage(terminal) : undefined, startedAt, firstContentAt, "failed"));
-					remaining = remaining.filter((candidate) => `${candidate.provider}/${candidate.id}` !== decision.selectedModel);
+					removeFromRemaining(decision);
 					continue;
 				}
 				if (!visible) for (const pending of buffered) outer.push(pending);
@@ -235,9 +264,10 @@ export function registerVirtualRouterProvider(pi: ExtensionAPI, getRuntime: Virt
 			{ id: "quality", name: "Router · Quality", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 16_384 },
 			{ id: "cost", name: "Router · Cost", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 16_384 },
 			{ id: "latency", name: "Router · Latency", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 16_384 },
+			{ id: "subscription", name: "Router · Subscription", reasoning: true, input: ["text", "image"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 128_000, maxTokens: 16_384 },
 		],
 		streamSimple: stream as any,
 	});
 
-	return { resetSession() { cacheAffinityModel = undefined; } };
+	return { resetSession() { cacheAffinityModel = undefined; suppressedFamilies.clear(); } };
 }

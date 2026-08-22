@@ -17,7 +17,7 @@ export type ComplexityTier = (typeof COMPLEXITY_TIERS)[number];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-export const ROUTING_PROFILES = ["balanced", "quality_first", "cost_first", "latency_first"] as const;
+export const ROUTING_PROFILES = ["balanced", "quality_first", "cost_first", "latency_first", "subscription_first"] as const;
 export type RoutingProfile = (typeof ROUTING_PROFILES)[number];
 
 export type RoutingStage = "off" | "shadow" | "explore" | "auto";

@@ -27,12 +27,15 @@ export interface ArmConstraintInput {
 	modality: "text" | "image";
 	routingProfile: RoutingProfile;
 	circuitOpen: boolean;
+	/** Subscription mode keeps hard capability checks only (no floors/caps). */
+	mode?: "standard" | "subscription";
 }
 
 
 export function evaluateArmConstraints(input: ArmConstraintInput, config: RouterConfig): ConstraintEvaluation {
 	const reasons: string[] = [];
 	const { profile, prediction, assessment, baseline } = input;
+	const ignoreSoftFloors = input.mode === "subscription";
 	const qualityFloor = config.complexity.qualityFloor[assessment.complexityTier];
 	const reliabilityFloor = config.complexity.reliabilityFloor[assessment.complexityTier];
 	const needed = input.estimatedInputTokens + input.estimatedOutputTokens;
@@ -40,9 +43,21 @@ export function evaluateArmConstraints(input: ArmConstraintInput, config: Router
 	if (profile.contextWindow < needed) reasons.push(`context:${needed}>${profile.contextWindow}`);
 	if (profile.maxTokens < input.estimatedOutputTokens) reasons.push(`output:${input.estimatedOutputTokens}>${profile.maxTokens}`);
 	if (input.circuitOpen) reasons.push("circuit_open");
-	if (prediction.qualityMean < qualityFloor) reasons.push(`quality:${prediction.qualityMean.toFixed(3)}<${qualityFloor.toFixed(3)}`);
-	if (prediction.reliabilitySamples >= 20 && prediction.reliabilityMean < reliabilityFloor) reasons.push(`reliability:${prediction.reliabilityMean.toFixed(3)}<${reliabilityFloor.toFixed(3)}`);
+	if (!ignoreSoftFloors && prediction.qualityMean < qualityFloor) reasons.push(`quality:${prediction.qualityMean.toFixed(3)}<${qualityFloor.toFixed(3)}`);
+	if (!ignoreSoftFloors && prediction.reliabilitySamples >= 20 && prediction.reliabilityMean < reliabilityFloor) reasons.push(`reliability:${prediction.reliabilityMean.toFixed(3)}<${reliabilityFloor.toFixed(3)}`);
 	const selectedProfile = config.profiles[input.routingProfile];
+	if (ignoreSoftFloors) {
+		return {
+			model: profile.ref,
+			thinkingLevel: input.thinkingLevel,
+			eligible: reasons.length === 0,
+			reasons,
+			qualityFloor,
+			reliabilityFloor,
+			estimatedCostUsd: prediction.estimatedCostUsd,
+			estimatedP95LatencyMs: prediction.estimatedP95LatencyMs,
+		};
+	}
 	if (selectedProfile.maxCostUsd !== undefined && prediction.estimatedCostUsd !== undefined && prediction.estimatedCostUsd > selectedProfile.maxCostUsd) reasons.push("absolute_cost_cap");
 	if (selectedProfile.maxP95LatencyMs !== undefined && prediction.estimatedP95LatencyMs !== undefined && prediction.estimatedP95LatencyMs > selectedProfile.maxP95LatencyMs) reasons.push("absolute_latency_cap");
 	if (selectedProfile.maxCostRatio !== undefined && baseline?.costUsd !== undefined && prediction.estimatedCostUsd !== undefined && prediction.estimatedCostUsd > baseline.costUsd * selectedProfile.maxCostRatio) reasons.push("relative_cost_cap");

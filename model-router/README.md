@@ -15,6 +15,17 @@ The router keeps answer quality separate from operational reliability, starts fr
 - Missing data is unknown. Zero observations are “insufficient data,” never 0% success or zero cost.
 - Prompts, outputs, code, paths, tool payloads, credentials, and raw errors are not persisted or exported.
 
+## Subscription-first routing (opt-in)
+
+The `subscription_first` profile is deterministic, immediate, and family-based — no shadow stage,
+no bandit sampling, no quality/reliability/cost floors. It routes through the
+`model-router/subscription` virtual model using a hard family ranking (for example
+Codex > Claude > Grok > Kimi > GLM) and an included-vs-metered provider split: included families
+always beat metered ones, same-rank members walk in configured order, and a pre-output failure
+suppresses the **entire family** for `familyCooldownMs` before the next family is tried in the
+same turn. User pins still win; `/router unpin` returns to the policy. See
+[CONFIGURATION.md](CONFIGURATION.md#subscription-policy) for the `subscriptionPolicy` schema.
+
 ## Install as a Pi package
 
 ```bash

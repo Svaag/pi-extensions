@@ -3,7 +3,7 @@ import type { RoutingProfile } from "../../core/types.ts";
 import { PiRunRouter } from "./PiRunRouter.ts";
 import { formatRouterStatus } from "./rendering.ts";
 
-const PROFILES: readonly RoutingProfile[] = ["balanced", "quality_first", "cost_first", "latency_first"];
+const PROFILES: readonly RoutingProfile[] = ["balanced", "quality_first", "cost_first", "latency_first", "subscription_first"];
 const SUBCOMMANDS = ["status", "profile", "pin", "unpin", "feedback", "rollout", "reset-rollout", "telemetry"];
 
 export interface PiRunRouterAccessor {
