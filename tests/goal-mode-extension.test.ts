@@ -15,6 +15,7 @@ interface ExtensionHarness {
 	notifications: { message: string; level: string }[];
 	context: any;
 	setIdle: (value: boolean) => void;
+	setProcessing: (value: boolean) => void;
 }
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });
@@ -30,6 +31,8 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 	const sentUserMessages: SentUserMessage[] = [];
 	const notifications: { message: string; level: string }[] = [];
 	let isIdle = typeof idle === "function" ? idle : () => idle;
+	// Mimic pi: sending without a delivery mode while the agent is busy throws.
+	let processing = false;
 	const ui = {
 		theme: {
 			fg: (_color: string, text: string) => text,
@@ -61,6 +64,11 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 			events.set(name, handler);
 		},
 		sendUserMessage: (content: string, options?: SentUserMessage["options"]) => {
+			if (processing && !options?.deliverAs) {
+				throw new Error(
+					"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
+				);
+			}
 			sentUserMessages.push({ content, options });
 		},
 	};
@@ -75,6 +83,9 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 		context,
 		setIdle: (value: boolean) => {
 			isIdle = () => value;
+		},
+		setProcessing: (value: boolean) => {
+			processing = value;
 		},
 	};
 }
@@ -268,4 +279,24 @@ test("no resume fires when pi is not idle or the run belongs to an old revision"
 	await flushTimers();
 	// The replacement goal submission is the only extra message; no stale resume.
 	assert.equal(harness.sentUserMessages.length, 2);
+});
+
+test("a run starting during the backoff window queues the resume as followUp", async () => {
+	const harness = createHarness(true, { autoResumeBaseDelayMs: 30, autoResumeMaxDelayMs: 40 });
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Race the timer", harness.context);
+
+	await assistantTurn(harness, "error")();
+	// Idle at settle time, so the resume is scheduled with a backoff delay...
+	await harness.events.get("agent_settled")?.({}, harness.context);
+
+	// ...but a new run starts before the timer fires. The bare send would throw;
+	// the extension must queue the goal follow-up instead of dropping it.
+	harness.setProcessing(true);
+	harness.setIdle(false);
+	await flushTimers(60);
+
+	assert.equal(harness.sentUserMessages.length, 2);
+	assert.deepEqual(harness.sentUserMessages[1].options, { deliverAs: "followUp" });
+	assert.match(harness.sentUserMessages[1].content, /auto-resume/);
 });

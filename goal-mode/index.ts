@@ -455,14 +455,32 @@ export default function goalModeExtension(
 		}, delayMs);
 	});
 
-	function resumeAfterSettle(reason: string, ctx: ExtensionContext): void {
-		// State may have changed while the backoff timer was pending.
-		if (!goalModeEnabled || !currentGoal) return;
+	function queueGoalResume(prompt: string, ctx: ExtensionContext): void {
 		try {
-			pi.sendUserMessage(buildAutoResumePrompt(reason, currentGoal, goalRevision));
+			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(`Goal auto-resume failed: ${message}`, "error");
+		}
+	}
+
+	function resumeAfterSettle(reason: string, ctx: ExtensionContext): void {
+		// State may have changed while the backoff timer was pending.
+		if (!goalModeEnabled || !currentGoal) return;
+		const prompt = buildAutoResumePrompt(reason, currentGoal, goalRevision);
+
+		try {
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(prompt);
+			} else {
+				// Another extension or the user started a run while the resume
+				// timer was pending: queue behind it instead of throwing.
+				queueGoalResume(prompt, ctx);
+			}
+		} catch {
+			// Race: a run started between the idle check and the send. Queue the
+			// resume behind the active run rather than dropping it.
+			queueGoalResume(prompt, ctx);
 		}
 	}
 
