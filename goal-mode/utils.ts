@@ -24,6 +24,27 @@ export function replaceGoalModeContext<T>(messages: readonly T[], activeContext?
 	return filtered;
 }
 
+/**
+ * Build the follow-up user message used to resume a goal run that stopped
+ * without completing (API error, dropped stream, or any other pause).
+ */
+export function buildAutoResumePrompt(reason: string, goal: string, revision: number): string {
+	return [
+		`[Goal Mode auto-resume] The previous run stopped ${reason}.`,
+		`The active goal (revision ${revision}) is still in effect:`,
+		"",
+		goal,
+		"",
+		"Continue executing it from where you left off. Verify current state before redoing work, do not repeat completed steps, and do not ask open-ended questions.",
+		"Only emit [GOAL COMPLETE] once the entire goal has been delivered and verified.",
+	].join("\n");
+}
+
+/** Backoff delay before the nth consecutive auto-resume (1-based), in ms. */
+export function getAutoResumeDelayMs(attempt: number, baseMs: number, maxMs: number): number {
+	return Math.min(baseMs * attempt, maxMs);
+}
+
 /** Build the authoritative context re-injected for every model call. */
 export function buildPersistentGoalContext(goal: string, revision: number): string {
 	return [
