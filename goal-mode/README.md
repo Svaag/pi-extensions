@@ -32,18 +32,25 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
    one authoritative copy of the latest goal. This happens after context is
    rebuilt too, so manual compaction, automatic compaction, overflow retries,
    and tool-loop turns cannot drop the active goal.
-5. The agent receives instructions like:
+5. **Goal mode keeps driving.** When a run ends without a completion signal —
+   an API/provider error, a dropped stream, or any other event that pauses the
+   feed — the extension listens on Pi's `agent_settled` event and re-kicks the
+   agent with an auto-resume message so the goal keeps executing. Repeated API
+   errors back off progressively and pause goal mode after five consecutive
+   failures. An explicit user interrupt (`Esc`) intentionally pauses goal mode
+   instead of resuming; send any message or run `/goal <task>` to continue.
+6. The agent receives instructions like:
    - **Assumptions-first execution**: "When information is missing, do not ask
      questions — make a sensible assumption, state it briefly, and continue."
    - **Long-horizon execution**: "Break the work into milestones and keep a
      running checklist."
    - **Reporting progress**: "Summarize what you delivered and how to validate it."
-6. Progress items written by the agent in formats like `[DONE] item`,
+7. Progress items written by the agent in formats like `[DONE] item`,
    `- [x] item`, or `- [ ] item` are extracted and shown in the status widget.
-7. The agent can signal whole-goal completion with `[GOAL COMPLETE]`,
+8. The agent can signal whole-goal completion with `[GOAL COMPLETE]`,
    `[TASK COMPLETE]`, or `Goal complete.` — the extension will auto-exit goal
    mode. A checklist item such as `[DONE] Add tests` does not end the whole goal.
-8. State persists across session resume and follows the active session branch.
+9. State persists across session resume and follows the active session branch.
 
 The footer and checklist explicitly show **persisted** while a goal is active.
 `/goal-status` also reports how the goal is saved and re-injected.
