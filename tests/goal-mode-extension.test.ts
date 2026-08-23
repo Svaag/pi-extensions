@@ -7,11 +7,22 @@ interface SentUserMessage {
 	options?: { deliverAs?: "steer" | "followUp" };
 }
 
+interface SentCustomMessage {
+	message: {
+		customType: string;
+		content: string;
+		display: boolean;
+		details?: unknown;
+	};
+	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" };
+}
+
 interface ExtensionHarness {
 	commands: Map<string, (args: string, ctx: any) => Promise<void>>;
 	events: Map<string, (event: any, ctx: any) => Promise<any>>;
 	entries: any[];
 	sentUserMessages: SentUserMessage[];
+	sentCustomMessages: SentCustomMessage[];
 	notifications: { message: string; level: string }[];
 	context: any;
 	setIdle: (value: boolean) => void;
@@ -29,6 +40,7 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 	const events = new Map<string, (event: any, ctx: any) => Promise<any>>();
 	const entries: any[] = [];
 	const sentUserMessages: SentUserMessage[] = [];
+	const sentCustomMessages: SentCustomMessage[] = [];
 	const notifications: { message: string; level: string }[] = [];
 	let isIdle = typeof idle === "function" ? idle : () => idle;
 	// Mimic pi: sending without a delivery mode while the agent is busy throws.
@@ -71,6 +83,12 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 			}
 			sentUserMessages.push({ content, options });
 		},
+		sendMessage: (
+			message: SentCustomMessage["message"],
+			options?: SentCustomMessage["options"],
+		) => {
+			sentCustomMessages.push({ message, options });
+		},
 	};
 
 	goalModeExtension(pi, extensionOptions);
@@ -79,6 +97,7 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 		events,
 		entries,
 		sentUserMessages,
+		sentCustomMessages,
 		notifications,
 		context,
 		setIdle: (value: boolean) => {
@@ -107,6 +126,7 @@ test("busy /goal submissions steer the running agent and replace active goals", 
 		enabled: true,
 		goal: "Replacement goal",
 		revision: 2,
+		paused: false,
 		turns: 0,
 		progress: [],
 	});
@@ -145,10 +165,15 @@ test("active goals are injected after rebuilt context and restored from the bran
 	const resumedContext = await resumed.events.get("context")?.({ messages: [] }, resumed.context);
 	assert.match(resumedContext.messages[0].content, /Persist this goal/);
 	assert.match(resumedContext.messages[0].content, /Revision: 1/);
+
+	await flushTimers();
+	assert.equal(resumed.sentCustomMessages.length, 1);
+	assert.match(resumed.sentCustomMessages[0].message.content, /session was restored/);
 });
 
 function assistantTurn(harness: ExtensionHarness, stopReason: string, text = "working") {
 	return async () => {
+		await harness.events.get("agent_start")?.({}, harness.context);
 		await harness.events.get("turn_start")?.({}, harness.context);
 		await harness.events.get("turn_end")?.(
 			{
@@ -179,53 +204,73 @@ async function flushTimers(ms = 20): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-test("goal keeps driving after an API error pauses the feed", async () => {
+test("goal keeps driving after Pi exhausts retries for an API error", async () => {
 	const harness = createHarness(true, { autoResumeBaseDelayMs: 1, autoResumeMaxDelayMs: 2 });
 	await harness.events.get("session_start")?.({}, harness.context);
 	await harness.commands.get("goal")?.("Ship the feature", harness.context);
 
-	// First run ends in an API error without a completion signal.
 	await assistantTurn(harness, "error")();
-	assert.equal(harness.sentUserMessages.length, 1); // only the original submission
+	assert.equal(harness.sentCustomMessages.length, 0);
 
 	await harness.events.get("agent_settled")?.({}, harness.context);
-	assert.equal(harness.sentUserMessages.length, 1); // resumed after backoff timer
 	await flushTimers();
-	assert.equal(harness.sentUserMessages.length, 2);
-	assert.match(harness.sentUserMessages[1].content, /auto-resume/);
-	assert.match(harness.sentUserMessages[1].content, /after an API error/);
-	assert.match(harness.sentUserMessages[1].content, /Ship the feature/);
+
+	assert.equal(harness.sentCustomMessages.length, 1);
+	assert.match(harness.sentCustomMessages[0].message.content, /after an API error/);
+	assert.match(harness.sentCustomMessages[0].message.content, /Ship the feature/);
+	assert.deepEqual(harness.sentCustomMessages[0].options, {
+		triggerTurn: true,
+		deliverAs: "followUp",
+	});
 });
 
-test("goal resumes when a run stops without a completion signal", async () => {
-	const harness = createHarness(true, { autoResumeBaseDelayMs: 1, autoResumeMaxDelayMs: 2 });
+test("ordinary stops continue as soon as Pi settles", async () => {
+	const harness = createHarness(true);
 	await harness.events.get("session_start")?.({}, harness.context);
 	await harness.commands.get("goal")?.("Keep going", harness.context);
 
-	await assistantTurn(harness, "stop")();
+	await assistantTurn(harness, "stop", "The first approach failed; here are next steps.")();
+	assert.equal(harness.sentCustomMessages.length, 0);
 	await harness.events.get("agent_settled")?.({}, harness.context);
-	await flushTimers();
 
-	assert.equal(harness.sentUserMessages.length, 2);
-	assert.match(harness.sentUserMessages[1].content, /before the goal was completed/);
+	assert.equal(harness.sentUserMessages.length, 1);
+	assert.equal(harness.sentCustomMessages.length, 1);
+	assert.match(harness.sentCustomMessages[0].message.content, /next concrete action now/i);
+	assert.match(harness.sentCustomMessages[0].message.content, /materially different approach/i);
+	assert.deepEqual(harness.sentCustomMessages[0].options, {
+		triggerTurn: true,
+		deliverAs: "followUp",
+	});
 });
 
 test("an explicit user interrupt pauses goal mode instead of resuming", async () => {
-	const harness = createHarness(true, { autoResumeBaseDelayMs: 1, autoResumeMaxDelayMs: 2 });
+	const harness = createHarness(true);
 	await harness.events.get("session_start")?.({}, harness.context);
 	await harness.commands.get("goal")?.("Do not fight me", harness.context);
 
 	await assistantTurn(harness, "aborted")();
 	await harness.events.get("agent_settled")?.({}, harness.context);
-	await flushTimers();
 
-	assert.equal(harness.sentUserMessages.length, 1);
-	assert.equal(harness.entries.at(-1)?.data.enabled, true); // goal stays persisted
+	assert.equal(harness.sentCustomMessages.length, 0);
+	assert.equal(harness.entries.at(-1)?.data.enabled, true);
+	assert.equal(harness.entries.at(-1)?.data.paused, true);
 	assert.equal(harness.notifications.at(-1)?.level, "warning");
+
+	const restored = createHarness(true);
+	restored.entries.push(...harness.entries);
+	await restored.events.get("session_start")?.({}, restored.context);
+	await flushTimers();
+	assert.equal(restored.sentCustomMessages.length, 0);
+
+	await restored.events.get("before_agent_start")?.(
+		{ systemPrompt: "base" },
+		restored.context,
+	);
+	assert.equal(restored.entries.at(-1)?.data.paused, false);
 });
 
 test("completion signal exits goal mode so settled does not resume", async () => {
-	const harness = createHarness(true, { autoResumeBaseDelayMs: 1, autoResumeMaxDelayMs: 2 });
+	const harness = createHarness(true);
 	await harness.events.get("session_start")?.({}, harness.context);
 	await harness.commands.get("goal")?.("Finish up", harness.context);
 
@@ -233,8 +278,7 @@ test("completion signal exits goal mode so settled does not resume", async () =>
 	assert.equal(harness.entries.at(-1)?.data.enabled, false);
 
 	await harness.events.get("agent_settled")?.({}, harness.context);
-	await flushTimers();
-	assert.equal(harness.sentUserMessages.length, 1);
+	assert.equal(harness.sentCustomMessages.length, 0);
 });
 
 test("consecutive API errors back off and eventually pause instead of looping forever", async () => {
@@ -253,50 +297,102 @@ test("consecutive API errors back off and eventually pause instead of looping fo
 		await flushTimers();
 	}
 
-	// Original submission + capped number of auto-resumes, then it stops.
-	assert.equal(harness.sentUserMessages.length, 4);
+	assert.equal(harness.sentCustomMessages.length, 2);
 	assert.equal(harness.notifications.at(-1)?.level, "error");
-	assert.match(harness.notifications.at(-1)?.message ?? "", /consecutive API errors/);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /consecutive failed runs/);
 });
 
-test("no resume fires when pi is not idle or the run belongs to an old revision", async () => {
-	const harness = createHarness(() => false, { autoResumeBaseDelayMs: 1 });
+test("runs without an assistant outcome back off and stop at the failure limit", async () => {
+	const harness = createHarness(true, {
+		autoResumeBaseDelayMs: 1,
+		autoResumeMaxDelayMs: 2,
+		maxConsecutiveErrorResumes: 3,
+	});
 	await harness.events.get("session_start")?.({}, harness.context);
-	await harness.commands.get("goal")?.("Stale goal", harness.context);
+	await harness.commands.get("goal")?.("Handle missing outcomes", harness.context);
 
-	// Busy agent: settle must not kick off a competing run.
+	for (let attempt = 0; attempt < 5; attempt++) {
+		await harness.events.get("agent_start")?.({}, harness.context);
+		await harness.events.get("agent_end")?.({ messages: [] }, harness.context);
+		await harness.events.get("agent_settled")?.({}, harness.context);
+		await flushTimers();
+	}
+
+	assert.equal(harness.sentCustomMessages.length, 2);
+	assert.equal(harness.notifications.at(-1)?.level, "error");
+});
+
+test("a stale run settling after replacement drives the new goal", async () => {
+	const harness = createHarness(false, { autoResumeBaseDelayMs: 1 });
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Old goal", harness.context);
+
 	await assistantTurn(harness, "error")();
-	await harness.events.get("agent_settled")?.({}, harness.context);
-	await flushTimers();
-	assert.equal(harness.sentUserMessages.length, 1);
-
-	// Stale revision: goal replaced after the old run settled; the old run's
-	// settle must not resume (turnGoalRevision no longer matches).
+	await harness.commands.get("goal")?.("Replacement goal", harness.context);
 	harness.setIdle(true);
-	await assistantTurn(harness, "error")();
-	await harness.commands.get("goal")?.("New goal", harness.context); // revision++ and resets turnGoalRevision
+	await harness.events.get("agent_settled")?.({}, harness.context);
+
+	assert.equal(harness.sentCustomMessages.length, 1);
+	assert.match(harness.sentCustomMessages[0].message.content, /Replacement goal/);
+	assert.doesNotMatch(harness.sentCustomMessages[0].message.content, /after an API error/);
+});
+
+test("settlement before turn_start cannot strand the active goal", async () => {
+	const harness = createHarness(true, { autoResumeBaseDelayMs: 1 });
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Survive preflight", harness.context);
+
+	await harness.events.get("agent_start")?.({}, harness.context);
+	await harness.events.get("agent_end")?.(
+		{
+			messages: [
+				{
+					role: "assistant",
+					content: [],
+					stopReason: "error",
+				},
+			],
+		},
+		harness.context,
+	);
 	await harness.events.get("agent_settled")?.({}, harness.context);
 	await flushTimers();
-	// The replacement goal submission is the only extra message; no stale resume.
+
+	assert.equal(harness.sentCustomMessages.length, 1);
+	assert.match(harness.sentCustomMessages[0].message.content, /Survive preflight/);
+});
+
+test("replacing a goal cancels its pending error backoff", async () => {
+	const harness = createHarness(true, { autoResumeBaseDelayMs: 30, autoResumeMaxDelayMs: 40 });
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Old timer", harness.context);
+
+	await assistantTurn(harness, "error")();
+	await harness.events.get("agent_settled")?.({}, harness.context);
+	await harness.commands.get("goal")?.("New goal", harness.context);
+	await flushTimers(60);
+
+	assert.equal(harness.sentCustomMessages.length, 0);
 	assert.equal(harness.sentUserMessages.length, 2);
 });
 
-test("a run starting during the backoff window queues the resume as followUp", async () => {
+test("a busy run during error backoff discards the timer instead of queueing", async () => {
 	const harness = createHarness(true, { autoResumeBaseDelayMs: 30, autoResumeMaxDelayMs: 40 });
 	await harness.events.get("session_start")?.({}, harness.context);
 	await harness.commands.get("goal")?.("Race the timer", harness.context);
 
 	await assistantTurn(harness, "error")();
-	// Idle at settle time, so the resume is scheduled with a backoff delay...
 	await harness.events.get("agent_settled")?.({}, harness.context);
 
-	// ...but a new run starts before the timer fires. The bare send would throw;
-	// the extension must queue the goal follow-up instead of dropping it.
 	harness.setProcessing(true);
 	harness.setIdle(false);
 	await flushTimers(60);
+	assert.equal(harness.sentCustomMessages.length, 0);
 
-	assert.equal(harness.sentUserMessages.length, 2);
-	assert.deepEqual(harness.sentUserMessages[1].options, { deliverAs: "followUp" });
-	assert.match(harness.sentUserMessages[1].content, /auto-resume/);
+	// No stale Goal Mode follow-up survives to trigger after an explicit exit.
+	await harness.commands.get("no-goal")?.("", harness.context);
+	harness.setProcessing(false);
+	harness.setIdle(true);
+	await flushTimers();
+	assert.equal(harness.sentCustomMessages.length, 0);
 });

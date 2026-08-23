@@ -25,8 +25,10 @@ import {
 	getAutoResumeDelayMs,
 	getGoalDeliveryMode,
 	GOAL_MODE_CONTEXT_TYPE,
+	GOAL_MODE_RESUME_TYPE,
 	isGoalCompleteSignal,
 	mergeProgressItems,
+	pruneGoalModeResumeMessages,
 	replaceGoalModeContext,
 	type PlanModeState,
 } from "./utils.js";
@@ -107,14 +109,14 @@ function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
 
 const AUTO_RESUME_BASE_DELAY_MS = 2_000;
 const AUTO_RESUME_MAX_DELAY_MS = 30_000;
-const MAX_CONSECUTIVE_ERROR_RESUMES = 5;
+const MAX_CONSECUTIVE_FAILURES = 5;
 
 export interface GoalModeExtensionOptions {
 	/** Base delay for the auto-resume error backoff (tests inject a small value). */
 	autoResumeBaseDelayMs?: number;
 	/** Upper bound for the auto-resume error backoff. */
 	autoResumeMaxDelayMs?: number;
-	/** Consecutive error resumes allowed before pausing goal mode. */
+	/** Number of consecutive failed runs that triggers a Goal Mode pause. */
 	maxConsecutiveErrorResumes?: number;
 }
 
@@ -124,17 +126,19 @@ export default function goalModeExtension(
 ): void {
 	const autoResumeBaseDelayMs = options.autoResumeBaseDelayMs ?? AUTO_RESUME_BASE_DELAY_MS;
 	const autoResumeMaxDelayMs = options.autoResumeMaxDelayMs ?? AUTO_RESUME_MAX_DELAY_MS;
-	const maxConsecutiveErrorResumes =
-		options.maxConsecutiveErrorResumes ?? MAX_CONSECUTIVE_ERROR_RESUMES;
+	const maxConsecutiveFailures =
+		options.maxConsecutiveErrorResumes ?? MAX_CONSECUTIVE_FAILURES;
 
 	let goalModeEnabled = false;
 	let currentGoal = "";
 	let goalRevision = 0;
+	let goalPaused = false;
 	let turnCount = 0;
 	let turnGoalRevision: number | undefined;
 	let progressItems: { text: string; done: boolean }[] = [];
-	// Stop reason of the last assistant message of the most recent low-level run.
+	// Outcome and goal ownership of the most recent low-level run.
 	let lastRunStopReason: AssistantMessage["stopReason"] | undefined;
+	let lastRunGoalRevision: number | undefined;
 	let consecutiveErrorResumes = 0;
 	let resumeTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -143,6 +147,7 @@ export default function goalModeExtension(
 			enabled: goalModeEnabled,
 			goal: currentGoal,
 			revision: goalRevision,
+			paused: goalPaused,
 			turns: turnCount,
 			progress: progressItems,
 		});
@@ -152,7 +157,10 @@ export default function goalModeExtension(
 		if (goalModeEnabled && currentGoal) {
 			ctx.ui.setStatus(
 				"goal-mode",
-				ctx.ui.theme.fg("accent", "⚡ goal • persisted"),
+				ctx.ui.theme.fg(
+					goalPaused ? "warning" : "accent",
+					goalPaused ? "⚡ goal • paused" : "⚡ goal • persisted",
+				),
 			);
 		} else {
 			ctx.ui.setStatus("goal-mode", undefined);
@@ -163,6 +171,9 @@ export default function goalModeExtension(
 				ctx.ui.theme.fg("accent", "Goal: ") + currentGoal,
 				ctx.ui.theme.fg("dim", "Persisted in this session • re-injected after compaction"),
 			];
+			if (goalPaused) {
+				lines.push(ctx.ui.theme.fg("warning", "Paused • send a message to resume"));
+			}
 			if (turnCount > 0) {
 				lines.push(ctx.ui.theme.fg("dim", `Turns: ${turnCount}`));
 			}
@@ -198,9 +209,12 @@ export default function goalModeExtension(
 		goalModeEnabled = true;
 		currentGoal = goal;
 		goalRevision++;
+		goalPaused = false;
 		turnCount = 0;
 		turnGoalRevision = undefined;
 		progressItems = [];
+		lastRunStopReason = undefined;
+		lastRunGoalRevision = undefined;
 		consecutiveErrorResumes = 0;
 		persistState();
 		updateStatus(ctx);
@@ -238,13 +252,24 @@ export default function goalModeExtension(
 		);
 	}
 
+	function pauseGoal(ctx: ExtensionContext): void {
+		clearPendingResume();
+		goalPaused = true;
+		persistState();
+		updateStatus(ctx);
+	}
+
 	function exitGoalMode(ctx: ExtensionContext): void {
 		clearPendingResume();
 		goalModeEnabled = false;
 		currentGoal = "";
+		goalPaused = false;
 		turnCount = 0;
 		turnGoalRevision = undefined;
 		progressItems = [];
+		lastRunStopReason = undefined;
+		lastRunGoalRevision = undefined;
+		consecutiveErrorResumes = 0;
 		persistState();
 		updateStatus(ctx);
 	}
@@ -304,6 +329,7 @@ export default function goalModeExtension(
 			const status = [
 				`Goal: ${currentGoal}`,
 				`Revision: ${goalRevision}`,
+				`State: ${goalPaused ? "paused" : "running"}`,
 				`Turns: ${turnCount}`,
 				`Progress: ${doneCount}/${progressItems.length}`,
 				"Persistence: saved in this session and re-injected on every model call",
@@ -331,6 +357,15 @@ export default function goalModeExtension(
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (!goalModeEnabled) return;
 
+		// A real user prompt explicitly resumes a paused goal. Hidden Goal Mode
+		// continuation messages bypass before_agent_start and cannot clear this.
+		if (goalPaused) {
+			goalPaused = false;
+			consecutiveErrorResumes = 0;
+			persistState();
+			updateStatus(ctx);
+		}
+
 		// Append the execute collaboration-style instructions to the system prompt.
 		let systemPrompt = event.systemPrompt + "\n\n" + EXECUTE_SYSTEM_PROMPT;
 
@@ -353,9 +388,17 @@ export default function goalModeExtension(
 		};
 	});
 
-	// ── turn tracking ──────────────────────────────────────────────────────────
+	// ── run and turn tracking ──────────────────────────────────────────────────
+
+	pi.on("agent_start", async () => {
+		// Cover runs that fail before their first turn_start event. A replacement
+		// goal resets this value so output from the old revision is not trusted.
+		turnGoalRevision = goalModeEnabled ? goalRevision : undefined;
+	});
 
 	pi.on("turn_start", async (_event, _ctx) => {
+		// A busy /goal replacement is delivered inside the same agent run, so
+		// capture the latest revision again at every model turn.
 		turnGoalRevision = goalModeEnabled ? goalRevision : undefined;
 		if (turnGoalRevision === undefined) return;
 		turnCount++;
@@ -377,28 +420,27 @@ export default function goalModeExtension(
 		updateStatus(ctx);
 	});
 
-	// ── agent_end: auto-exit on completion signal ──────────────────────────────
+	// ── agent_end: record outcome and exit only on verified completion ─────────
 
 	pi.on("agent_end", async (event, ctx) => {
-		// Remember why the last run stopped so agent_settled can decide whether to
-		// resume driving. Captured before the guards: even runs for a replaced or
-		// exited goal must not leave a stale reason behind.
-		lastRunStopReason = [...event.messages].reverse().find(isAssistantMessage)?.stopReason;
-
-		if (!goalModeEnabled || turnGoalRevision !== goalRevision) return;
-
-		// Check if the assistant signaled goal/task completion
 		const lastAssistant = [...event.messages].reverse().find(isAssistantMessage);
-		if (lastAssistant) {
-			const text = getTextContent(lastAssistant);
-			if (isGoalCompleteSignal(text)) {
-				exitGoalMode(ctx);
-				ctx.ui.notify("Goal complete — goal mode exited.", "info");
-				return;
-			}
+		lastRunStopReason = lastAssistant?.stopReason;
+		lastRunGoalRevision = turnGoalRevision;
+
+		if (lastAssistant && lastRunStopReason !== "error") {
+			consecutiveErrorResumes = 0;
 		}
 
-		// If we're coordinating with plan mode and every step is done, exit too
+		// Output from a run superseded by /goal replacement cannot complete or
+		// pause the new revision. agent_settled will drive the latest goal instead.
+		if (!goalModeEnabled || turnGoalRevision !== goalRevision) return;
+
+		if (lastAssistant && isGoalCompleteSignal(getTextContent(lastAssistant))) {
+			exitGoalMode(ctx);
+			ctx.ui.notify("Goal complete — goal mode exited.", "info");
+			return;
+		}
+
 		const planState = getPlanModeState(ctx);
 		if (planState && planState.todos.every((t) => t.completed)) {
 			exitGoalMode(ctx);
@@ -406,22 +448,21 @@ export default function goalModeExtension(
 		}
 	});
 
-	// ── keep driving after anything pauses the feed ────────────────────────────
-	// Re-injecting the goal into context is not enough: if a run ends because of
-	// an API error, a dropped stream, or any other pause, Pi settles idle and
-	// nothing would ever restart it. agent_settled fires exactly when Pi will
-	// not continue on its own (retries and auto-compaction included), so that is
-	// where goal mode re-kicks the agent until the goal is delivered.
+	// ── keep driving whenever Pi has no continuation left ──────────────────────
+	// agent_settled runs only after Pi has exhausted retries, compaction retries,
+	// and every queued user/extension follow-up. Starting the next goal turn here
+	// prevents stale Goal Mode messages from competing with real queued work.
 	pi.on("agent_settled", async (_event, ctx) => {
 		clearPendingResume();
+		if (!goalModeEnabled || !currentGoal || goalPaused) return;
 
-		if (!goalModeEnabled || !currentGoal) return;
-		if (!ctx.isIdle()) return; // another run is already queued or active
-		if (turnGoalRevision !== goalRevision) return; // stale run for an old goal
+		const stopReason =
+			lastRunGoalRevision === goalRevision ? lastRunStopReason : undefined;
 
-		// An explicit user interrupt (Esc) pauses goal mode on purpose. Never
-		// fight the operator: require a new message or /goal <task> to resume.
-		if (lastRunStopReason === "aborted") {
+		// Only an interrupt belonging to the current goal pauses it. An old run
+		// that was aborted while /goal replaced it must not strand the new goal.
+		if (stopReason === "aborted") {
+			pauseGoal(ctx);
 			ctx.ui.notify(
 				"Goal mode paused by interrupt. Send a message or run /goal <task> to resume.",
 				"warning",
@@ -429,58 +470,64 @@ export default function goalModeExtension(
 			return;
 		}
 
-		if (lastRunStopReason === "error") {
+		const missingOutcome =
+			lastRunGoalRevision === goalRevision && lastRunStopReason === undefined;
+		const failedRun = stopReason === "error" || missingOutcome;
+		if (failedRun) {
 			consecutiveErrorResumes++;
-			if (consecutiveErrorResumes > maxConsecutiveErrorResumes) {
+			if (consecutiveErrorResumes >= maxConsecutiveFailures) {
+				pauseGoal(ctx);
 				ctx.ui.notify(
-					`Goal paused after ${maxConsecutiveErrorResumes} consecutive API errors. Send a message to retry.`,
+					`Goal paused after ${maxConsecutiveFailures} consecutive failed runs. Send a message to retry.`,
 					"error",
 				);
 				return;
 			}
-		} else {
-			consecutiveErrorResumes = 0;
 		}
 
 		const reason =
-			lastRunStopReason === "error" ? "after an API error" : "before the goal was completed";
-		const delayMs =
-			lastRunStopReason === "error"
-				? getAutoResumeDelayMs(consecutiveErrorResumes, autoResumeBaseDelayMs, autoResumeMaxDelayMs)
-				: 0;
+			stopReason === "error"
+				? "after an API error"
+				: missingOutcome
+					? "without an assistant result"
+					: "before the goal was completed";
+		const delayMs = failedRun
+			? getAutoResumeDelayMs(consecutiveErrorResumes, autoResumeBaseDelayMs, autoResumeMaxDelayMs)
+			: 0;
+		const scheduledRevision = goalRevision;
+
+		if (delayMs === 0) {
+			resumeGoal(reason, scheduledRevision, ctx);
+			return;
+		}
 
 		resumeTimer = setTimeout(() => {
 			resumeTimer = undefined;
-			resumeAfterSettle(reason, ctx);
+			resumeGoal(reason, scheduledRevision, ctx);
 		}, delayMs);
 	});
 
-	function queueGoalResume(prompt: string, ctx: ExtensionContext): void {
+	function resumeGoal(reason: string, revision: number, ctx: ExtensionContext): void {
+		if (!goalModeEnabled || !currentGoal || goalPaused || revision !== goalRevision) return;
+		// Never leave a Goal Mode message in Pi's follow-up queue. If another run
+		// won the idle race, its own agent_settled event will try again.
+		if (!ctx.isIdle()) return;
+
 		try {
-			pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+			// Unlike sendUserMessage(), sendMessage has no asynchronous input or
+			// preflight window between this idle check and starting the turn.
+			pi.sendMessage(
+				{
+					customType: GOAL_MODE_RESUME_TYPE,
+					content: buildAutoResumePrompt(reason, currentGoal, revision),
+					display: false,
+					details: { reason, revision },
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			ctx.ui.notify(`Goal auto-resume failed: ${message}`, "error");
-		}
-	}
-
-	function resumeAfterSettle(reason: string, ctx: ExtensionContext): void {
-		// State may have changed while the backoff timer was pending.
-		if (!goalModeEnabled || !currentGoal) return;
-		const prompt = buildAutoResumePrompt(reason, currentGoal, goalRevision);
-
-		try {
-			if (ctx.isIdle()) {
-				pi.sendUserMessage(prompt);
-			} else {
-				// Another extension or the user started a run while the resume
-				// timer was pending: queue behind it instead of throwing.
-				queueGoalResume(prompt, ctx);
-			}
-		} catch {
-			// Race: a run started between the idle check and the send. Queue the
-			// resume behind the active run rather than dropping it.
-			queueGoalResume(prompt, ctx);
 		}
 	}
 
@@ -499,7 +546,11 @@ export default function goalModeExtension(
 					}
 				: undefined;
 
-		return { messages: replaceGoalModeContext(event.messages, activeContext) };
+		const messages = pruneGoalModeResumeMessages(
+			event.messages,
+			goalModeEnabled ? goalRevision : undefined,
+		);
+		return { messages: replaceGoalModeContext(messages, activeContext) };
 	});
 
 	// ── session shutdown / start ─────────────────────────────────────────────
@@ -521,6 +572,7 @@ export default function goalModeExtension(
 						enabled: boolean;
 						goal?: string;
 						revision?: number;
+						paused?: boolean;
 						turns?: number;
 						progress?: { text: string; done: boolean }[];
 					};
@@ -531,21 +583,37 @@ export default function goalModeExtension(
 			goalModeEnabled = goalEntry.data.enabled;
 			currentGoal = goalEntry.data.goal ?? "";
 			goalRevision = goalEntry.data.revision ?? (goalModeEnabled ? 1 : 0);
+			goalPaused = goalEntry.data.paused === true;
 			turnCount = goalEntry.data.turns ?? 0;
 			turnGoalRevision = undefined;
 			progressItems = goalEntry.data.progress ?? [];
+			lastRunStopReason = undefined;
+			lastRunGoalRevision = undefined;
 			consecutiveErrorResumes = 0;
 		} else {
 			goalModeEnabled = false;
 			currentGoal = "";
 			goalRevision = 0;
+			goalPaused = false;
 			turnCount = 0;
 			turnGoalRevision = undefined;
 			progressItems = [];
+			lastRunStopReason = undefined;
+			lastRunGoalRevision = undefined;
 			consecutiveErrorResumes = 0;
 		}
 
 		clearPendingResume();
 		updateStatus(ctx);
+
+		if (goalModeEnabled && currentGoal && !goalPaused) {
+			const restoredRevision = goalRevision;
+			// Defer until every extension has finished session_start and Pi has
+			// rediscovered resources. If a run starts first, its settle event resumes.
+			resumeTimer = setTimeout(() => {
+				resumeTimer = undefined;
+				resumeGoal("after the session was restored", restoredRevision, ctx);
+			}, 0);
+		}
 	});
 }

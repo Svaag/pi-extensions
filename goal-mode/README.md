@@ -32,13 +32,14 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
    one authoritative copy of the latest goal. This happens after context is
    rebuilt too, so manual compaction, automatic compaction, overflow retries,
    and tool-loop turns cannot drop the active goal.
-5. **Goal mode keeps driving.** When a run ends without a completion signal —
-   an API/provider error, a dropped stream, or any other event that pauses the
-   feed — the extension listens on Pi's `agent_settled` event and re-kicks the
-   agent with an auto-resume message so the goal keeps executing. Repeated API
-   errors back off progressively and pause goal mode after five consecutive
-   failures. An explicit user interrupt (`Esc`) intentionally pauses goal mode
-   instead of resuming; send any message or run `/goal <task>` to continue.
+5. **Goal mode keeps driving.** When Pi reaches `agent_settled` with no
+   completion signal, retry, compaction retry, or queued user follow-up left,
+   the extension atomically starts a hidden continuation turn. It tells the
+   model to take another concrete action, investigate failures, and change
+   tactics instead of only reporting a blocker. Failed runs back off
+   progressively and pause goal mode on the fifth consecutive failure. An
+   explicit user interrupt (`Esc`) intentionally pauses goal mode instead of
+   resuming; send any message or run `/goal <task>` to continue.
 6. The agent receives instructions like:
    - **Assumptions-first execution**: "When information is missing, do not ask
      questions — make a sensible assumption, state it briefly, and continue."
@@ -47,12 +48,18 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
    - **Reporting progress**: "Summarize what you delivered and how to validate it."
 7. Progress items written by the agent in formats like `[DONE] item`,
    `- [x] item`, or `- [ ] item` are extracted and shown in the status widget.
-8. The agent can signal whole-goal completion with `[GOAL COMPLETE]`,
-   `[TASK COMPLETE]`, or `Goal complete.` — the extension will auto-exit goal
-   mode. A checklist item such as `[DONE] Add tests` does not end the whole goal.
+8. The agent can signal whole-goal completion by putting `[GOAL COMPLETE]`,
+   `[TASK COMPLETE]`, or `Goal complete.` on the final non-empty response line.
+   The extension then exits goal mode. A checklist item such as `[DONE] Add
+   tests`, a quoted marker, or a marker followed by remaining caveats does not
+   end the whole goal.
 9. State persists across session resume and follows the active session branch.
+   A running restored goal automatically restarts after startup, `/reload`,
+   session resume, or fork. A goal paused by `Esc` or repeated failures stays
+   paused across reloads until you send a new message.
 
-The footer and checklist explicitly show **persisted** while a goal is active.
+The footer and checklist explicitly show **persisted** while a goal is running
+and **paused** when operator action or repeated failures stopped it.
 `/goal-status` also reports how the goal is saved and re-injected.
 
 ## Differences from Codex
@@ -80,6 +87,20 @@ You may replace the goal while work is in progress:
 
 The replacement is persisted immediately and steers the running agent. Bare
 `/goal`, `/no-goal`, or `Ctrl+Alt+G` exits goal mode.
+
+## Updating an existing install
+
+Use a symlink rather than a copied extension directory so fixes take effect on
+`git pull`, then run `/reload` in every already-running Pi session:
+
+```bash
+rm -rf ~/.pi/agent/extensions/goal-mode
+ln -s /path/to/pi-extensions/goal-mode ~/.pi/agent/extensions/goal-mode
+```
+
+The current footer reads `⚡ goal • persisted`. If it only reads `⚡ goal`, Pi is
+still running the legacy copy, which stops after ordinary assistant responses
+and also mistakes `[DONE]` checklist items for whole-goal completion.
 
 ## Plan Mode Integration
 

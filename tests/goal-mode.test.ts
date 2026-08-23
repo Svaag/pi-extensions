@@ -7,7 +7,9 @@ import {
 	getGoalDeliveryMode,
 	GOAL_MODE_CONTEXT_TYPE,
 	isGoalCompleteSignal,
+	GOAL_MODE_RESUME_TYPE,
 	mergeProgressItems,
+	pruneGoalModeResumeMessages,
 	replaceGoalModeContext,
 } from "../goal-mode/utils.ts";
 
@@ -45,6 +47,8 @@ test("isGoalCompleteSignal recognizes only whole-goal completion markers", () =>
 	assert.equal(isGoalCompleteSignal("[TASK COMPLETE]"), true);
 	assert.equal(isGoalCompleteSignal("Goal complete."), true);
 	assert.equal(isGoalCompleteSignal("Delivered and verified.\n[GOAL COMPLETE]"), true);
+	assert.equal(isGoalCompleteSignal("[GOAL COMPLETE]\nOne caveat remains."), false);
+	assert.equal(isGoalCompleteSignal("> [GOAL COMPLETE]"), false);
 	assert.equal(isGoalCompleteSignal("[DONE] Add tests"), false);
 	assert.equal(isGoalCompleteSignal('Do not say "Goal complete." until verification.'), false);
 	assert.equal(isGoalCompleteSignal("Still working."), false);
@@ -77,6 +81,29 @@ test("replaceGoalModeContext replaces stale contexts after a context rebuild", (
 		{ role: "user", content: "continue" },
 		latest,
 	]);
+});
+
+test("pruneGoalModeResumeMessages keeps only the current resume input", () => {
+	const currentResume = {
+		role: "custom",
+		customType: GOAL_MODE_RESUME_TYPE,
+		content: "current",
+		details: { revision: 3 },
+	};
+	const messages = [
+		{
+			role: "custom",
+			customType: GOAL_MODE_RESUME_TYPE,
+			content: "old",
+			details: { revision: 2 },
+		},
+		{ role: "assistant", content: "work" },
+		currentResume,
+	];
+
+	assert.deepEqual(pruneGoalModeResumeMessages(messages, 3), [messages[1], currentResume]);
+	assert.deepEqual(pruneGoalModeResumeMessages(messages, 4), [messages[1]]);
+	assert.deepEqual(pruneGoalModeResumeMessages(messages), [messages[1]]);
 });
 
 test("getGoalDeliveryMode steers busy agents and starts immediately when idle", () => {

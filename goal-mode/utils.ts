@@ -6,8 +6,11 @@
 /** Message type used for the authoritative, LLM-visible goal context. */
 export const GOAL_MODE_CONTEXT_TYPE = "goal-mode-context";
 
-/** Unambiguous tags that signal the agent considers the whole goal complete. */
-const GOAL_COMPLETE_PATTERN = /^\s*(?:\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|Goal complete\.)\s*$/im;
+/** Hidden message type used to force another execution turn. */
+export const GOAL_MODE_RESUME_TYPE = "goal-mode-auto-resume";
+
+/** Unambiguous final lines that signal the whole goal is complete. */
+const GOAL_COMPLETE_PATTERN = /^(?:\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|Goal complete\.)$/i;
 
 /** Choose how a submitted goal reaches the agent. */
 export function getGoalDeliveryMode(isIdle: boolean): "immediate" | "steer" {
@@ -25,6 +28,25 @@ export function replaceGoalModeContext<T>(messages: readonly T[], activeContext?
 }
 
 /**
+ * Keep a resume message only while it is the current input to the model.
+ * Historical resume prompts repeat the full goal and otherwise bloat context.
+ */
+export function pruneGoalModeResumeMessages<T>(
+	messages: readonly T[],
+	activeRevision?: number,
+): T[] {
+	const currentInput = activeRevision === undefined ? undefined : messages.at(-1);
+	return messages.filter((message) => {
+		const resume = message as {
+			customType?: unknown;
+			details?: { revision?: unknown };
+		};
+		if (resume.customType !== GOAL_MODE_RESUME_TYPE) return true;
+		return message === currentInput && resume.details?.revision === activeRevision;
+	});
+}
+
+/**
  * Build the follow-up user message used to resume a goal run that stopped
  * without completing (API error, dropped stream, or any other pause).
  */
@@ -36,6 +58,8 @@ export function buildAutoResumePrompt(reason: string, goal: string, revision: nu
 		goal,
 		"",
 		"Continue executing it from where you left off. Verify current state before redoing work, do not repeat completed steps, and do not ask open-ended questions.",
+		"Take the next concrete action now. Do not stop at a diagnosis, blocker report, failed command, missing optional tool, or list of proposed next steps.",
+		"Investigate the obstacle, try a sensible correction, and switch to a materially different approach if the first attempt fails. If a genuine external blocker remains, finish every unblocked part before reporting the exact unblock action.",
 		"Only emit [GOAL COMPLETE] once the entire goal has been delivered and verified.",
 	].join("\n");
 }
@@ -54,8 +78,9 @@ export function buildPersistentGoalContext(goal: string, revision: number): stri
 		goal,
 		"",
 		"This is the authoritative active goal. It supersedes earlier Goal Mode goals and remains active across turns, tool calls, and context compaction.",
-		"Continue executing it independently. Do not treat a compaction summary or the end of one turn as completion.",
-		"Only include [GOAL COMPLETE] after the entire goal has been delivered and verified.",
+		"Continue executing it independently. Do not treat a compaction summary, an ordinary obstacle, a failed attempt, or the end of one turn as a reason to stop.",
+		"When work gets stuck, inspect the failure, try a sensible correction, then change tactics rather than repeating the same blocker report. Keep taking concrete actions and finish all unblocked work.",
+		"Only include [GOAL COMPLETE] as the final non-empty line after the entire goal has been delivered and verified.",
 	].join("\n");
 }
 
@@ -70,7 +95,12 @@ export interface ProgressItem {
 }
 
 export function isGoalCompleteSignal(text: string): boolean {
-	return GOAL_COMPLETE_PATTERN.test(text);
+	const finalLine = text
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.at(-1);
+	return finalLine !== undefined && GOAL_COMPLETE_PATTERN.test(finalLine);
 }
 
 export function buildPlanModeCoordinationPrompt(state: PlanModeState): string {
