@@ -5,6 +5,7 @@ import * as path from "node:path";
 import type { AgentBackend, AgentBackendEvents, AgentHandle, BackendSpawnRequest } from "./AgentBackend.ts";
 import type { AgentRecord, AgentResult } from "./AgentTypes.ts";
 import { RpcClient } from "./RpcClient.ts";
+import { RUNTIME_TIMEOUT_RECOVERY_COMMAND_TEXT, RUNTIME_TIMEOUT_RECOVERY_MARKER } from "./TimeoutRecovery.ts";
 import { aggregateAssistantUsage } from "../telemetry/Usage.ts";
 import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 
@@ -18,6 +19,10 @@ export function isChildProcessAlive(proc: Pick<ChildProcessWithoutNullStreams, "
 export function isContextWindowError(message: unknown): boolean {
 	if (typeof message !== "string") return false;
 	return /context window|context length|maximum context|too many tokens|input exceeds/i.test(message);
+}
+
+export function shouldDeferAgentEnd(willRetry: boolean, timeoutRecoveryRequested: boolean, timeoutRecoveryPromptStarted: boolean): boolean {
+	return willRetry || (timeoutRecoveryRequested && !timeoutRecoveryPromptStarted);
 }
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
@@ -136,6 +141,7 @@ class SubprocessRpcHandle implements AgentHandle {
 	private readonly proc: ChildProcessWithoutNullStreams;
 	private readonly rpc: RpcClient;
 	private readonly tempPrompt: { dir: string; filePath: string } | undefined;
+	private readonly markTimeoutRecoveryRequested: () => void;
 	private closePromise: Promise<void> | undefined;
 
 	constructor(
@@ -143,11 +149,13 @@ class SubprocessRpcHandle implements AgentHandle {
 		proc: ChildProcessWithoutNullStreams,
 		rpc: RpcClient,
 		tempPrompt: { dir: string; filePath: string } | undefined,
+		markTimeoutRecoveryRequested: () => void,
 	) {
 		this.agentId = agentId;
 		this.proc = proc;
 		this.rpc = rpc;
 		this.tempPrompt = tempPrompt;
+		this.markTimeoutRecoveryRequested = markTimeoutRecoveryRequested;
 	}
 
 	prompt(message: string): Promise<void> {
@@ -160,6 +168,11 @@ class SubprocessRpcHandle implements AgentHandle {
 
 	followupTask(message: string): Promise<void> {
 		return this.rpc.send({ type: "follow_up", message }).then(() => undefined);
+	}
+
+	requestTimeoutRecovery(graceMs: number): Promise<void> {
+		this.markTimeoutRecoveryRequested();
+		return this.rpc.send({ type: "prompt", message: RUNTIME_TIMEOUT_RECOVERY_COMMAND_TEXT }, Math.max(1_000, graceMs + 1_000)).then(() => undefined);
 	}
 
 	async interrupt(_reason?: string): Promise<void> {
@@ -258,6 +271,8 @@ export class SubprocessRpcBackend implements AgentBackend {
 		let overflowRecoveryActive = false;
 		let overflowRecoveryStartedAt: number | undefined;
 		let compactionStartedAt: number | undefined;
+		let runtimeTimeoutRecoveryRequested = false;
+		let runtimeTimeoutRecoveryPromptStarted = false;
 		const toolStartedAt = new Map<string, number>();
 		const fallbackToolCallIds = new Map<string, string[]>();
 		let generatedToolCallId = 0;
@@ -342,7 +357,18 @@ export class SubprocessRpcBackend implements AgentBackend {
 					turnToolCalls = 0;
 					turnProviderRequests = 0;
 					turnCompactions = 0;
+					lastAssistantText = "";
+					lastAssistant = undefined;
+					toolStartedAt.clear();
+					fallbackToolCallIds.clear();
 					events.onStarted?.();
+				}
+				if (event.type === "message_start" && event.message?.role === "user") {
+					const message = textFromMessage(event.message);
+					if (runtimeTimeoutRecoveryRequested && message.includes(RUNTIME_TIMEOUT_RECOVERY_MARKER)) {
+						runtimeTimeoutRecoveryPromptStarted = true;
+						events.onOutput?.("\n[Child active turn aborted; producing a no-tools partial report.]\n");
+					}
 				}
 				if (event.type === "compaction_start") {
 					turnCompactions += 1;
@@ -447,7 +473,6 @@ export class SubprocessRpcBackend implements AgentBackend {
 					});
 				}
 				if (event.type === "agent_end") {
-					sawTerminalResult = true;
 					const messages = Array.isArray(event.messages) ? event.messages : [];
 					const usage = aggregateAssistantUsage(messages);
 					lastAssistant = finalAssistantMessage(messages) ?? lastAssistant;
@@ -456,12 +481,20 @@ export class SubprocessRpcBackend implements AgentBackend {
 					const errorMessage = lastAssistant?.errorMessage;
 					const status: AgentResult["status"] = stopReason === "aborted" ? "interrupted" : stopReason === "error" ? "failed" : "succeeded";
 					const summary = errorMessage || summarizeText(lastAssistantText, 800) || "(no output)";
+
+					if (shouldDeferAgentEnd(Boolean(event.willRetry), runtimeTimeoutRecoveryRequested, runtimeTimeoutRecoveryPromptStarted)) {
+						sawTerminalResult = false;
+						return;
+					}
+
+					sawTerminalResult = true;
 					if (status === "failed" && (sawContextOverflow || isContextWindowError(summary)) && !overflowRecoveryAttempted) {
 						sawTerminalResult = false;
 						void recoverFromContextOverflow(summary);
 						return;
 					}
 					overflowRecoveryActive = false;
+					const completedRuntimeTimeoutRecovery = runtimeTimeoutRecoveryPromptStarted;
 					events.onResult?.({
 						agentId: record.agentId,
 						status,
@@ -476,6 +509,10 @@ export class SubprocessRpcBackend implements AgentBackend {
 							compactions: turnCompactions,
 						},
 					});
+					if (completedRuntimeTimeoutRecovery) {
+						runtimeTimeoutRecoveryRequested = false;
+						runtimeTimeoutRecoveryPromptStarted = false;
+					}
 				}
 			},
 		});
@@ -505,7 +542,10 @@ export class SubprocessRpcBackend implements AgentBackend {
 			}
 		}
 
-		const handle = new SubprocessRpcHandle(record.agentId, proc, rpc, tempPrompt);
+		const handle = new SubprocessRpcHandle(record.agentId, proc, rpc, tempPrompt, () => {
+			runtimeTimeoutRecoveryRequested = true;
+			runtimeTimeoutRecoveryPromptStarted = false;
+		});
 		try {
 			await rpc.send({ type: "set_auto_compaction", enabled: true }, 10_000);
 		} catch (error) {

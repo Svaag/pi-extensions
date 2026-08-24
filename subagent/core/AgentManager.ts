@@ -177,6 +177,7 @@ export class AgentManager {
 	private readonly routeSignals = new Map<string, RouteRuntimeSignals>();
 	private readonly pendingFollowupRoutes = new Map<string, RoutingDecision[]>();
 	private readonly closingAgentIds = new Set<string>();
+	private readonly interruptPromises = new Map<string, Promise<AgentRecord>>();
 	private readonly observedRouteIds = new Set<string>();
 	private readonly telemetry: SubagentTelemetry;
 	private readonly onChange?: (manager: AgentManager) => void;
@@ -363,6 +364,7 @@ export class AgentManager {
 			if (spawnOptions.routingDecision) applyRoutingFields(record, spawnOptions.routingDecision);
 			this.transition(record, "running", { processState: "live_running", controllable: true, startedAt, finishedAt: undefined, error: undefined });
 			this.beginTurn(record, "live_followup", startedAt);
+			this.installAgentTimeout(agentId, record.timeoutMs ?? this.limits.maxRuntimeMsPerAgent);
 			await handle.prompt(prompt);
 			this.recordMessageTelemetry(agentId, "followup", "rpc_prompt", true, false, startedAt);
 			return { agentId, delivered: true, queued: false, deliveryMode: "rpc_prompt", message: "Follow-up started on the existing live agent." };
@@ -398,37 +400,58 @@ export class AgentManager {
 	}
 
 	async interruptAgent(agentId: string, reason?: string): Promise<AgentRecord> {
+		const existing = this.interruptPromises.get(agentId);
+		if (existing) return shallowCloneRecord(await existing);
+		const operation = this.interruptAgentOnce(agentId, reason);
+		this.interruptPromises.set(agentId, operation);
+		try {
+			return shallowCloneRecord(await operation);
+		} finally {
+			if (this.interruptPromises.get(agentId) === operation) this.interruptPromises.delete(agentId);
+		}
+	}
+
+	private async interruptAgentOnce(agentId: string, reason?: string): Promise<AgentRecord> {
 		const record = this.requireRecord(agentId);
+		if (record.status !== "running" && record.status !== "queued") return record;
 		const handle = this.handles.get(agentId);
 		this.handles.delete(agentId);
 		this.clearAgentTimeout(agentId);
 		this.clearIdleClose(agentId);
 		this.closingAgentIds.add(agentId);
+		let closeError: Error | undefined;
 		try {
 			if (handle?.isAlive()) await handle.close(reason);
+		} catch (error) {
+			closeError = error instanceof Error ? error : new Error(String(error));
 		} finally {
 			this.closingAgentIds.delete(agentId);
 		}
 		const finishedAt = nowMs();
+		const hadActiveTurn = this.activeTurnIds.has(record.agentId);
 		const previousMetrics = record.result?.metrics;
 		const turnMetrics = this.completedTurnMetrics(record, undefined, finishedAt);
-		this.ensureInterruptedResult(record, reason, finishedAt);
-		if (this.activeTurnIds.has(record.agentId)) record.result!.metrics = mergeCumulativeAgentMetrics(previousMetrics, turnMetrics, { outputChars: record.outputChars });
-		this.transition(record, "interrupted", { processState: "killed", controllable: false, finishedAt, error: reason ?? "Interrupted by parent agent." });
-		const outcome: TelemetryOutcome = reason?.toLowerCase().includes("timed out") ? "timeout" : "interrupted";
-		this.recordRouteTerminal(record, outcome === "timeout" ? "timeout" : "cancelled", finishedAt, turnMetrics, reason, "user");
-		this.finishRuntimeRecovery(record, outcome, finishedAt, reason);
-		this.finishTurn(record, outcome, finishedAt, reason, turnMetrics);
-		this.recordAgentCompletion(record, outcome, finishedAt, reason);
+		if (hadActiveTurn) record.result = undefined;
+		const terminalReason = closeError
+			? `${reason ?? "Interrupted by parent agent."}; child close failed: ${closeError.message}`
+			: reason;
+		this.ensureInterruptedResult(record, terminalReason, finishedAt);
+		if (hadActiveTurn) record.result!.metrics = mergeCumulativeAgentMetrics(previousMetrics, turnMetrics, { outputChars: record.outputChars });
+		this.transition(record, "interrupted", { processState: closeError ? "unknown" : "killed", controllable: false, finishedAt, error: terminalReason ?? "Interrupted by parent agent." });
+		const outcome: TelemetryOutcome = terminalReason?.toLowerCase().includes("timed out") ? "timeout" : "interrupted";
+		this.recordRouteTerminal(record, outcome === "timeout" ? "timeout" : "cancelled", finishedAt, turnMetrics, terminalReason, outcome === "timeout" ? "host" : "user");
+		this.finishRuntimeRecovery(record, outcome, finishedAt, terminalReason);
+		this.finishTurn(record, outcome, finishedAt, terminalReason, turnMetrics);
+		this.recordAgentCompletion(record, outcome, finishedAt, terminalReason);
 		const edge = this.graph.closeEdge(agentId, "interrupted");
-		this.store.appendEvent("agent.interrupted", { agentId, taskPath: record.taskPath, data: { reason, result: record.result, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
+		this.store.appendEvent("agent.interrupted", { agentId, taskPath: record.taskPath, data: { reason: terminalReason, result: record.result, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
 		if (edge) {
 			this.store.appendEvent("graph.edge_closed", { agentId, parentAgentId: record.parentAgentId, childAgentId: agentId, taskPath: record.taskPath, data: { edge } });
 			this.store.appendEdgeState(edge);
 		}
 		this.clearRetainedRuntimeState(agentId);
 		void this.startQueued();
-		return shallowCloneRecord(record);
+		return record;
 	}
 
 	async closeAgent(agentId: string, reason?: string): Promise<AgentRecord> {
@@ -610,23 +633,30 @@ export class AgentManager {
 		const record = this.records.get(agentId);
 		if (!record) return;
 		this.clearIdleClose(agentId);
+		const eventAt = nowMs();
 		const pending = this.pendingFollowupRoutes.get(agentId);
+		let resumedTerminalAgent = false;
 		if (record.status !== "running") {
-			if (!pending?.length || (record.status !== "succeeded" && record.status !== "failed")) return;
-			applyRoutingFields(record, pending.shift());
-			if (pending.length === 0) this.pendingFollowupRoutes.delete(agentId);
+			if (record.status !== "succeeded" && record.status !== "failed") return;
+			if (pending?.length) {
+				applyRoutingFields(record, pending.shift());
+				if (pending.length === 0) this.pendingFollowupRoutes.delete(agentId);
+			}
 			record.status = "running";
+			record.startedAt = eventAt;
 			record.finishedAt = undefined;
 			record.error = undefined;
+			resumedTerminalAgent = true;
 		} else if (!this.activeTurnIds.has(agentId) && pending?.length) {
 			applyRoutingFields(record, pending.shift());
 			if (pending.length === 0) this.pendingFollowupRoutes.delete(agentId);
 		}
-		record.startedAt = nowMs();
+		record.startedAt ??= eventAt;
 		record.processState = "live_running";
 		record.controllable = true;
-		record.updatedAt = record.startedAt;
-		if (!this.activeTurnIds.has(agentId)) this.beginTurn(record, "live_followup", record.updatedAt);
+		record.updatedAt = eventAt;
+		if (!this.activeTurnIds.has(agentId)) this.beginTurn(record, "live_followup", eventAt);
+		if (resumedTerminalAgent) this.installAgentTimeout(agentId, record.timeoutMs ?? this.limits.maxRuntimeMsPerAgent);
 		this.store.appendAgentState(record);
 		this.notifyChange();
 	}
@@ -784,31 +814,41 @@ export class AgentManager {
 		if (!record || record.status !== "running") return;
 		const graceMs = Math.max(0, this.limits.timeoutRecoveryGraceMs);
 		const reason = `Timed out after ${timeoutMs} ms`;
-		record.error = graceMs > 0 ? `${reason}; requested a final partial summary before hard abort.` : reason;
+		record.error = graceMs > 0 ? `${reason}; aborting the active turn before requesting a no-tools partial report.` : reason;
 		record.updatedAt = nowMs();
 		this.runtimeRecoveryStartedAt.set(agentId, record.updatedAt);
 		this.observeTelemetry((telemetry) => telemetry.recovery({ agentId, turnId: this.activeTurnIds.get(agentId), type: "runtime_timeout", phase: "started", at: record.updatedAt }));
-		this.store.appendEvent("agent.timeout_recovery", { agentId, taskPath: record.taskPath, data: { timeoutMs, graceMs, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
+		this.store.appendEvent("agent.timeout_recovery", { agentId, taskPath: record.taskPath, data: { phase: "started", timeoutMs, graceMs, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
 		this.store.appendAgentState(record);
 		this.notifyChange();
 
 		if (graceMs <= 0) {
-			void this.interruptAgent(agentId, reason);
+			await this.interruptAgent(agentId, reason);
 			return;
 		}
 		const hardTimeout = setTimeout(() => {
-			void this.interruptAgent(agentId, `${reason}; recovery grace ${graceMs} ms expired`);
+			void this.interruptAgent(agentId, `${reason}; recovery grace ${graceMs} ms expired`).catch((error) => {
+				console.warn(`subagent: failed to hard-abort timed-out agent ${agentId}: ${error instanceof Error ? error.message : String(error)}`);
+			});
 		}, graceMs);
 		hardTimeout.unref?.();
 		this.timeoutRecoveryHandles.set(agentId, hardTimeout);
 
 		const handle = this.handles.get(agentId);
-		if (handle?.isAlive()) {
-			try {
-				await handle.sendMessage("TIME BUDGET EXPIRED. Stop running tools now. Return a concise final answer using only what you already inspected. Include partial findings, useful file paths, commands/results seen, uncertainty, and next recommended checks. Do not call any more tools.");
-			} catch {
-				// Hard timeout above still preserves outputTail if steering cannot be delivered.
-			}
+		if (!handle?.isAlive()) return;
+		try {
+			await handle.requestTimeoutRecovery(graceMs);
+		} catch (error) {
+			const current = this.records.get(agentId);
+			if (!current || current.status !== "running") return;
+			const message = error instanceof Error ? error.message : String(error);
+			const failureReason = `${reason}; timeout recovery request failed: ${message}`;
+			current.error = failureReason;
+			current.updatedAt = nowMs();
+			this.store.appendEvent("agent.timeout_recovery", { agentId, taskPath: current.taskPath, data: { phase: "request_failed", error: message } });
+			this.store.appendAgentState(current);
+			this.notifyChange();
+			await this.interruptAgent(agentId, failureReason);
 		}
 	}
 

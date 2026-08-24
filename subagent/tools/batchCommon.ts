@@ -19,7 +19,7 @@ export const BatchCommonParams = {
 	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking level override for worker subagents." })),
 	routingMode: Type.Optional(StringEnum(["auto", "off", "explain"] as const, { description: "Smart router mode. Defaults to off/inherit current main Pi model; set auto to route." })),
 	routingProfile: Type.Optional(StringEnum(["balanced", "cost_first", "quality_first", "latency_first"] as const, { description: "Router objective for cost/reward/quality/latency tradeoff." })),
-	timeoutMs: Type.Optional(Type.Number({ description: "Per-worker timeout in milliseconds. Values below 300000ms are ignored and use the default 30-minute runtime." })),
+	timeoutMs: Type.Optional(Type.Number({ description: "Per-worker runtime timeout. Explicit values are accepted from 300000ms through 1800000ms; shorter values use the 30-minute default and longer values are capped." })),
 	writeMode: Type.Optional(StringEnum(["read_only", "disjoint_scope", "git_worktree"] as const, { description: "Worker write policy. Defaults to read_only." })),
 	allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "Allowed paths for disjoint_scope workers." })),
 	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Worker context mode. Defaults to fresh." })),

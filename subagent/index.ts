@@ -214,7 +214,8 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			const includeSummaries = mode === "full" || mode === "verbose";
 			const lines = agents.map((agent) => {
 				const duration = formatDuration(agent.durationMs);
-				const base = `${agent.taskPath}: ${agent.status}${duration ? ` ${duration}` : ""}`;
+				const status = agent.status === "interrupted" && /timed out/i.test(agent.error || agent.summary || "") ? "timed_out" : agent.status;
+				const base = `${agent.taskPath}: ${status}${duration ? ` ${duration}` : ""}`;
 				if (!includeSummaries) return base;
 				return `${base}${agent.summary ? ` — ${agent.summary}` : agent.error ? ` — ${agent.error}` : ""}`;
 			});

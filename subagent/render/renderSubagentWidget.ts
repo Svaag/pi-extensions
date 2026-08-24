@@ -24,6 +24,14 @@ function countAgents(agents: AgentSummary[], status: AgentStatus): number {
 	return agents.filter((agent) => agent.status === status).length;
 }
 
+function isTimedOut(agent: AgentSummary): boolean {
+	return agent.status === "interrupted" && /timed out/i.test(agent.error || agent.summary || "");
+}
+
+function countTimedOut(agents: AgentSummary[]): number {
+	return agents.filter(isTimedOut).length;
+}
+
 function activeJobs(jobs: BatchJobSummary[]): BatchJobSummary[] {
 	return jobs.filter((job) => job.status === "running" || job.status === "queued");
 }
@@ -172,11 +180,13 @@ function renderJobRow(job: BatchJobSummary, theme: ThemeLike, width: number): st
 function terminalSummaryLine(agents: AgentSummary[], theme: ThemeLike, nowMs: number, width: number): string | undefined {
 	const succeeded = countAgents(agents, "succeeded");
 	const failed = countAgents(agents, "failed");
-	const interrupted = countAgents(agents, "interrupted");
+	const timedOut = countTimedOut(agents);
+	const interrupted = countAgents(agents, "interrupted") - timedOut;
 	const lost = countAgents(agents, "lost");
 	const parts = [
 		succeeded ? theme.fg("success", plural(succeeded, "done", "done")) : "",
 		failed ? theme.fg("error", plural(failed, "failed", "failed")) : "",
+		timedOut ? theme.fg("warning", plural(timedOut, "timed out", "timed out")) : "",
 		interrupted ? theme.fg("warning", plural(interrupted, "interrupted", "interrupted")) : "",
 		lost ? theme.fg("warning", plural(lost, "lost", "lost")) : "",
 	].filter(Boolean);
@@ -184,25 +194,27 @@ function terminalSummaryLine(agents: AgentSummary[], theme: ThemeLike, nowMs: nu
 	const latest = [...agents]
 		.filter((agent) => !ACTIVE_AGENT_STATUSES.has(agent.status))
 		.sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt))[0];
-	const latestText = latest ? theme.fg("dim", `last: ${shortTaskLabel(latest.taskPath)}${agentDurationMs(latest, nowMs) !== undefined ? ` ${formatDuration(agentDurationMs(latest, nowMs))}` : ""}`) : "";
-	return fit(`${parts.join(theme.fg("dim", " · "))}${latestText ? theme.fg("dim", " · ") + latestText : ""}`, width);
+	const latestAt = latest ? latest.finishedAt ?? latest.updatedAt : undefined;
+	const latestDuration = latest ? agentDurationMs(latest, nowMs) : undefined;
+	const latestText = latest
+		? theme.fg("dim", `last finished: ${shortTaskLabel(latest.taskPath)}${latestDuration !== undefined ? ` · ran ${formatDuration(latestDuration)}` : ""}${latestAt !== undefined ? ` · ${formatDuration(Math.max(0, nowMs - latestAt))} ago` : ""}`)
+		: "";
+	return fit(`${theme.fg("dim", "history: ")}${parts.join(theme.fg("dim", " · "))}${latestText ? theme.fg("dim", " · ") + latestText : ""}`, width);
 }
 
-function problemHintLine(agents: AgentSummary[], theme: ThemeLike, width: number): string | undefined {
+function problemHintLine(agents: AgentSummary[], theme: ThemeLike, nowMs: number, width: number): string | undefined {
 	const latestProblem = [...agents]
 		.filter((agent) => PROBLEM_AGENT_STATUSES.has(agent.status))
 		.sort((a, b) => (b.finishedAt ?? b.updatedAt) - (a.finishedAt ?? a.updatedAt))[0];
 	if (!latestProblem) return undefined;
 	const text = latestProblem.error || latestProblem.summary || latestProblem.outputTail || "No error detail.";
-	return fit(theme.fg("error", `last problem: ${shortTaskLabel(latestProblem.taskPath)} — ${compactOneLine(text, 120)}`), width);
+	const finishedAt = latestProblem.finishedAt ?? latestProblem.updatedAt;
+	return fit(theme.fg("error", `last issue: ${shortTaskLabel(latestProblem.taskPath)} · finished ${formatDuration(Math.max(0, nowMs - finishedAt))} ago — ${compactOneLine(text, 120)}`), width);
 }
 
 export function subagentStatusSummary(agents: AgentSummary[], jobs: BatchJobSummary[]): SubagentStatusSummary | undefined {
 	const running = countAgents(agents, "running");
 	const queued = countAgents(agents, "queued");
-	const failed = countAgents(agents, "failed");
-	const interrupted = countAgents(agents, "interrupted");
-	const lost = countAgents(agents, "lost");
 	const runningJobs = activeJobs(jobs).length;
 	if (running || queued || runningJobs) {
 		const agentPart = running && queued ? `${running} run +${queued}q` : running ? `${running} run` : queued ? `${queued} queued` : "";
@@ -212,7 +224,6 @@ export function subagentStatusSummary(agents: AgentSummary[], jobs: BatchJobSumm
 		].filter(Boolean);
 		return { color: "warning", text: `🤖 ${parts.join(" · ")}` };
 	}
-	if (failed || interrupted || lost) return { color: failed ? "error" : "warning", text: `🤖 ${failed + interrupted + lost} issue${failed + interrupted + lost === 1 ? "" : "s"}` };
 	if (agents.length > 0 || jobs.length > 0) return { color: "accent", text: "🤖 idle" };
 	return undefined;
 }
@@ -230,10 +241,6 @@ export function renderSubagentWidgetLines(
 
 	const running = countAgents(agents, "running");
 	const queued = countAgents(agents, "queued");
-	const succeeded = countAgents(agents, "succeeded");
-	const failed = countAgents(agents, "failed");
-	const interrupted = countAgents(agents, "interrupted");
-	const lost = countAgents(agents, "lost");
 	const active = agents
 		.filter((agent) => ACTIVE_AGENT_STATUSES.has(agent.status))
 		.sort((a, b) => agentSortRank(a.status) - agentSortRank(b.status) || b.updatedAt - a.updatedAt);
@@ -243,10 +250,6 @@ export function renderSubagentWidgetLines(
 	const countParts = [
 		running ? theme.fg("warning", plural(running, "running", "running")) : "",
 		queued ? theme.fg("muted", plural(queued, "queued", "queued")) : "",
-		succeeded ? theme.fg("success", plural(succeeded, "done", "done")) : "",
-		failed ? theme.fg("error", plural(failed, "failed", "failed")) : "",
-		interrupted ? theme.fg("warning", plural(interrupted, "interrupted", "interrupted")) : "",
-		lost ? theme.fg("warning", plural(lost, "lost", "lost")) : "",
 		liveJobs.length ? theme.fg("warning", plural(liveJobs.length, "active job")) : "",
 	].filter(Boolean);
 	const hint = theme.fg("dim", "· /subagents");
@@ -255,7 +258,7 @@ export function renderSubagentWidgetLines(
 	if (active.length === 0 && liveJobs.length === 0) {
 		const terminal = terminalSummaryLine(agents, theme, nowMs, width);
 		if (terminal) lines.push(terminal);
-		const problem = problemHintLine(agents, theme, width);
+		const problem = problemHintLine(agents, theme, nowMs, width);
 		if (problem) lines.push(problem);
 		return lines;
 	}
@@ -271,7 +274,7 @@ export function renderSubagentWidgetLines(
 
 	const terminal = terminalSummaryLine(agents, theme, nowMs, width);
 	if (terminal) lines.push(terminal);
-	const problem = problemHintLine(agents, theme, width);
+	const problem = problemHintLine(agents, theme, nowMs, width);
 	if (problem) lines.push(problem);
 	return lines;
 }

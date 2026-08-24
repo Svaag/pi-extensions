@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildSubprocessRpcArgs, formatRetryNote, isChildProcessAlive, isContextWindowError, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
+import { buildSubprocessRpcArgs, formatRetryNote, isChildProcessAlive, isContextWindowError, shouldDeferAgentEnd, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
 
 test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	const args = buildSubprocessRpcArgs({
@@ -33,6 +33,13 @@ test("isContextWindowError recognizes provider overflow wording", () => {
 	assert.equal(isContextWindowError("Your input exceeds the context window of this model. Please adjust your input and try again."), true);
 	assert.equal(isContextWindowError("maximum context length is 200000 tokens"), true);
 	assert.equal(isContextWindowError("ordinary model failure"), false);
+});
+
+test("shouldDeferAgentEnd waits through retries and the pre-report timeout abort", () => {
+	assert.equal(shouldDeferAgentEnd(true, false, false), true);
+	assert.equal(shouldDeferAgentEnd(false, true, false), true);
+	assert.equal(shouldDeferAgentEnd(false, true, true), false);
+	assert.equal(shouldDeferAgentEnd(false, false, false), false);
 });
 
 test("textFromToolResult extracts text content and full-output path", () => {

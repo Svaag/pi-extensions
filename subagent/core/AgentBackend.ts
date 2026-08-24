@@ -49,6 +49,7 @@ export interface AgentHandle {
 	prompt(message: string): Promise<void>;
 	sendMessage(message: string): Promise<void>;
 	followupTask(message: string): Promise<void>;
+	requestTimeoutRecovery(graceMs: number): Promise<void>;
 	interrupt(reason?: string): Promise<void>;
 	close(reason?: string): Promise<void>;
 	isAlive(): boolean;

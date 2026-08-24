@@ -33,9 +33,20 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - Running agents are killed on session shutdown/reload.
 - Completed RPC children remain reusable for live follow-ups for up to 30 minutes, then close automatically; they are also reaped early when process capacity is needed, and explicit `close_agent` calls release them sooner.
 - Session history has no agent-count cap. Safety limits apply only to queued/running/live child processes, not completed or closed records.
-- Explicit per-agent `timeoutMs` values below 5 minutes are ignored and normalized to the default 30-minute runtime to avoid accidental 120s cutoffs.
-- On runtime timeout, the manager first asks the child to stop tools and emit a partial final summary, then hard-aborts after a bounded recovery grace period while preserving output tails.
+- Explicit per-agent `timeoutMs` values below 5 minutes are ignored and normalized to the default 30-minute runtime to avoid accidental 120s cutoffs. Values above 30 minutes are capped at 30 minutes.
+- On runtime timeout, the manager aborts the active child turn, disables child tools, and starts a partial-report turn using only retained context. It hard-aborts after a 60-second recovery grace period while preserving output tails.
 - After restart/reload, previously running agents are reconstructed as `lost`, persisted with explicit `agent.lost` / `graph.edge_lost` events, and not claimed as controllable.
+
+## Timeout semantics
+
+| Setting | Default | Meaning |
+|---|---:|---|
+| Agent runtime `timeoutMs` | 30 minutes | Stops the delegated run. Explicit values are accepted from 5–30 minutes. |
+| Timeout recovery grace | 60 seconds | Time allowed for aborting the active turn and generating a no-tools partial report before process termination. This is currently an internal limit. |
+| `wait_agent.timeoutMs` | 60 seconds | Bounds only the parent tool's wait call. Expiry does not stop the child. |
+| `wait_agent_job.timeoutMs` | 60 seconds | Bounds only the parent tool's batch wait call. Expiry does not cancel workers. |
+
+The widget labels retained terminal counts as history. Timed-out records remain available through `/subagents full` and the list/graph tools, but do not keep the footer in an active-issue state.
 
 ## Persistence
 

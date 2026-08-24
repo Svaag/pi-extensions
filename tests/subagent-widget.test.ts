@@ -65,5 +65,22 @@ test("subagent widget prioritizes active agents and collapses completed summarie
 test("subagent footer status summarizes active and idle states", () => {
 	assert.deepEqual(subagentStatusSummary([agent({ taskPath: "/root/a", status: "running" }), agent({ taskPath: "/root/b", status: "queued" })], []), { color: "warning", text: "🤖 1 run +1q" });
 	assert.deepEqual(subagentStatusSummary([agent({ taskPath: "/root/a", status: "succeeded" })], []), { color: "accent", text: "🤖 idle" });
+	assert.deepEqual(subagentStatusSummary([agent({ taskPath: "/root/a", status: "interrupted", error: "Timed out after 300000 ms" })], []), { color: "accent", text: "🤖 idle" });
 	assert.equal(subagentStatusSummary([], []), undefined);
+});
+
+test("subagent widget labels retained timeouts as history and separates duration from age", () => {
+	const agents = [agent({
+		taskPath: "/root/audit_emulator_layout",
+		status: "interrupted",
+		startedAt: 1_000,
+		finishedAt: 8_000,
+		updatedAt: 8_000,
+		error: "Timed out after 300000 ms; recovery grace 60000 ms expired",
+	})];
+	const lines = renderSubagentWidgetLines(agents, [], theme, 200, { nowMs: 10_000 });
+	assert.doesNotMatch(lines[0], /interrupted|timed out/);
+	assert.match(lines[1], /history: 1 timed out/);
+	assert.match(lines[1], /last finished: audit_emulator_layout · ran 7s · 2s ago/);
+	assert.match(lines[2], /last issue: audit_emulator_layout · finished 2s ago/);
 });

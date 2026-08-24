@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { extname, resolve, sep } from "node:path";
+import { RUNTIME_TIMEOUT_RECOVERY_COMMAND, RUNTIME_TIMEOUT_RECOVERY_PROMPT } from "./core/TimeoutRecovery.ts";
 
 export type ChildWriteMode = "read_only" | "disjoint_scope" | "git_worktree";
 
@@ -203,8 +204,36 @@ function blocked(reason: string) {
 
 export default function subagentChildPolicy(pi: ExtensionAPI): void {
 	const policy = loadPolicy();
+	let timeoutRecoveryActive = false;
+	let timeoutRecoveryPromptStarted = false;
+	let toolsBeforeTimeoutRecovery: string[] = [];
+
+	pi.registerCommand(RUNTIME_TIMEOUT_RECOVERY_COMMAND, {
+		description: "Abort the active child turn and emit a no-tools partial report.",
+		handler: async (_args, ctx) => {
+			if (timeoutRecoveryActive) return;
+			timeoutRecoveryActive = true;
+			toolsBeforeTimeoutRecovery = pi.getActiveTools();
+			ctx.abort();
+			await ctx.waitForIdle();
+			pi.setActiveTools([]);
+			timeoutRecoveryPromptStarted = true;
+			pi.sendUserMessage(RUNTIME_TIMEOUT_RECOVERY_PROMPT);
+		},
+	});
+
+	pi.on("agent_settled", () => {
+		if (!timeoutRecoveryActive || !timeoutRecoveryPromptStarted) return;
+		pi.setActiveTools(toolsBeforeTimeoutRecovery);
+		toolsBeforeTimeoutRecovery = [];
+		timeoutRecoveryPromptStarted = false;
+		timeoutRecoveryActive = false;
+	});
 
 	pi.on("tool_call", async (event: any) => {
+		if (timeoutRecoveryPromptStarted) {
+			return blocked(`Subagent ${policy.agentId}: tools are disabled while producing the runtime-timeout partial report.`);
+		}
 		if (event.toolName === "read") {
 			const candidate = normalizeCandidate(policy.cwd, toolPath(event.input));
 			if (!candidate) return blocked(`Subagent ${policy.agentId}: missing target path for read.`);

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { capToolResultText, isPathAllowed, isRawBinaryPath, isReadOnlyShellCommand, isReadPathAllowed, loadPolicy, looksLikeBinaryText } from "../subagent/child-policy.ts";
+import subagentChildPolicy, { capToolResultText, isPathAllowed, isRawBinaryPath, isReadOnlyShellCommand, isReadPathAllowed, loadPolicy, looksLikeBinaryText } from "../subagent/child-policy.ts";
+import { RUNTIME_TIMEOUT_RECOVERY_COMMAND, RUNTIME_TIMEOUT_RECOVERY_MARKER } from "../subagent/core/TimeoutRecovery.ts";
 
 test("child policy allows common read-only commands", () => {
 	assert.equal(isReadOnlyShellCommand("git status --short"), true);
@@ -56,4 +57,39 @@ test("child policy caps huge and binary-looking tool result text", () => {
 
 test("loadPolicy falls back safely", () => {
 	assert.equal(loadPolicy({ PI_SUBAGENT_POLICY: "not-json" }).writeMode, "read_only");
+});
+
+test("child timeout recovery aborts first, disables tools, and restores them after settling", async () => {
+	const handlers = new Map<string, Array<(...args: any[]) => any>>();
+	const commands = new Map<string, any>();
+	const actions: string[] = [];
+	const sentMessages: string[] = [];
+	let activeTools = ["read", "bash"];
+	const pi = {
+		registerCommand(name: string, command: any) { commands.set(name, command); },
+		on(name: string, handler: (...args: any[]) => any) {
+			const registered = handlers.get(name) ?? [];
+			registered.push(handler);
+			handlers.set(name, registered);
+		},
+		getActiveTools() { return [...activeTools]; },
+		setActiveTools(tools: string[]) { activeTools = [...tools]; actions.push(`tools:${tools.join(",")}`); },
+		sendUserMessage(message: string) { sentMessages.push(message); actions.push("partial-report"); },
+	} as any;
+	subagentChildPolicy(pi);
+
+	await commands.get(RUNTIME_TIMEOUT_RECOVERY_COMMAND).handler("", {
+		abort() { actions.push("abort"); },
+		async waitForIdle() { actions.push("idle"); },
+	});
+	assert.deepEqual(actions.slice(0, 4), ["abort", "idle", "tools:", "partial-report"]);
+	assert.deepEqual(activeTools, []);
+	assert.match(sentMessages[0], new RegExp(RUNTIME_TIMEOUT_RECOVERY_MARKER.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+	const blockedCall = await handlers.get("tool_call")?.[0]?.({ toolName: "read", input: { path: "README.md" } });
+	assert.equal(blockedCall?.block, true);
+	assert.match(blockedCall?.reason ?? "", /tools are disabled/);
+
+	await handlers.get("agent_settled")?.[0]?.();
+	assert.deepEqual(activeTools, ["read", "bash"]);
 });

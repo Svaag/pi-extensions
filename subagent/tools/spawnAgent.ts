@@ -29,7 +29,7 @@ const SpawnAgentCommonParams = {
 	contextSummary: Type.Optional(Type.String({ description: "Explicit inherited context text. Sanitized before it reaches the child." })),
 	writeMode: Type.Optional(StringEnum(["read_only", "disjoint_scope", "git_worktree"] as const, { description: "Child write policy. Defaults to read_only." })),
 	allowedPaths: Type.Optional(Type.Array(Type.String(), { description: "Allowed paths for disjoint_scope write mode." })),
-	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task. Values below 300000ms are ignored and use the default 30-minute runtime." })),
+	timeoutMs: Type.Optional(Type.Number({ description: "Maximum runtime for the delegated task. Explicit values are accepted from 300000ms through 1800000ms; shorter values use the 30-minute default and longer values are capped." })),
 	maxOutputChars: Type.Optional(Type.Number({ description: "Maximum retained output characters for this agent." })),
 	model: Type.Optional(Type.String({ description: "Optional model override for the child process. Defaults to the current main Pi model." })),
 	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking level override for the child process." })),

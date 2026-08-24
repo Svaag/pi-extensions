@@ -10,12 +10,18 @@ class FakeHandle implements AgentHandle {
 	readonly agentId: string;
 	closed = false;
 	messages: string[] = [];
+	timeoutRecoveryRequests = 0;
+	timeoutRecoveryError: Error | undefined;
 	constructor(agentId: string) {
 		this.agentId = agentId;
 	}
 	prompt(message: string): Promise<void> { this.messages.push(message); return Promise.resolve(); }
 	sendMessage(message: string): Promise<void> { this.messages.push(message); return Promise.resolve(); }
 	followupTask(message: string): Promise<void> { this.messages.push(message); return Promise.resolve(); }
+	requestTimeoutRecovery(_graceMs: number): Promise<void> {
+		this.timeoutRecoveryRequests += 1;
+		return this.timeoutRecoveryError ? Promise.reject(this.timeoutRecoveryError) : Promise.resolve();
+	}
 	interrupt(_reason?: string): Promise<void> { this.closed = true; return Promise.resolve(); }
 	close(_reason?: string): Promise<void> { this.closed = true; return Promise.resolve(); }
 	isAlive(): boolean { return !this.closed; }
@@ -251,6 +257,62 @@ test("AgentManager ignores too-short runtime timeouts", async () => {
 	assert.equal(backend.requests[0].timeoutMs, 30 * 60_000);
 });
 
+test("AgentManager aborts the active turn before timeout partial-report recovery", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend, {
+		minRuntimeMsPerAgent: 20,
+		maxRuntimeMsPerAgent: 20,
+		timeoutRecoveryGraceMs: 200,
+	});
+	const record = await h.manager.spawnAgent({ taskName: "timeout-recovery", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 50));
+	assert.equal(backend.handles.get(record.agentId)?.timeoutRecoveryRequests, 1);
+	assert.match(h.manager.getRecord(record.agentId)?.error ?? "", /aborting the active turn/);
+
+	backend.events.get(record.agentId)?.onResult?.({
+		agentId: record.agentId,
+		status: "succeeded",
+		summary: "partial report",
+		output: "partial report",
+	});
+	const waited = await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	assert.equal(waited.agents[0].status, "succeeded");
+	assert.equal(waited.agents[0].summary, "partial report");
+	assert.equal(waited.agents[0].error, undefined);
+});
+
+test("AgentManager hard-aborts when timeout partial-report recovery exceeds its grace", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend, {
+		minRuntimeMsPerAgent: 20,
+		maxRuntimeMsPerAgent: 20,
+		timeoutRecoveryGraceMs: 20,
+	});
+	const record = await h.manager.spawnAgent({ taskName: "timeout-hard-abort", prompt: "do it" });
+	const waited = await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	assert.equal(waited.agents[0].status, "interrupted");
+	assert.match(waited.agents[0].error ?? "", /recovery grace 20 ms expired/);
+	assert.equal(backend.handles.get(record.agentId)?.closed, true);
+});
+
+test("AgentManager timeout recovery request failure aborts immediately", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend, {
+		minRuntimeMsPerAgent: 100,
+		maxRuntimeMsPerAgent: 100,
+		timeoutRecoveryGraceMs: 500,
+	});
+	const record = await h.manager.spawnAgent({ taskName: "timeout-rpc-failure", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	backend.handles.get(record.agentId)!.timeoutRecoveryError = new Error("RPC unavailable");
+	const waited = await h.manager.wait({ agentId: record.agentId, timeoutMs: 1000 });
+	assert.equal(waited.agents[0].status, "interrupted");
+	assert.match(waited.agents[0].error ?? "", /timeout recovery request failed: RPC unavailable/);
+});
+
 test("AgentManager stores routed model, thinking, and routing decision", async () => {
 	const backend = new FakeBackend();
 	backend.autoComplete = false;
@@ -463,6 +525,33 @@ test("AgentManager interrupt marks agent interrupted", async () => {
 	const interrupted = await h.manager.interruptAgent(record.agentId, "stop");
 	assert.equal(interrupted.status, "interrupted");
 	assert.equal(interrupted.controllable, false);
+});
+
+test("AgentManager serializes repeated interrupt requests", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend);
+	const record = await h.manager.spawnAgent({ taskName: "interrupt-once", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	const [first, second] = await Promise.all([
+		h.manager.interruptAgent(record.agentId, "stop"),
+		h.manager.interruptAgent(record.agentId, "duplicate stop"),
+	]);
+	assert.equal(first.status, "interrupted");
+	assert.equal(second.status, "interrupted");
+	assert.equal(h.entries.filter((entry) => entry.data?.type === "agent.interrupted").length, 1);
+});
+
+test("AgentManager preserves lifecycle start time across child retries", async () => {
+	const backend = new FakeBackend();
+	backend.autoComplete = false;
+	const h = manager(backend);
+	const record = await h.manager.spawnAgent({ taskName: "retry-duration", prompt: "do it" });
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	const firstStartedAt = h.manager.getRecord(record.agentId)?.startedAt;
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	backend.events.get(record.agentId)?.onStarted?.();
+	assert.equal(h.manager.getRecord(record.agentId)?.startedAt, firstStartedAt);
 });
 
 test("AgentManager persists restored lost agents once", () => {
