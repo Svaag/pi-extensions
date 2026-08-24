@@ -23,6 +23,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 ## Safety defaults
 
 - Child agents default to `writeMode: "read_only"`.
+- Explicit `writeMode: "disjoint_scope"` authorizes spawning without a TUI confirmation, including for batch workers and unattended `/goal` runs; the child policy still limits writes to `allowedPaths`.
 - When `model` is omitted, managed shared routing begins in shadow and retains the current main Pi model. Explicit `routingMode: "auto"` forces immediate routing; automatic rollout may route omitted-mode requests only after evidence gates pass.
 - Child subprocesses are launched with extension/resource discovery disabled, plus a controlled child policy extension.
 - The child policy blocks raw reads of likely-binary/database files and caps oversized tool-result text before it enters the child LLM context.

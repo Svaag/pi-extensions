@@ -76,16 +76,6 @@ async function resolveAgentDefinition(ctx: any, params: any): Promise<{ definiti
 	return { definition: definition || undefined, agent };
 }
 
-async function confirmWriteCapability(ctx: any, spawnParams: any[]): Promise<void> {
-	if (!ctx.hasUI) return;
-	const writeTasks = spawnParams.filter((item) => (item.writeMode ?? "read_only") !== "read_only");
-	if (writeTasks.length === 0) return;
-	const names = writeTasks.slice(0, 8).map((item) => `${item.taskName}: ${item.writeMode}`).join("\n");
-	const suffix = writeTasks.length > 8 ? `\n... ${writeTasks.length - 8} more` : "";
-	const ok = await ctx.ui.confirm("Spawn write-capable subagent(s)?", `${writeTasks.length} task(s) request write access:\n${names}${suffix}\n\nParallel write-capable agents can conflict. Continue?`);
-	if (!ok) throw new Error("Write-capable subagent was not approved.");
-}
-
 async function spawnOne(ctx: any, manager: ReturnType<ManagerGetter>, params: any, signal?: AbortSignal): Promise<AgentRecord> {
 	const { definition, agent } = await resolveAgentDefinition(ctx, params);
 	const contextMode = (params.contextMode ?? "fresh") as ContextMode;
@@ -164,7 +154,6 @@ export function registerSpawnAgentTool(pi: ExtensionAPI, getManager: ManagerGett
 		async execute(_toolCallId, params: any, signal, onUpdate, ctx) {
 			const manager = getManager(ctx);
 			const spawnParams = expandSpawnParams(params);
-			await confirmWriteCapability(ctx, spawnParams);
 			onUpdate?.(textResult(spawnParams.length === 1 ? `Spawning subagent ${spawnParams[0].taskName}...` : `Spawning ${spawnParams.length} subagents...`));
 			const records: AgentRecord[] = [];
 			for (const item of spawnParams) records.push(await spawnOne(ctx, manager, item, signal));

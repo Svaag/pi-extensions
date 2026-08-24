@@ -25,10 +25,6 @@ export function registerSpawnAgentsOnJsonlTool(pi: ExtensionAPI, getBatchManager
 		async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
 			if (!params.jsonlPath && !params.jsonlText) throw new Error("spawn_agents_on_jsonl requires jsonlPath or jsonlText.");
 			if (params.jsonlPath && params.jsonlText) throw new Error("Provide only one of jsonlPath or jsonlText.");
-			if (params.writeMode && params.writeMode !== "read_only" && ctx.hasUI) {
-				const ok = await ctx.ui.confirm("Spawn write-capable JSONL workers?", `Rows will run with writeMode=${params.writeMode}. Continue?`);
-				if (!ok) throw new Error("Write-capable batch workers were not approved.");
-			}
 			const { rows, sourcePath } = await readRowsFromJsonl({ path: params.jsonlPath, text: params.jsonlText }, ctx.cwd, params.idField ?? params.idColumn);
 			const routed = await resolveBatchRouting(ctx, params, "jsonl", rows);
 			const job = getBatchManager(ctx).createJob({

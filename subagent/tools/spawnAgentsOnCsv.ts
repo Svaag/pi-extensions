@@ -24,10 +24,6 @@ export function registerSpawnAgentsOnCsvTool(pi: ExtensionAPI, getBatchManager: 
 		async execute(_toolCallId, params: any, _signal, _onUpdate, ctx) {
 			if (!params.csvPath && !params.csvText) throw new Error("spawn_agents_on_csv requires csvPath or csvText.");
 			if (params.csvPath && params.csvText) throw new Error("Provide only one of csvPath or csvText.");
-			if (params.writeMode && params.writeMode !== "read_only" && ctx.hasUI) {
-				const ok = await ctx.ui.confirm("Spawn write-capable CSV workers?", `Rows will run with writeMode=${params.writeMode}. Continue?`);
-				if (!ok) throw new Error("Write-capable batch workers were not approved.");
-			}
 			const { rows, sourcePath } = await readRowsFromCsv({ path: params.csvPath, text: params.csvText }, ctx.cwd, params.idColumn);
 			const routed = await resolveBatchRouting(ctx, params, "csv", rows);
 			const job = getBatchManager(ctx).createJob({
