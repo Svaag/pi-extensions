@@ -17,14 +17,22 @@ interface SentCustomMessage {
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" };
 }
 
+interface CompactRequest {
+	customInstructions?: string;
+	onComplete?: (result: unknown) => void;
+	onError?: (error: Error) => void;
+}
+
 interface ExtensionHarness {
 	commands: Map<string, (args: string, ctx: any) => Promise<void>>;
 	events: Map<string, (event: any, ctx: any) => Promise<any>>;
 	entries: any[];
 	sentUserMessages: SentUserMessage[];
 	sentCustomMessages: SentCustomMessage[];
+	compactRequests: CompactRequest[];
 	notifications: { message: string; level: string }[];
 	context: any;
+	setContextUsage: (tokens: number | null, contextWindow?: number) => void;
 	setIdle: (value: boolean) => void;
 	setProcessing: (value: boolean) => void;
 }
@@ -41,7 +49,9 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 	const entries: any[] = [];
 	const sentUserMessages: SentUserMessage[] = [];
 	const sentCustomMessages: SentCustomMessage[] = [];
+	const compactRequests: CompactRequest[] = [];
 	const notifications: { message: string; level: string }[] = [];
+	let contextUsage: { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
 	let isIdle = typeof idle === "function" ? idle : () => idle;
 	// Mimic pi: sending without a delivery mode while the agent is busy throws.
 	let processing = false;
@@ -60,6 +70,10 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 	const context = {
 		ui,
 		isIdle: () => isIdle(),
+		getContextUsage: () => contextUsage,
+		compact: (options: CompactRequest = {}) => {
+			compactRequests.push(options);
+		},
 		sessionManager: {
 			getBranch: () => entries,
 		},
@@ -98,8 +112,16 @@ function createHarness(idle: boolean | (() => boolean), extensionOptions?: any):
 		entries,
 		sentUserMessages,
 		sentCustomMessages,
+		compactRequests,
 		notifications,
 		context,
+		setContextUsage: (tokens: number | null, contextWindow = 272_000) => {
+			contextUsage = {
+				tokens,
+				contextWindow,
+				percent: tokens === null ? null : (tokens / contextWindow) * 100,
+			};
+		},
 		setIdle: (value: boolean) => {
 			isIdle = () => value;
 		},
@@ -203,6 +225,125 @@ function assistantTurn(harness: ExtensionHarness, stopReason: string, text = "wo
 async function flushTimers(ms = 20): Promise<void> {
 	await new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+test("context safeguards apply only to active Goal Mode tool loops", async () => {
+	const inactive = createHarness(true);
+	await inactive.events.get("session_start")?.({}, inactive.context);
+	inactive.setContextUsage(255_617);
+	await assistantTurn(inactive, "toolUse")();
+	assert.equal(inactive.compactRequests.length, 0);
+
+	const ordinaryStop = createHarness(true);
+	await ordinaryStop.events.get("session_start")?.({}, ordinaryStop.context);
+	await ordinaryStop.commands.get("goal")?.("Stay bounded", ordinaryStop.context);
+	ordinaryStop.setContextUsage(255_617);
+	await assistantTurn(ordinaryStop, "stop")();
+	assert.equal(ordinaryStop.compactRequests.length, 0);
+});
+
+test("tool loops compact once after crossing the context threshold", async () => {
+	const harness = createHarness(true);
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Stay within context", harness.context);
+
+	harness.setContextUsage(255_616);
+	await assistantTurn(harness, "toolUse")();
+	assert.equal(harness.compactRequests.length, 0);
+
+	harness.setContextUsage(255_617);
+	await assistantTurn(harness, "toolUse")();
+	await assistantTurn(harness, "toolUse")();
+
+	assert.equal(harness.compactRequests.length, 1);
+	assert.match(
+		harness.compactRequests[0].customInstructions ?? "",
+		/preserve completed Goal Mode work/i,
+	);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /threshold 255,616 of 272,000/);
+});
+
+test("pending context compaction suppresses settlement and resumes exactly once", async () => {
+	const harness = createHarness(true);
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Resume after summary", harness.context);
+	harness.setContextUsage(255_617);
+
+	await assistantTurn(harness, "toolUse")();
+	await harness.events.get("agent_settled")?.({}, harness.context);
+	assert.equal(harness.sentCustomMessages.length, 0);
+
+	harness.compactRequests[0].onComplete?.({});
+	harness.compactRequests[0].onComplete?.({});
+
+	assert.equal(harness.sentCustomMessages.length, 1);
+	assert.match(harness.sentCustomMessages[0].message.content, /after context compaction/);
+	assert.deepEqual(harness.sentCustomMessages[0].message.details, {
+		reason: "after context compaction",
+		revision: 1,
+	});
+});
+
+test("failed context compaction pauses the persisted goal", async () => {
+	const harness = createHarness(true);
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Pause safely", harness.context);
+	harness.setContextUsage(255_617);
+
+	await assistantTurn(harness, "toolUse")();
+	harness.compactRequests[0].onError?.(new Error("summary unavailable"));
+	await harness.events.get("agent_settled")?.({}, harness.context);
+
+	assert.equal(harness.sentCustomMessages.length, 0);
+	assert.equal(harness.entries.at(-1)?.data.enabled, true);
+	assert.equal(harness.entries.at(-1)?.data.paused, true);
+	assert.equal(harness.notifications.at(-1)?.level, "error");
+	assert.match(harness.notifications.at(-1)?.message ?? "", /summary unavailable/);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /send a message to retry/i);
+});
+
+test("goal replacement during compaction defers delivery and resumes the latest revision", async () => {
+	const harness = createHarness(true);
+	await harness.events.get("session_start")?.({}, harness.context);
+	await harness.commands.get("goal")?.("Old goal", harness.context);
+	harness.setContextUsage(255_617);
+	await assistantTurn(harness, "toolUse")();
+
+	await harness.commands.get("goal")?.("Replacement goal", harness.context);
+	assert.equal(harness.sentUserMessages.length, 1);
+	assert.equal(harness.entries.at(-1)?.data.revision, 2);
+	assert.match(harness.notifications.at(-1)?.message ?? "", /after context compaction/);
+
+	harness.compactRequests[0].onComplete?.({});
+	assert.equal(harness.sentCustomMessages.length, 1);
+	assert.match(harness.sentCustomMessages[0].message.content, /Replacement goal/);
+	assert.doesNotMatch(harness.sentCustomMessages[0].message.content, /Old goal/);
+	assert.deepEqual(harness.sentCustomMessages[0].message.details, {
+		reason: "after context compaction",
+		revision: 2,
+	});
+});
+
+test("exit or shutdown during compaction prevents a stale resume", async () => {
+	const exited = createHarness(true);
+	await exited.events.get("session_start")?.({}, exited.context);
+	await exited.commands.get("goal")?.("Exit during summary", exited.context);
+	exited.setContextUsage(255_617);
+	await assistantTurn(exited, "toolUse")();
+	await exited.commands.get("no-goal")?.("", exited.context);
+	exited.compactRequests[0].onComplete?.({});
+	assert.equal(exited.sentCustomMessages.length, 0);
+
+	const shutDown = createHarness(true);
+	await shutDown.events.get("session_start")?.({}, shutDown.context);
+	await shutDown.commands.get("goal")?.("Ignore stale callback", shutDown.context);
+	shutDown.setContextUsage(255_617);
+	await assistantTurn(shutDown, "toolUse")();
+	await shutDown.events.get("session_shutdown")?.({}, shutDown.context);
+	shutDown.compactRequests[0].onComplete?.({});
+	shutDown.compactRequests[0].onError?.(new Error("late failure"));
+	assert.equal(shutDown.sentCustomMessages.length, 0);
+	assert.equal(shutDown.notifications.some((item) => /late failure/.test(item.message)), false);
+});
 
 test("goal keeps driving after Pi exhausts retries for an API error", async () => {
 	const harness = createHarness(true, { autoResumeBaseDelayMs: 1, autoResumeMaxDelayMs: 2 });

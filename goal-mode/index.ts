@@ -21,6 +21,7 @@ import {
 	buildAutoResumePrompt,
 	buildPersistentGoalContext,
 	buildPlanModeCoordinationPrompt,
+	DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS,
 	extractProgressItems,
 	getAutoResumeDelayMs,
 	getGoalDeliveryMode,
@@ -30,6 +31,7 @@ import {
 	mergeProgressItems,
 	pruneGoalModeResumeMessages,
 	replaceGoalModeContext,
+	shouldCompactGoalContext,
 	type PlanModeState,
 } from "./utils.js";
 
@@ -110,6 +112,10 @@ function getPlanModeState(ctx: ExtensionContext): PlanModeState | undefined {
 const AUTO_RESUME_BASE_DELAY_MS = 2_000;
 const AUTO_RESUME_MAX_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 5;
+const GOAL_COMPACTION_INSTRUCTIONS = [
+	"Preserve completed Goal Mode work, the current repository state, unresolved blockers, and the exact next concrete action.",
+	"The active goal remains in effect after compaction; do not treat compaction as goal completion.",
+].join(" ");
 
 export interface GoalModeExtensionOptions {
 	/** Base delay for the auto-resume error backoff (tests inject a small value). */
@@ -141,6 +147,9 @@ export default function goalModeExtension(
 	let lastRunGoalRevision: number | undefined;
 	let consecutiveErrorResumes = 0;
 	let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+	let contextCompactionPending = false;
+	let contextCompactionGeneration = 0;
+	let extensionActive = true;
 
 	function persistState(): void {
 		pi.appendEntry("goal-mode", {
@@ -224,6 +233,15 @@ export default function goalModeExtension(
 		const replacing = goalModeEnabled;
 		const deliveryMode = getGoalDeliveryMode(ctx.isIdle());
 		enterGoalMode(goal, ctx);
+
+		if (contextCompactionPending) {
+			const action = replacing ? "replaced" : "saved";
+			ctx.ui.notify(
+				`Goal ${action} and will start after context compaction finishes.`,
+				"info",
+			);
+			return;
+		}
 
 		const submission = [
 			`Goal Mode revision ${goalRevision}${replacing ? " (replaces the previous goal)" : ""}:`,
@@ -418,7 +436,72 @@ export default function goalModeExtension(
 
 		persistState();
 		updateStatus(ctx);
+
+		if (goalPaused || contextCompactionPending || event.message.stopReason !== "toolUse") {
+			return;
+		}
+
+		const usage = ctx.getContextUsage();
+		if (!shouldCompactGoalContext(usage)) return;
+
+		requestGoalContextCompaction(usage, ctx);
 	});
+
+	function requestGoalContextCompaction(
+		usage: { tokens: number | null; contextWindow: number },
+		ctx: ExtensionContext,
+	): void {
+		if (usage.tokens === null || contextCompactionPending) return;
+
+		contextCompactionPending = true;
+		const generation = ++contextCompactionGeneration;
+		const threshold = usage.contextWindow - DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS;
+		ctx.ui.notify(
+			`Goal context reached ${usage.tokens.toLocaleString()} tokens ` +
+				`(threshold ${threshold.toLocaleString()} of ${usage.contextWindow.toLocaleString()}); ` +
+				"compacting before the next action.",
+			"warning",
+		);
+
+		const finish = (): boolean => {
+			if (
+				!extensionActive ||
+				!contextCompactionPending ||
+				generation !== contextCompactionGeneration
+			) {
+				return false;
+			}
+			contextCompactionPending = false;
+			return true;
+		};
+
+		const handleError = (error: Error): void => {
+			if (!finish()) return;
+			if (!goalModeEnabled || !currentGoal) return;
+
+			pauseGoal(ctx);
+			ctx.ui.notify(
+				`Goal context compaction failed: ${error.message}. ` +
+					"Goal mode is paused; send a message to retry.",
+				"error",
+			);
+		};
+
+		try {
+			ctx.compact({
+				customInstructions: GOAL_COMPACTION_INSTRUCTIONS,
+				onComplete: () => {
+					if (!finish()) return;
+					if (!goalModeEnabled || !currentGoal || goalPaused) return;
+
+					resumeGoal("after context compaction", goalRevision, ctx);
+				},
+				onError: handleError,
+			});
+		} catch (error) {
+			handleError(error instanceof Error ? error : new Error(String(error)));
+		}
+	}
 
 	// ── agent_end: record outcome and exit only on verified completion ─────────
 
@@ -454,7 +537,7 @@ export default function goalModeExtension(
 	// prevents stale Goal Mode messages from competing with real queued work.
 	pi.on("agent_settled", async (_event, ctx) => {
 		clearPendingResume();
-		if (!goalModeEnabled || !currentGoal || goalPaused) return;
+		if (!goalModeEnabled || !currentGoal || goalPaused || contextCompactionPending) return;
 
 		const stopReason =
 			lastRunGoalRevision === goalRevision ? lastRunStopReason : undefined;
@@ -557,9 +640,15 @@ export default function goalModeExtension(
 
 	pi.on("session_shutdown", async () => {
 		clearPendingResume();
+		extensionActive = false;
+		contextCompactionPending = false;
+		contextCompactionGeneration++;
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		extensionActive = true;
+		contextCompactionPending = false;
+		contextCompactionGeneration++;
 		const entries = ctx.sessionManager.getBranch();
 		const goalEntry = entries
 			.filter(

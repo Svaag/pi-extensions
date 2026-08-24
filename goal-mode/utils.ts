@@ -9,8 +9,33 @@ export const GOAL_MODE_CONTEXT_TYPE = "goal-mode-context";
 /** Hidden message type used to force another execution turn. */
 export const GOAL_MODE_RESUME_TYPE = "goal-mode-auto-resume";
 
+/** Pi's default token reserve for the model response after compaction. */
+export const DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS = 16_384;
+
 /** Unambiguous final lines that signal the whole goal is complete. */
 const GOAL_COMPLETE_PATTERN = /^(?:\[GOAL\s+COMPLETE\]|\[TASK\s+COMPLETE\]|Goal complete\.)$/i;
+
+/** Return whether Goal Mode should compact before another model request. */
+export function shouldCompactGoalContext(
+	usage: { tokens: number | null; contextWindow?: number } | undefined,
+	reserveTokens = DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS,
+): boolean {
+	if (
+		usage?.tokens === null ||
+		usage?.tokens === undefined ||
+		!Number.isFinite(usage.tokens) ||
+		usage.tokens < 0 ||
+		usage.contextWindow === undefined ||
+		!Number.isFinite(usage.contextWindow) ||
+		usage.contextWindow <= 0 ||
+		!Number.isFinite(reserveTokens) ||
+		reserveTokens < 0
+	) {
+		return false;
+	}
+
+	return usage.tokens > usage.contextWindow - reserveTokens;
+}
 
 /** Choose how a submitted goal reaches the agent. */
 export function getGoalDeliveryMode(isIdle: boolean): "immediate" | "steer" {

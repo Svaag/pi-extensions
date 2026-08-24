@@ -32,7 +32,15 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
    one authoritative copy of the latest goal. This happens after context is
    rebuilt too, so manual compaction, automatic compaction, overflow retries,
    and tool-loop turns cannot drop the active goal.
-5. **Goal mode keeps driving.** When Pi reaches `agent_settled` with no
+5. **Goal mode compacts between tool-loop turns.** After each completed
+   `toolUse` response, the extension checks Pi's current context estimate. If
+   usage exceeds `contextWindow - 16,384` tokens (Pi's default response
+   reserve), it stops the tool loop and requests one compaction before another
+   provider call. The active goal is re-injected and resumed exactly once after
+   compaction succeeds. Goal replacement is saved but deferred while the
+   summary is being generated. If compaction ultimately fails after Pi's
+   retries, the goal remains persisted but pauses until you send a message.
+6. **Goal mode keeps driving.** When Pi reaches `agent_settled` with no
    completion signal, retry, compaction retry, or queued user follow-up left,
    the extension atomically starts a hidden continuation turn. It tells the
    model to take another concrete action, investigate failures, and change
@@ -40,20 +48,20 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
    progressively and pause goal mode on the fifth consecutive failure. An
    explicit user interrupt (`Esc`) intentionally pauses goal mode instead of
    resuming; send any message or run `/goal <task>` to continue.
-6. The agent receives instructions like:
+7. The agent receives instructions like:
    - **Assumptions-first execution**: "When information is missing, do not ask
      questions — make a sensible assumption, state it briefly, and continue."
    - **Long-horizon execution**: "Break the work into milestones and keep a
      running checklist."
    - **Reporting progress**: "Summarize what you delivered and how to validate it."
-7. Progress items written by the agent in formats like `[DONE] item`,
+8. Progress items written by the agent in formats like `[DONE] item`,
    `- [x] item`, or `- [ ] item` are extracted and shown in the status widget.
-8. The agent can signal whole-goal completion by putting `[GOAL COMPLETE]`,
+9. The agent can signal whole-goal completion by putting `[GOAL COMPLETE]`,
    `[TASK COMPLETE]`, or `Goal complete.` on the final non-empty response line.
    The extension then exits goal mode. A checklist item such as `[DONE] Add
    tests`, a quoted marker, or a marker followed by remaining caveats does not
    end the whole goal.
-9. State persists across session resume and follows the active session branch.
+10. State persists across session resume and follows the active session branch.
    A running restored goal automatically restarts after startup, `/reload`,
    session resume, or fork. A goal paused by `Esc` or repeated failures stays
    paused across reloads until you send a new message.
@@ -66,9 +74,11 @@ and **paused** when operator action or repeated failures stopped it.
 
 - Codex has a built-in `/goal` slash command in their CLI; in Pi it is an
   extension.
-- This extension **does not** restrict tools (unlike plan mode).  Full `edit`,
+- This extension **does not** restrict tools (unlike plan mode). Full `edit`,
   `write`, `bash`, etc. access is available — the agent is expected to use them
   autonomously.
+- Between-turn compaction is a Goal Mode safeguard, not a replacement for Pi's
+  core automatic compaction in ordinary sessions.
 
 ## Usage
 
@@ -85,8 +95,9 @@ You may replace the goal while work is in progress:
 /goal Keep the rate limiter, but store counters in Redis and add integration tests
 ```
 
-The replacement is persisted immediately and steers the running agent. Bare
-`/goal`, `/no-goal`, or `Ctrl+Alt+G` exits goal mode.
+The replacement is persisted immediately and steers the running agent. If a
+Goal Mode compaction is already in progress, delivery waits for the new summary
+instead. Bare `/goal`, `/no-goal`, or `Ctrl+Alt+G` exits goal mode.
 
 ## Updating an existing install
 

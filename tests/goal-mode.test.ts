@@ -3,6 +3,7 @@ import test from "node:test";
 import {
 	buildPersistentGoalContext,
 	buildPlanModeCoordinationPrompt,
+	DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS,
 	extractProgressItems,
 	getGoalDeliveryMode,
 	GOAL_MODE_CONTEXT_TYPE,
@@ -11,6 +12,7 @@ import {
 	mergeProgressItems,
 	pruneGoalModeResumeMessages,
 	replaceGoalModeContext,
+	shouldCompactGoalContext,
 } from "../goal-mode/utils.ts";
 
 test("extractProgressItems extracts done and pending checklist items", () => {
@@ -104,6 +106,36 @@ test("pruneGoalModeResumeMessages keeps only the current resume input", () => {
 	assert.deepEqual(pruneGoalModeResumeMessages(messages, 3), [messages[1], currentResume]);
 	assert.deepEqual(pruneGoalModeResumeMessages(messages, 4), [messages[1]]);
 	assert.deepEqual(pruneGoalModeResumeMessages(messages), [messages[1]]);
+});
+
+test("shouldCompactGoalContext uses Pi's default response reserve", () => {
+	const contextWindow = 272_000;
+	const threshold = contextWindow - DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS;
+
+	assert.equal(threshold, 255_616);
+	assert.equal(
+		shouldCompactGoalContext({ tokens: threshold - 1, contextWindow }),
+		false,
+	);
+	assert.equal(shouldCompactGoalContext({ tokens: threshold, contextWindow }), false);
+	assert.equal(shouldCompactGoalContext({ tokens: threshold + 1, contextWindow }), true);
+});
+
+test("shouldCompactGoalContext rejects unavailable or invalid usage", () => {
+	assert.equal(shouldCompactGoalContext(undefined), false);
+	assert.equal(shouldCompactGoalContext({ tokens: null, contextWindow: 272_000 }), false);
+	assert.equal(shouldCompactGoalContext({ tokens: Number.NaN, contextWindow: 272_000 }), false);
+	assert.equal(shouldCompactGoalContext({ tokens: 10_000 }), false);
+	assert.equal(shouldCompactGoalContext({ tokens: 10_000, contextWindow: 0 }), false);
+	assert.equal(
+		shouldCompactGoalContext({ tokens: 10_000, contextWindow: Number.POSITIVE_INFINITY }),
+		false,
+	);
+});
+
+test("shouldCompactGoalContext accepts a reserve override for isolated tests", () => {
+	assert.equal(shouldCompactGoalContext({ tokens: 80, contextWindow: 100 }, 20), false);
+	assert.equal(shouldCompactGoalContext({ tokens: 81, contextWindow: 100 }, 20), true);
 });
 
 test("getGoalDeliveryMode steers busy agents and starts immediately when idle", () => {
