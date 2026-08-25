@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildSubprocessRpcArgs, formatRetryNote, isChildProcessAlive, isContextWindowError, shouldDeferAgentEnd, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
+import { buildSubprocessRpcArgs, formatRetryNote, getPiInvocation, isChildProcessAlive, isContextWindowError, shouldDeferAgentEnd, textFromToolResult } from "../subagent/core/SubprocessRpcBackend.ts";
 
 test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	const args = buildSubprocessRpcArgs({
@@ -27,6 +27,30 @@ test("buildSubprocessRpcArgs includes routed model and thinking level", () => {
 	assert.equal(args[args.indexOf("--model") + 1], "local-llamacpp/local-model");
 	assert(args.includes("--thinking"));
 	assert.equal(args[args.indexOf("--thinking") + 1], "off");
+});
+
+test("getPiInvocation falls back to PATH when the packaged executable moved", () => {
+	const args = ["--mode", "rpc"];
+	const invocation = getPiInvocation(
+		args,
+		{ execPath: "/opt/pi-coding-agent/pi", currentScript: "/$bunfs/root/pi.js" },
+		() => false,
+	);
+	assert.deepEqual(invocation, { command: "pi", args });
+});
+
+test("getPiInvocation reuses a packaged executable that still exists", () => {
+	const args = ["--mode", "rpc"];
+	const execPath = "/usr/lib/pi-coding-agent/pi";
+	const invocation = getPiInvocation(args, { execPath, currentScript: "/$bunfs/root/pi.js" }, (candidate) => candidate === execPath);
+	assert.deepEqual(invocation, { command: execPath, args });
+});
+
+test("getPiInvocation launches a real script through its runtime", () => {
+	const args = ["--mode", "rpc"];
+	const runtime = { execPath: "/usr/bin/node", currentScript: "/app/pi.js" };
+	const invocation = getPiInvocation(args, runtime, () => true);
+	assert.deepEqual(invocation, { command: runtime.execPath, args: [runtime.currentScript, ...args] });
 });
 
 test("isContextWindowError recognizes provider overflow wording", () => {

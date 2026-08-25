@@ -25,15 +25,25 @@ export function shouldDeferAgentEnd(willRetry: boolean, timeoutRecoveryRequested
 	return willRetry || (timeoutRecoveryRequested && !timeoutRecoveryPromptStarted);
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
+interface PiRuntime {
+	execPath: string;
+	currentScript?: string;
+}
+
+export function getPiInvocation(
+	args: string[],
+	runtime: PiRuntime = { execPath: process.execPath, currentScript: process.argv[1] },
+	pathExists: (candidate: string) => boolean = fs.existsSync,
+): { command: string; args: string[] } {
+	const { execPath, currentScript } = runtime;
+	const execPathExists = pathExists(execPath);
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+	if (execPathExists && currentScript && !isBunVirtualScript && pathExists(currentScript)) {
+		return { command: execPath, args: [currentScript, ...args] };
 	}
-	const execName = path.basename(process.execPath).toLowerCase();
+	const execName = path.basename(execPath).toLowerCase();
 	const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
-	if (!isGenericRuntime) return { command: process.execPath, args };
+	if (execPathExists && !isGenericRuntime) return { command: execPath, args };
 	return { command: "pi", args };
 }
 
