@@ -1,16 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+	buildAutoResumePrompt,
 	buildPersistentGoalContext,
 	buildPlanModeCoordinationPrompt,
 	DEFAULT_GOAL_COMPACTION_RESERVE_TOKENS,
 	extractProgressItems,
 	getGoalDeliveryMode,
 	GOAL_MODE_CONTEXT_TYPE,
-	isGoalCompleteSignal,
 	GOAL_MODE_RESUME_TYPE,
+	isGoalCompleteSignal,
 	mergeProgressItems,
-	pruneGoalModeResumeMessages,
 	replaceGoalModeContext,
 	shouldCompactGoalContext,
 } from "../goal-mode/utils.ts";
@@ -66,46 +66,66 @@ test("buildPersistentGoalContext identifies the authoritative persisted goal", (
 	assert.match(context, /Only include \[GOAL COMPLETE\]/);
 });
 
-test("replaceGoalModeContext replaces stale contexts after a context rebuild", () => {
+test("replaceGoalModeContext keeps the authoritative checkpoint at a stable prefix", () => {
 	const latest = { role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 3" };
-	const messages = replaceGoalModeContext(
+	const initialRequest = replaceGoalModeContext(
 		[
-			{ role: "compactionSummary", content: "older work" },
-			{ role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 1" },
 			{ role: "user", content: "continue" },
+			{ role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 1" },
+		],
+		latest,
+	);
+	const toolLoopRequest = replaceGoalModeContext(
+		[
+			{ role: "user", content: "continue" },
+			{ role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 1" },
+			{ role: "assistant", content: "I will inspect the project." },
+			{ role: "toolResult", content: "file list" },
 			{ role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 2" },
 		],
 		latest,
 	);
 
-	assert.deepEqual(messages, [
-		{ role: "compactionSummary", content: "older work" },
-		{ role: "user", content: "continue" },
+	assert.deepEqual(initialRequest, [
 		latest,
+		{ role: "user", content: "continue" },
 	]);
+	assert.deepEqual(toolLoopRequest.slice(0, initialRequest.length), initialRequest);
+	assert.equal(
+		toolLoopRequest.filter(
+			(message) => (message as { customType?: string }).customType === GOAL_MODE_CONTEXT_TYPE,
+		).length,
+		1,
+	);
 });
 
-test("pruneGoalModeResumeMessages keeps only the current resume input", () => {
+test("goal context replacement preserves historical resume prompts", () => {
+	const latest = { role: "custom", customType: GOAL_MODE_CONTEXT_TYPE, content: "revision 3" };
+	const previousResume = {
+		role: "custom",
+		customType: GOAL_MODE_RESUME_TYPE,
+		content: "resume revision 2",
+	};
 	const currentResume = {
 		role: "custom",
 		customType: GOAL_MODE_RESUME_TYPE,
-		content: "current",
-		details: { revision: 3 },
+		content: "resume revision 3",
 	};
-	const messages = [
-		{
-			role: "custom",
-			customType: GOAL_MODE_RESUME_TYPE,
-			content: "old",
-			details: { revision: 2 },
-		},
-		{ role: "assistant", content: "work" },
-		currentResume,
-	];
 
-	assert.deepEqual(pruneGoalModeResumeMessages(messages, 3), [messages[1], currentResume]);
-	assert.deepEqual(pruneGoalModeResumeMessages(messages, 4), [messages[1]]);
-	assert.deepEqual(pruneGoalModeResumeMessages(messages), [messages[1]]);
+	assert.deepEqual(
+		replaceGoalModeContext(
+			[{ role: "assistant", content: "working" }, previousResume, currentResume],
+			latest,
+		),
+		[latest, { role: "assistant", content: "working" }, previousResume, currentResume],
+	);
+});
+
+test("buildAutoResumePrompt relies on the stable goal checkpoint", () => {
+	const prompt = buildAutoResumePrompt("before the goal was completed", 3);
+
+	assert.match(prompt, /persisted active goal \(revision 3\)/i);
+	assert.match(prompt, /Continue executing it from where you left off/);
 });
 
 test("shouldCompactGoalContext uses Pi's default response reserve", () => {

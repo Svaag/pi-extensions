@@ -42,45 +42,29 @@ export function getGoalDeliveryMode(isIdle: boolean): "immediate" | "steer" {
 	return isIdle ? "immediate" : "steer";
 }
 
-/** Remove stale goal contexts and optionally append the authoritative one. */
+/**
+ * Remove stale goal contexts and prepend the authoritative one.
+ *
+ * Context hooks run before every provider request. The checkpoint must stay at
+ * a fixed position so each request extends, rather than rewrites, the cached
+ * prompt prefix as assistant and tool messages are added.
+ */
 export function replaceGoalModeContext<T>(messages: readonly T[], activeContext?: T): T[] {
 	const filtered = messages.filter(
 		(message) =>
 			(message as { customType?: unknown }).customType !== GOAL_MODE_CONTEXT_TYPE,
 	);
-	if (activeContext !== undefined) filtered.push(activeContext);
-	return filtered;
-}
-
-/**
- * Keep a resume message only while it is the current input to the model.
- * Historical resume prompts repeat the full goal and otherwise bloat context.
- */
-export function pruneGoalModeResumeMessages<T>(
-	messages: readonly T[],
-	activeRevision?: number,
-): T[] {
-	const currentInput = activeRevision === undefined ? undefined : messages.at(-1);
-	return messages.filter((message) => {
-		const resume = message as {
-			customType?: unknown;
-			details?: { revision?: unknown };
-		};
-		if (resume.customType !== GOAL_MODE_RESUME_TYPE) return true;
-		return message === currentInput && resume.details?.revision === activeRevision;
-	});
+	return activeContext === undefined ? filtered : [activeContext, ...filtered];
 }
 
 /**
  * Build the follow-up user message used to resume a goal run that stopped
  * without completing (API error, dropped stream, or any other pause).
  */
-export function buildAutoResumePrompt(reason: string, goal: string, revision: number): string {
+export function buildAutoResumePrompt(reason: string, revision: number): string {
 	return [
 		`[Goal Mode auto-resume] The previous run stopped ${reason}.`,
-		`The active goal (revision ${revision}) is still in effect:`,
-		"",
-		goal,
+		`The persisted active goal (revision ${revision}) is still in effect.`,
 		"",
 		"Continue executing it from where you left off. Verify current state before redoing work, do not repeat completed steps, and do not ask open-ended questions.",
 		"Take the next concrete action now. Do not stop at a diagnosis, blocker report, failed command, missing optional tool, or list of proposed next steps.",

@@ -154,7 +154,7 @@ test("busy /goal submissions steer the running agent and replace active goals", 
 	});
 });
 
-test("active goals are injected after rebuilt context and restored from the branch", async () => {
+test("active goals use a stable prefix after rebuilt context and restore from the branch", async () => {
 	const harness = createHarness(true);
 	await harness.events.get("session_start")?.({}, harness.context);
 	await harness.commands.get("goal")?.("Persist this goal", harness.context);
@@ -178,8 +178,30 @@ test("active goals are injected after rebuilt context and restored from the bran
 		harness.context,
 	);
 	assert.equal(rebuilt.messages.length, 2);
-	assert.equal(rebuilt.messages[1].customType, "goal-mode-context");
-	assert.match(rebuilt.messages[1].content, /Persist this goal/);
+	assert.equal(rebuilt.messages[0].customType, "goal-mode-context");
+	assert.match(rebuilt.messages[0].content, /Persist this goal/);
+	assert.equal(rebuilt.messages[1].role, "compactionSummary");
+
+	const firstProviderContext = await harness.events.get("context")?.(
+		{
+			messages: [{ role: "user", content: "Start work" }],
+		},
+		harness.context,
+	);
+	const nextProviderContext = await harness.events.get("context")?.(
+		{
+			messages: [
+				{ role: "user", content: "Start work" },
+				{ role: "assistant", content: "I will inspect the project." },
+				{ role: "toolResult", content: "file list" },
+			],
+		},
+		harness.context,
+	);
+	assert.deepEqual(
+		nextProviderContext.messages.slice(0, firstProviderContext.messages.length),
+		firstProviderContext.messages,
+	);
 
 	const resumed = createHarness(true);
 	resumed.entries.push(...harness.entries);
@@ -315,7 +337,7 @@ test("goal replacement during compaction defers delivery and resumes the latest 
 
 	harness.compactRequests[0].onComplete?.({});
 	assert.equal(harness.sentCustomMessages.length, 1);
-	assert.match(harness.sentCustomMessages[0].message.content, /Replacement goal/);
+	assert.match(harness.sentCustomMessages[0].message.content, /persisted active goal \(revision 2\)/i);
 	assert.doesNotMatch(harness.sentCustomMessages[0].message.content, /Old goal/);
 	assert.deepEqual(harness.sentCustomMessages[0].message.details, {
 		reason: "after context compaction",
@@ -358,7 +380,7 @@ test("goal keeps driving after Pi exhausts retries for an API error", async () =
 
 	assert.equal(harness.sentCustomMessages.length, 1);
 	assert.match(harness.sentCustomMessages[0].message.content, /after an API error/);
-	assert.match(harness.sentCustomMessages[0].message.content, /Ship the feature/);
+	assert.match(harness.sentCustomMessages[0].message.content, /persisted active goal \(revision 1\)/i);
 	assert.deepEqual(harness.sentCustomMessages[0].options, {
 		triggerTurn: true,
 		deliverAs: "followUp",
@@ -474,7 +496,7 @@ test("a stale run settling after replacement drives the new goal", async () => {
 	await harness.events.get("agent_settled")?.({}, harness.context);
 
 	assert.equal(harness.sentCustomMessages.length, 1);
-	assert.match(harness.sentCustomMessages[0].message.content, /Replacement goal/);
+	assert.match(harness.sentCustomMessages[0].message.content, /persisted active goal \(revision 2\)/i);
 	assert.doesNotMatch(harness.sentCustomMessages[0].message.content, /after an API error/);
 });
 
@@ -500,7 +522,7 @@ test("settlement before turn_start cannot strand the active goal", async () => {
 	await flushTimers();
 
 	assert.equal(harness.sentCustomMessages.length, 1);
-	assert.match(harness.sentCustomMessages[0].message.content, /Survive preflight/);
+	assert.match(harness.sentCustomMessages[0].message.content, /persisted active goal \(revision 1\)/i);
 });
 
 test("replacing a goal cancels its pending error backoff", async () => {

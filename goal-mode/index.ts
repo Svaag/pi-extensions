@@ -29,7 +29,6 @@ import {
 	GOAL_MODE_RESUME_TYPE,
 	isGoalCompleteSignal,
 	mergeProgressItems,
-	pruneGoalModeResumeMessages,
 	replaceGoalModeContext,
 	shouldCompactGoalContext,
 	type PlanModeState,
@@ -178,7 +177,7 @@ export default function goalModeExtension(
 		if (goalModeEnabled && currentGoal) {
 			const lines: string[] = [
 				ctx.ui.theme.fg("accent", "Goal: ") + currentGoal,
-				ctx.ui.theme.fg("dim", "Persisted in this session • re-injected after compaction"),
+				ctx.ui.theme.fg("dim", "Persisted in this session • stable cache prefix"),
 			];
 			if (goalPaused) {
 				lines.push(ctx.ui.theme.fg("warning", "Paused • send a message to resume"));
@@ -350,7 +349,7 @@ export default function goalModeExtension(
 				`State: ${goalPaused ? "paused" : "running"}`,
 				`Turns: ${turnCount}`,
 				`Progress: ${doneCount}/${progressItems.length}`,
-				"Persistence: saved in this session and re-injected on every model call",
+				"Persistence: saved in this session with a stable provider cache prefix",
 			].join("\n");
 			ctx.ui.notify(status, "info");
 		},
@@ -602,7 +601,7 @@ export default function goalModeExtension(
 			pi.sendMessage(
 				{
 					customType: GOAL_MODE_RESUME_TYPE,
-					content: buildAutoResumePrompt(reason, currentGoal, revision),
+					content: buildAutoResumePrompt(reason, revision),
 					display: false,
 					details: { reason, revision },
 				},
@@ -614,7 +613,12 @@ export default function goalModeExtension(
 		}
 	}
 
-	// ── keep exactly one authoritative goal in every model context ─────────────
+	// ── keep one stable authoritative goal at the start of every context ──────
+	//
+	// The context hook runs before every provider request. Prepending the
+	// checkpoint keeps every later tool-loop request an extension of the prior
+	// prompt. Appending it after newly produced tool results rewrites the cached
+	// prefix and forces providers to bill the whole context again.
 
 	pi.on("context", async (event) => {
 		const activeContext: AgentMessage | undefined =
@@ -625,15 +629,14 @@ export default function goalModeExtension(
 						content: buildPersistentGoalContext(currentGoal, goalRevision),
 						display: false,
 						details: { revision: goalRevision },
-						timestamp: Date.now(),
+						// This transient message is rebuilt per request. Keep every
+						// field deterministic so downstream context transforms retain
+						// the provider-cache prefix too.
+						timestamp: 0,
 					}
 				: undefined;
 
-		const messages = pruneGoalModeResumeMessages(
-			event.messages,
-			goalModeEnabled ? goalRevision : undefined,
-		);
-		return { messages: replaceGoalModeContext(messages, activeContext) };
+		return { messages: replaceGoalModeContext(event.messages, activeContext) };
 	});
 
 	// ── session shutdown / start ─────────────────────────────────────────────

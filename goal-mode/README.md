@@ -28,10 +28,12 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
    ([source](https://github.com/openai/codex/blob/main/codex-rs/collaboration-mode-templates/templates/execute.md))
    is appended to the system prompt sent to the LLM.
 4. The active goal is also stored as a hidden context checkpoint. Before every
-   model call, the extension removes stale goal checkpoints and injects exactly
-   one authoritative copy of the latest goal. This happens after context is
-   rebuilt too, so manual compaction, automatic compaction, overflow retries,
-   and tool-loop turns cannot drop the active goal.
+   model call, the extension removes stale checkpoints and places exactly one
+   authoritative copy at the **start** of the context. This fixed placement
+   keeps later tool-loop requests as extensions of the same provider cache
+   prefix instead of moving the goal after each new tool result. It also
+   restores the goal after manual compaction, automatic compaction, and
+   overflow retries.
 5. **Goal mode compacts between tool-loop turns.** After each completed
    `toolUse` response, the extension checks Pi's current context estimate. If
    usage exceeds `contextWindow - 16,384` tokens (Pi's default response
@@ -68,7 +70,8 @@ OpenAI Codex-style `/goal` ("execute" collaboration style) for Pi, with session 
 
 The footer and checklist explicitly show **persisted** while a goal is running
 and **paused** when operator action or repeated failures stopped it.
-`/goal-status` also reports how the goal is saved and re-injected.
+`/goal-status` also reports that the goal is saved with a stable provider cache
+prefix.
 
 ## Differences from Codex
 
