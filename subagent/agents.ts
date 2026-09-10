@@ -5,7 +5,7 @@
 import * as fs from "node:fs";
 import { homedir } from "node:os";
 import * as path from "node:path";
-import type { RoutingMode, RoutingObjective, ThinkingLevel } from "./core/AgentTypes.ts";
+import type { ThinkingLevel } from "./core/AgentTypes.ts";
 
 const CONFIG_DIR_NAME = ".pi";
 
@@ -36,8 +36,6 @@ export interface AgentConfig {
 	tools?: string[];
 	model?: string;
 	thinkingLevel?: ThinkingLevel;
-	routingMode?: RoutingMode;
-	routingProfile?: RoutingObjective;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -49,8 +47,6 @@ export interface AgentDiscoveryResult {
 }
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const ROUTING_MODES = new Set<RoutingMode>(["auto", "off", "explain"]);
-const ROUTING_OBJECTIVES = new Set<RoutingObjective>(["balanced", "cost_first", "quality_first", "latency_first"]);
 
 function parseOptionalEnum<T extends string>(value: string | undefined, allowed: Set<T>): T | undefined {
 	const normalized = value?.trim();
@@ -90,8 +86,6 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
 			thinkingLevel: parseOptionalEnum(frontmatter.thinking, THINKING_LEVELS),
-			routingMode: parseOptionalEnum(frontmatter.router, ROUTING_MODES),
-			routingProfile: parseOptionalEnum(frontmatter.routingProfile, ROUTING_OBJECTIVES),
 			systemPrompt: body,
 			source,
 			filePath,

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AggregationTemporality, InMemoryMetricExporter } from "../subagent/node_modules/@opentelemetry/sdk-metrics/build/src/index.js";
+import { AggregationTemporality, InMemoryMetricExporter } from "@opentelemetry/sdk-metrics";
 import { loadSubagentTelemetryConfig } from "../subagent/telemetry/Config.ts";
 import { createOpenTelemetrySubagentTelemetry, OpenTelemetrySubagentTelemetry } from "../subagent/telemetry/OpenTelemetry.ts";
 import { HmacTelemetryPrivacy, TELEMETRY_KEY_BYTES } from "../subagent/telemetry/Privacy.ts";

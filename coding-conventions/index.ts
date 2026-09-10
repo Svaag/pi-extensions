@@ -213,10 +213,8 @@ function computeConventionsBlock(config: ConventionsConfig, ecosystems: Ecosyste
 
 export default function (pi: ExtensionAPI) {
 	// ---- Track real models used during the session ----
-	// The active model (ctx.model) is the virtual router profile (e.g. "balanced")
-	// when routing is enabled, so it cannot tell us which real model produced a
-	// given response. Each assistant message carries the actual model in
-	// message.model; collect those to attribute commits accurately.
+	// Each assistant message carries the actual model in message.model; collect
+	// those to attribute commits accurately.
 	pi.on("message_end", (event) => {
 		const msg = event.message as { role?: string; model?: unknown };
 		if (msg.role === "assistant" && typeof msg.model === "string" && msg.model.length > 0) {

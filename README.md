@@ -7,8 +7,7 @@ Personal extensions for the [Pi coding agent](https://github.com/earendil-works/
 - `plan-mode/` — read-only planning mode with proposed-plan extraction, interactive planning questions, and execution progress tracking.
 - `goal-mode/` — autonomous goal/execute mode inspired by Codex collaboration style.
 - `hyrule-loop/` — helper commands for running and inspecting the Hyrule Engineering Loop.
-- [`model-router/`](./model-router/README.md) — public telemetry-informed, self-learning model router with standalone Pi, virtual-provider, SDK, and Subagent adapters.
-- [`subagent/`](./subagent/README.md) — isolated RPC child-agent/swarm extension integrated with the shared router and metadata-only OTel.
+- [`subagent/`](./subagent/README.md) — isolated RPC child-agent/swarm extension with metadata-only OTel.
 - `coding-conventions/` — deterministic `Assisted-by:` trailer on every commit + layered coding-conventions injection with ecosystem auto-detection.
 - [`code-mode/`](./code-mode/README.md) — Codex-style JavaScript REPL (`exec`/`wait`) that puts tool calling behind a sandbox, with RLM-style `llm.query()` sub-LLM calls.
 
@@ -22,7 +21,6 @@ mkdir -p ~/.pi/agent/extensions
 ln -s "$PWD/pi-extensions/plan-mode" ~/.pi/agent/extensions/plan-mode
 ln -s "$PWD/pi-extensions/goal-mode" ~/.pi/agent/extensions/goal-mode
 ln -s "$PWD/pi-extensions/hyrule-loop" ~/.pi/agent/extensions/hyrule-loop
-ln -s "$PWD/pi-extensions/model-router" ~/.pi/agent/extensions/model-router
 ln -s "$PWD/pi-extensions/subagent" ~/.pi/agent/extensions/subagent
 ln -s "$PWD/pi-extensions/coding-conventions" ~/.pi/agent/extensions/coding-conventions
 ln -s "$PWD/pi-extensions/code-mode" ~/.pi/agent/extensions/code-mode
@@ -39,7 +37,7 @@ Run the full extension, router, storage, telemetry, Pi-adapter, and Subagent reg
 npm test
 ```
 
-The tests use Node's built-in test runner with TypeScript type stripping. Run `npm install` first for Pi/OTel integration dependencies, and `npm run build:model-router` for the public package type/build check.
+The tests use Node's built-in test runner with TypeScript type stripping. Run `npm install` first for Pi/OTel integration dependencies.
 
 ## Notes
 

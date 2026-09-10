@@ -2,19 +2,16 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import type { RoutingMode, RoutingObjective, ThinkingLevel } from "../core/AgentTypes.ts";
-import { type ManagerGetter, downgradeSubagentThinking, parentThinkingLevel, preview, textResult } from "./common.ts";
-import { resolveInheritedRouting, resolveRouting } from "./router.ts";
+import type { ThinkingLevel } from "../core/AgentTypes.ts";
+import { type ManagerGetter, preview, textResult } from "./common.ts";
 
 const FollowupTaskParams = Type.Object({
 	agentId: Type.String({ description: "Target agent id." }),
 	prompt: Type.String({ description: "Follow-up task prompt." }),
 	mode: Type.Optional(StringEnum(["live_if_supported", "spawn_followup"] as const, { description: "Use the live child if possible, or spawn a follow-up child when unavailable." })),
 	contextMode: Type.Optional(StringEnum(["fresh", "summary", "last_n_turns", "full_sanitized"] as const, { description: "Sanitized context mode for a spawned follow-up. Defaults to summary." })),
-	spawnRoutingMode: Type.Optional(StringEnum(["inherit", "auto", "off", "explain"] as const, { description: "For mode=spawn_followup: inherit the original model/thinking, reroute, disable routing, or explain only. Defaults to inherit." })),
-	routingProfile: Type.Optional(StringEnum(["balanced", "cost_first", "quality_first", "latency_first"] as const, { description: "Router objective for spawned follow-up rerouting." })),
-	model: Type.Optional(Type.String({ description: "Explicit model override for spawned follow-up agents." })),
-	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Explicit thinking level override for spawned follow-up agents." })),
+	model: Type.Optional(Type.String({ description: "Explicit model override for spawned follow-up agents. Defaults to the original child model." })),
+	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Explicit thinking level override for spawned follow-up agents. Defaults to the original child thinking level." })),
 });
 
 export function registerFollowupTaskTool(pi: ExtensionAPI, getManager: ManagerGetter): void {
@@ -31,71 +28,13 @@ export function registerFollowupTaskTool(pi: ExtensionAPI, getManager: ManagerGe
 			let spawnOptions: any = undefined;
 			const record = manager.getRecord(params.agentId);
 			if (!record) throw new Error(`Unknown agentId: ${params.agentId}`);
-			if (mode === "live_if_supported") {
-				const routed = await resolveInheritedRouting(ctx, {
-					taskName: `${record.taskName}-followup`,
-					prompt: params.prompt,
-					contextSummary: record.result?.summary ?? record.outputTail,
-					contextMode: record.contextMode,
-					writeMode: record.writeMode,
-					tools: record.tools,
-					explicitModel: record.actualModel ?? record.model,
-					explicitThinkingLevel: record.actualThinkingLevel ?? record.thinkingLevel,
-					routingProfile: record.routingProfile,
-				});
-				spawnOptions = { routingDecision: routed.decision };
-			} else if (mode === "spawn_followup") {
-				const contextMode = params.contextMode ?? "summary";
-				const spawnRoutingMode = params.spawnRoutingMode ?? "inherit";
-				if (spawnRoutingMode === "inherit") {
-					const model = params.model ?? record.actualModel ?? record.model;
-					const thinkingLevel = (params.thinkingLevel ?? record.actualThinkingLevel ?? record.thinkingLevel) as ThinkingLevel | undefined;
-					const routed = await resolveInheritedRouting(ctx, {
-						taskName: `${record.taskName}-followup`,
-						prompt: params.prompt,
-						contextSummary: record.result?.summary ?? record.outputTail,
-						contextMode,
-						writeMode: record.writeMode,
-						tools: record.tools,
-						explicitModel: model,
-						explicitThinkingLevel: thinkingLevel,
-						routingProfile: record.routingProfile,
-					});
-					spawnOptions = {
-						contextMode,
-						model,
-						thinkingLevel,
-						routingDecision: routed.decision,
-						inheritModelAndThinking: false,
-					};
-				} else {
-					const routed = await resolveRouting(ctx, {
-						taskName: `${record.taskName}-followup`,
-						prompt: params.prompt,
-						contextSummary: record.result?.summary ?? record.outputTail,
-						contextMode,
-						writeMode: record.writeMode,
-						tools: record.tools,
-						explicitModel: params.model,
-						explicitThinkingLevel: params.thinkingLevel as ThinkingLevel | undefined,
-						routingMode: spawnRoutingMode as RoutingMode,
-						routingProfile: params.routingProfile as RoutingObjective | undefined,
-					});
-					const followupThinking = downgradeSubagentThinking(
-						parentThinkingLevel(ctx),
-						routed.thinkingLevel,
-						params.thinkingLevel as ThinkingLevel | undefined,
-					);
-					spawnOptions = {
-						contextMode,
-						model: routed.model,
-						thinkingLevel: followupThinking,
-						routingMode: spawnRoutingMode as RoutingMode,
-						routingProfile: params.routingProfile as RoutingObjective | undefined,
-						routingDecision: routed.decision,
-						inheritModelAndThinking: false,
-					};
-				}
+			if (mode === "spawn_followup") {
+				spawnOptions = {
+					contextMode: params.contextMode ?? "summary",
+					model: params.model ?? record.actualModel ?? record.model,
+					thinkingLevel: (params.thinkingLevel ?? record.actualThinkingLevel ?? record.thinkingLevel) as ThinkingLevel | undefined,
+					inheritModelAndThinking: false,
+				};
 			}
 			const result = await manager.followupTask(params.agentId, params.prompt, mode, spawnOptions);
 			return textResult(result.message, result);

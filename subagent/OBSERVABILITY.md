@@ -26,7 +26,7 @@ pi
 ```
 
 5. Inspect `/subagents telemetry` in Pi.
-6. Search Jaeger for services `pi-subagent-extension` and `pi-model-router`; use `analyze_subagent_telemetry` (including `focus: "routing"`) or the independent `analyze_model_router_telemetry` tool.
+6. Search Jaeger for service `pi-subagent-extension`; use `analyze_subagent_telemetry` for a bounded metadata-only snapshot.
 
 The repository intentionally does not bundle Jaeger, Prometheus, Grafana, Loki, or Docker Compose.
 

@@ -15,8 +15,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 - `spawn_agents_on_csv` / `spawn_agents_on_jsonl` — fan out one worker per structured input row.
 - `list_agent_jobs` / `wait_agent_job` / `cancel_agent_job` — inspect and control batch jobs.
 - `export_agent_job_results` — export batch results to JSONL or CSV.
-- `analyze_subagent_telemetry` — query a bounded metadata-only reliability/cost/UX/routing snapshot from configured Prometheus and Jaeger endpoints.
-- `rate_agent` — record an explicitly user/validator-provided 0–1 quality score for a completed routed agent; TUI confirmation is required by default.
+- `analyze_subagent_telemetry` — query a bounded metadata-only reliability/cost/UX snapshot from configured Prometheus and Jaeger endpoints.
 - `interrupt_agent` — abort/kill a running child and preserve partial output.
 - `close_agent` — release child process resources while preserving history.
 
@@ -24,7 +23,7 @@ This extension exposes interactive child-agent tools backed by isolated `pi --mo
 
 - Child agents default to `writeMode: "read_only"`.
 - Explicit `writeMode: "disjoint_scope"` authorizes spawning without a TUI confirmation, including for batch workers and unattended `/goal` runs; the child policy still limits writes to `allowedPaths`.
-- When `model` is omitted, managed shared routing begins in shadow and retains the current main Pi model. Explicit `routingMode: "auto"` forces immediate routing; automatic rollout may route omitted-mode requests only after evidence gates pass.
+- When `model` is omitted, the child inherits the current main Pi model. Pass `model` to pin a different child model. Unspecified `thinkingLevel` is stepped down from the parent.
 - Child subprocesses are launched with extension/resource discovery disabled, plus a controlled child policy extension.
 - The child policy blocks raw reads of likely-binary/database files and caps oversized tool-result text before it enters the child LLM context.
 - Read-only children can use `read` inside the child `cwd` (plus explicit `allowedPaths`) and conservative read-only `bash` commands, including simple `&&`/pipe chains and `sqlite3 -readonly` queries.
@@ -68,93 +67,11 @@ The extension persists append-only lifecycle state with `pi.appendEntry()`:
 - `graph.edge_lost`
 - batch job state and events such as `batch.started`, `batch.worker_started`, `batch.worker_result`, `batch.completed`, `batch.failed`, `batch.cancelled`, and `batch.exported`
 
-It also persists latest agent records, parent/child graph edge records, and batch job records. Routing decisions are stored with agent/job records so `/subagents`, `list_agents`, and expanded render views can explain which model was chosen and why. This is enough to reconstruct historical state and display a graph after reload, but does not reattach to old subprocesses or resume in-flight batch workers.
+It also persists latest agent records, parent/child graph edge records, and batch job records. This is enough to reconstruct historical state and display a graph after reload, but does not reattach to old subprocesses or resume in-flight batch workers.
 
-## Shared self-learning model router
+## Child model
 
-Subagent routing now uses [`@svaag/pi-model-router`](../model-router/README.md), the same engine as standalone Pi and the opt-in virtual provider. Omitted `routingMode` uses managed rollout: it starts in shadow/inherit and may automatically promote after local sample, quality, completeness, non-inferiority, and cost/latency gates. Explicit `routingMode: "auto"` remains an immediate forced route.
-
-Routing inputs include task text, `taskName`, agent definition, write mode, tools, context mode, and batch metadata. The deterministic classifier supplies cold-start intent/complexity priors; observed model/thinking quality, reliability, cost, latency, and first progress then update privacy-safe hierarchical Bayesian statistics. Operational success never substitutes for answer quality.
-
-Complexity tiers and shared route/policy/baseline/stage/arm/failure fields are persisted with agent records. Typical cold-start outcomes:
-
-| Tier | Typical work | Preferred model class | Thinking |
-|---|---|---|---|
-| `trivial` | find/list/grep/read-only lookups | local or flash-class | `off` |
-| `simple` | light summarization, simple batch rows | local/flash/economy | `off`/`minimal` |
-| `moderate` | codebase scout, ordinary debug/plan | mid-tier coding/reasoning | `low` |
-| `complex` | implementation, review, high-context debug | Sonnet/Codex/strong reasoning | `medium`/`high` |
-| `critical` | security/auth/payment/migration/data-loss work | premium/highest-quality scoped models | `high` (`xhigh` only by explicit choice or exceptional quality-first routing) |
-
-Defaults:
-
-- Omitted `routingMode`: managed stage, initially shadow/inherit.
-- `auto`: forced shared routing; `off`: inherit; `explain`: compute without applying.
-- Profiles: `balanced`, `cost_first`, `quality_first`, and `latency_first`.
-- Explicit `model` and `thinkingLevel` are hard overrides.
-- Candidate models come from trusted Pi `enabledModels`, intersected with available/auth-resolved models.
-- Critical tasks are never explored and retain the explicit/current or deterministic premium arm until strict reliability and human/validator evidence exists.
-- If storage, discovery, or telemetry fails, execution continues on the explicit/current model.
-- The optional LLM classifier is disabled by default; deterministic classification is the fallback.
-
-Tool parameters:
-
-```json
-{
-  "routingMode": "auto",
-  "routingProfile": "balanced",
-  "thinkingLevel": "low"
-}
-```
-
-- `routingMode`: omitted uses managed rollout, `off` inherits, `auto` forces routing, and `explain` records without applying.
-- `routingProfile`: `balanced` (default), `cost_first`, `quality_first`, or `latency_first`.
-- `thinkingLevel`: optional explicit `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`; `max` is never selected automatically.
-
-Preferred configuration files:
-
-- `~/.pi/agent/model-router.json`
-- nearest trusted `.pi/model-router.json`
-
-Legacy `subagent-router.json` files remain readable and are migrated in memory. The following is a legacy-compatible example; see [`../model-router/CONFIGURATION.md`](../model-router/CONFIGURATION.md) for the complete shared schema.
-
-Example:
-
-```json
-{
-  "enabled": true,
-  "objective": "balanced",
-  "fallbackWhenNoScopedModels": "current_model",
-  "complexity": {
-    "thresholds": {
-      "trivialMax": 0.2,
-      "simpleMax": 0.38,
-      "moderateMax": 0.58,
-      "complexMax": 0.78
-    },
-    "tierQualityFloor": {
-      "trivial": 0.2,
-      "simple": 0.4,
-      "moderate": 0.6,
-      "complex": 0.78,
-      "critical": 0.9
-    }
-  },
-  "classifier": {
-    "enabled": "auto",
-    "requireLocalOrZeroCost": true,
-    "maxEstimatedCostUsd": 0.001,
-    "maxPromptChars": 4000,
-    "timeoutMs": 10000
-  },
-  "modelProfiles": {
-    "local-llamacpp/local-model": { "quality": 0.2, "speed": 0.9, "preferredIntents": ["lookup", "summarize"], "preferredTiers": ["trivial", "simple"] },
-    "anthropic/claude-sonnet-*": { "quality": 0.9, "preferredIntents": ["review", "implement", "complex"], "preferredTiers": ["complex", "critical"] }
-  }
-}
-```
-
-The candidate pool comes from Pi `enabledModels`. Keep cheap and strong models in that list so the engine has safe alternatives. Batch fan-out selects one model/thinking pair per job, but each worker gets a unique route ID and independently contributes outcome/cost/latency/quality evidence.
+Children inherit the current main Pi model unless `model` is set on the spawn (or in an agent definition). `thinkingLevel` is an optional override; when omitted it is stepped down from the parent session. There is no automatic model routing.
 
 ## OpenTelemetry observability
 
@@ -186,8 +103,6 @@ description: Fast read-only codebase recon
 tools: read,bash
 model: claude-haiku-4-5
 thinking: minimal
-router: auto
-routingProfile: cost_first
 ---
 
 You are a fast reconnaissance agent. Inspect only; do not modify files.
@@ -199,7 +114,7 @@ Project-local agent definitions require confirmation by default.
 
 ### Single research subagent
 
-With `contextMode: "summary"`, the extension includes a capped, sanitized excerpt of recent visible parent conversation when no explicit `contextSummary` is provided. `last_n_turns` selects the requested number of visible user turns, while `full_sanitized` considers the full visible conversation before applying the context cap. Hidden reasoning and tool results are excluded from all generated context. Because `model` and `routingMode` are omitted, the child follows managed rollout (current-model control while the default stage is shadow).
+With `contextMode: "summary"`, the extension includes a capped, sanitized excerpt of recent visible parent conversation when no explicit `contextSummary` is provided. `last_n_turns` selects the requested number of visible user turns, while `full_sanitized` considers the full visible conversation before applying the context cap. Hidden reasoning and tool results are excluded from all generated context. Because `model` is omitted, the child inherits the current main Pi model.
 
 ```json
 {
@@ -223,7 +138,7 @@ With `contextMode: "summary"`, the extension includes a capped, sanitized excerp
 }
 ```
 
-The explicit model/thinking choice is preserved. Add `routingMode: "auto"` only when you want the router to choose missing pieces such as a task-appropriate thinking level.
+The explicit model/thinking choice is preserved.
 
 ### Parallel read-only specialists
 
@@ -255,19 +170,7 @@ Then wait for the workers:
 }
 ```
 
-If the original subprocess is no longer live, use `mode: "spawn_followup"`. Spawned follow-ups default to `spawnRoutingMode: "inherit"`, which keeps the original child model/thinking and records an `inherited` routing decision. To reroute the follow-up from its new prompt, use:
-
-```json
-{
-  "agentId": "agent_...",
-  "prompt": "Now perform a security-focused review of that finding and propose a safe patch plan.",
-  "mode": "spawn_followup",
-  "spawnRoutingMode": "auto",
-  "routingProfile": "balanced"
-}
-```
-
-For spawned follow-ups, explicit `model` and `thinkingLevel` still win. `spawnRoutingMode: "off"` disables router selection and uses the current main Pi model unless an explicit override is supplied; `spawnRoutingMode: "explain"` records a decision without applying it.
+If the original subprocess is no longer live, use `mode: "spawn_followup"`. Spawned follow-ups keep the original child model and thinking level unless `model` or `thinkingLevel` is set.
 
 ### CSV batch fan-out
 

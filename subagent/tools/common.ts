@@ -27,8 +27,7 @@ const THINKING_LEVEL_ORDER: ThinkingLevel[] = ["off", "minimal", "low", "medium"
  * are never downgraded — the caller knows what they need.
  *
  * @param parentLevel  The parent session's current thinking level.
- * @param resolvedLevel  The thinking level resolved by the router (may already
- *                        be downgraded or set explicitly).
+ * @param resolvedLevel  The thinking level chosen for the child before downgrade.
  * @param explicitLevel  The level explicitly requested by the caller, if any.
  * @param steps  Number of steps to downgrade.  Default 2.
  * @returns The downgraded thinking level.
@@ -56,4 +55,34 @@ export function downgradeSubagentThinking(
 export function parentThinkingLevel(ctx: any): ThinkingLevel | undefined {
 	const value = ctx?.thinkingLevel;
 	return typeof value === "string" ? value as ThinkingLevel : undefined;
+}
+
+/** Read the parent session's current model ref (`provider/id`) from ctx. */
+export function parentModelRef(ctx: any): string | undefined {
+	const model = ctx?.model;
+	if (!model) return undefined;
+	if (typeof model === "string") {
+		const trimmed = model.trim();
+		return trimmed || undefined;
+	}
+	const id = typeof model.id === "string" ? model.id : undefined;
+	if (!id) return undefined;
+	const provider = typeof model.provider === "string" ? model.provider : undefined;
+	return provider && !id.startsWith(`${provider}/`) ? `${provider}/${id}` : id;
+}
+
+/** Explicit `model`/`thinkingLevel` win; otherwise inherit the parent model and a downgraded thinking level. */
+export function resolveChildModelAndThinking(
+	ctx: any,
+	explicitModel?: string,
+	explicitThinkingLevel?: ThinkingLevel,
+): { model?: string; thinkingLevel?: ThinkingLevel } {
+	return {
+		model: explicitModel ?? parentModelRef(ctx),
+		thinkingLevel: downgradeSubagentThinking(
+			parentThinkingLevel(ctx),
+			explicitThinkingLevel ?? parentThinkingLevel(ctx),
+			explicitThinkingLevel,
+		),
+	};
 }

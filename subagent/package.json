@@ -9,7 +9,6 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@svaag/pi-model-router": "file:../model-router",
     "@opentelemetry/api": "^1.9.0",
     "@opentelemetry/api-logs": "^0.221.0",
     "@opentelemetry/exporter-logs-otlp-http": "^0.221.0",

@@ -1,4 +1,4 @@
-import { downgradeSubagentThinking, parentThinkingLevel } from "../subagent/tools/common.ts";
+import { downgradeSubagentThinking, parentModelRef, parentThinkingLevel, resolveChildModelAndThinking } from "../subagent/tools/common.ts";
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
@@ -39,6 +39,38 @@ describe("downgradeSubagentThinking", () => {
 
 	it("returns resolved level when explicit is set even if mismatch", () => {
 		assert.equal(downgradeSubagentThinking("max", "low", "high"), "low");
+	});
+});
+
+describe("parentModelRef", () => {
+	it("builds provider/id from the parent model object", () => {
+		assert.equal(parentModelRef({ model: { provider: "xai", id: "grok-4.6" } }), "xai/grok-4.6");
+		assert.equal(parentModelRef({ model: "openai-codex/gpt-5.6-terra" }), "openai-codex/gpt-5.6-terra");
+	});
+
+	it("returns undefined when no model is set", () => {
+		assert.equal(parentModelRef({}), undefined);
+		assert.equal(parentModelRef({ model: {} }), undefined);
+	});
+});
+
+describe("resolveChildModelAndThinking", () => {
+	it("inherits the parent model and downgrades thinking when omitted", () => {
+		const resolved = resolveChildModelAndThinking({
+			model: { provider: "xai", id: "grok-4.6" },
+			thinkingLevel: "high",
+		});
+		assert.equal(resolved.model, "xai/grok-4.6");
+		assert.equal(resolved.thinkingLevel, "low");
+	});
+
+	it("keeps explicit model and thinking overrides", () => {
+		const resolved = resolveChildModelAndThinking({
+			model: { provider: "xai", id: "grok-4.6" },
+			thinkingLevel: "high",
+		}, "kimi-coding/k3", "minimal");
+		assert.equal(resolved.model, "kimi-coding/k3");
+		assert.equal(resolved.thinkingLevel, "minimal");
 	});
 });
 

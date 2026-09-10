@@ -1,9 +1,4 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { ModelRoutingEngine, SqliteRouterStore, loadRouterConfig as loadSharedRouterConfig } from "@svaag/pi-model-router";
-import { SubagentRouterAdapter, loadSubagentRouterAdapterSettings } from "@svaag/pi-model-router/subagent";
-import { createOpenTelemetryRouterTelemetry, createRouterTelemetryPrivacy, NOOP_ROUTER_TELEMETRY } from "@svaag/pi-model-router/telemetry";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { AgentManager } from "./core/AgentManager.ts";
 import { BatchJobManager } from "./core/BatchJobManager.ts";
@@ -26,8 +21,6 @@ import { registerSpawnAgentsOnJsonlTool } from "./tools/spawnAgentsOnJsonl.ts";
 import { registerWaitAgentTool } from "./tools/waitAgent.ts";
 import { registerWaitAgentJobTool } from "./tools/waitAgentJob.ts";
 import { registerAnalyzeSubagentTelemetryTool } from "./tools/analyzeSubagentTelemetry.ts";
-import { registerRateAgentTool } from "./tools/rateAgent.ts";
-import { installSubagentRouterAdapter } from "./tools/router.ts";
 import { TelemetryAnalysisClient } from "./telemetry/AnalysisClient.ts";
 import { loadSubagentTelemetryConfig, safeEndpointOrigin } from "./telemetry/Config.ts";
 import { NOOP_SUBAGENT_TELEMETRY } from "./telemetry/NoopTelemetry.ts";
@@ -41,44 +34,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	let activeContext: ExtensionContext | undefined;
 	let telemetry: SubagentTelemetry = NOOP_SUBAGENT_TELEMETRY;
 	let telemetryHealthTimer: NodeJS.Timeout | undefined;
-	let routingEngine: ModelRoutingEngine | undefined;
-	let routerAdapter: SubagentRouterAdapter | undefined;
 	const telemetryConfig = loadSubagentTelemetryConfig();
-
-	async function initializeRouter(ctx: ExtensionContext): Promise<void> {
-		if (routingEngine) await routingEngine.close().catch(() => undefined);
-		const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
-		try {
-			const trusted = typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted();
-			const loaded = loadSharedRouterConfig(ctx.cwd, { agentDir, configDirName: ".pi", projectTrusted: trusted });
-			const privacy = await createRouterTelemetryPrivacy({ agentDir });
-			const store = new SqliteRouterStore({
-				path: loaded.config.storage.path ?? join(agentDir, "model-router", "router.db"),
-				busyTimeoutMs: loaded.config.storage.busyTimeoutMs,
-				halfLifeDays: loaded.config.learning.halfLifeDays,
-				rawRetentionDays: loaded.config.learning.rawRetentionDays,
-			});
-			const routerTelemetry = loaded.config.telemetry.enabled
-				? await createOpenTelemetryRouterTelemetry({ enabled: true, requestedEnabled: true }, { privacy })
-				: NOOP_ROUTER_TELEMETRY;
-			routingEngine = new ModelRoutingEngine({
-				config: loaded.config,
-				store,
-				telemetry: routerTelemetry,
-				hashProject: (projectKey) => privacy.hashIdentifier("project", projectKey),
-			});
-			const adapterSettings = loadSubagentRouterAdapterSettings(ctx.cwd, { agentDir, configDirName: ".pi", projectTrusted: trusted });
-			routerAdapter = new SubagentRouterAdapter({ engine: routingEngine, config: loaded.config, ...adapterSettings });
-			installSubagentRouterAdapter(routerAdapter);
-		} catch {
-			// Router setup must not block the promoted Subagent lifecycle. tools/router
-			// will create a compute-only fallback that retains the current model.
-			routingEngine = undefined;
-			routerAdapter = undefined;
-			installSubagentRouterAdapter(undefined);
-			console.warn("subagent: shared router unavailable");
-		}
-	}
 
 	function appendEntrySafe(customType: string, data?: unknown): void {
 		try {
@@ -127,7 +83,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			restoredEdges: restored.edges,
 			restoredLostAgentIds: restored.lostAgentIds,
 			telemetry,
-			onRouteTerminal: (observation) => routerAdapter?.observeTerminal(observation),
 			onChange: (current) => {
 				if (activeContext) renderWidget(activeContext, current);
 			},
@@ -138,9 +93,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 			rootCwd: ctx.cwd,
 			restoredJobs: BatchJobManager.restore(branch),
 			telemetry,
-			forkRoutingDecision: async (decision, _item) => routerAdapter
-				? await routerAdapter.forkBatchDecision(decision) as typeof decision
-				: decision,
 			onChange: () => {
 				if (activeContext && manager) renderWidget(activeContext, manager);
 			},
@@ -176,7 +128,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 	registerCancelAgentJobTool(pi, getBatchManager);
 	registerAnalyzeSubagentTelemetryTool(pi, () => telemetryConfig);
 	registerExportAgentJobResultsTool(pi, getBatchManager);
-	registerRateAgentTool(pi, getManager);
 
 	pi.registerCommand("subagents", {
 		description: "Show subagent status. Use /subagents graph for the persistent tree, /subagents full for summaries.",
@@ -233,7 +184,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 				telemetry = NOOP_SUBAGENT_TELEMETRY;
 			}
 		}
-		await initializeRouter(ctx);
 		initialize(ctx);
 		if (telemetryHealthTimer) clearInterval(telemetryHealthTimer);
 		telemetryHealthTimer = setInterval(() => {
@@ -252,10 +202,6 @@ export default function subagentExtension(pi: ExtensionAPI): void {
 		await telemetry.forceFlush();
 		await telemetry.shutdown(5_000);
 		telemetry = NOOP_SUBAGENT_TELEMETRY;
-		installSubagentRouterAdapter(undefined);
-		routerAdapter = undefined;
-		await routingEngine?.close().catch(() => undefined);
-		routingEngine = undefined;
 		manager = undefined;
 		ctx.ui.setStatus("subagent", undefined);
 		ctx.ui.setStatus("subagent-telemetry", undefined);

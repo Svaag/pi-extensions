@@ -3,7 +3,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { readRowsFromJsonl } from "../core/BatchJobManager.ts";
-import { BatchCommonParams, type BatchManagerGetter, jobText, resolveBatchRouting } from "./batchCommon.ts";
+import { BatchCommonParams, type BatchManagerGetter, jobText, resolveBatchModel } from "./batchCommon.ts";
 import { textResult } from "./common.ts";
 
 const SpawnAgentsOnJsonlParams = Type.Object({
@@ -26,7 +26,7 @@ export function registerSpawnAgentsOnJsonlTool(pi: ExtensionAPI, getBatchManager
 			if (!params.jsonlPath && !params.jsonlText) throw new Error("spawn_agents_on_jsonl requires jsonlPath or jsonlText.");
 			if (params.jsonlPath && params.jsonlText) throw new Error("Provide only one of jsonlPath or jsonlText.");
 			const { rows, sourcePath } = await readRowsFromJsonl({ path: params.jsonlPath, text: params.jsonlText }, ctx.cwd, params.idField ?? params.idColumn);
-			const routed = await resolveBatchRouting(ctx, params, "jsonl", rows);
+			const resolved = resolveBatchModel(ctx, params);
 			const job = getBatchManager(ctx).createJob({
 				name: params.name,
 				sourceType: "jsonl",
@@ -36,12 +36,9 @@ export function registerSpawnAgentsOnJsonlTool(pi: ExtensionAPI, getBatchManager
 				idColumn: params.idField ?? params.idColumn,
 				maxConcurrency: params.maxConcurrency,
 				cwd: params.cwd,
-				model: routed.model,
-				thinkingLevel: routed.thinkingLevel,
+				model: resolved.model,
+				thinkingLevel: resolved.thinkingLevel,
 				timeoutMs: params.timeoutMs,
-				routingMode: params.routingMode,
-				routingProfile: params.routingProfile,
-				routingDecision: routed.decision,
 				writeMode: params.writeMode,
 				allowedPaths: params.allowedPaths,
 				contextMode: params.contextMode,

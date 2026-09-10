@@ -22,9 +22,7 @@ Assisted-by: pi-coding-agent:openai/gpt-5
 ```
 
 - Attributes the **real model(s) used this session**, tracked from each assistant
-  message's `model` field — so with the model-router the trailer lists the actual
-  routed model(s) (e.g. `anthropic/claude-sonnet-4-5`) instead of the virtual
-  profile id (`balanced`).
+  message's `model` field.
 - Deduplicates via `trailer.ifExists=addIfDifferent` — safe to `--amend`, while
   still allowing several distinct model lines on one commit.
 - Skips commands that already contain `Assisted-by` (idempotent).

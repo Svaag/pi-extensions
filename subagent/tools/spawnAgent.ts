@@ -5,11 +5,10 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { Type } from "typebox";
 import { discoverAgents, type AgentConfig, type AgentScope } from "../agents.ts";
-import type { AgentRecord, ContextMode, RoutingMode, RoutingObjective, ThinkingLevel, WriteMode } from "../core/AgentTypes.ts";
+import type { AgentRecord, ContextMode, ThinkingLevel } from "../core/AgentTypes.ts";
 import { buildVisibleSessionContext } from "../core/ContextSanitizer.ts";
 import { renderAgentSummary } from "../render/renderAgent.ts";
-import { type ManagerGetter, downgradeSubagentThinking, parentThinkingLevel, preview, textResult } from "./common.ts";
-import { resolveRouting } from "./router.ts";
+import { type ManagerGetter, preview, resolveChildModelAndThinking, textResult } from "./common.ts";
 import { expandSpawnParams } from "./spawnParams.ts";
 
 const TaskNameParam = Type.String({ description: "Short lowercase-ish task name for the child agent." });
@@ -33,8 +32,6 @@ const SpawnAgentCommonParams = {
 	maxOutputChars: Type.Optional(Type.Number({ description: "Maximum retained output characters for this agent." })),
 	model: Type.Optional(Type.String({ description: "Optional model override for the child process. Defaults to the current main Pi model." })),
 	thinkingLevel: Type.Optional(StringEnum(["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Optional thinking level override for the child process." })),
-	routingMode: Type.Optional(StringEnum(["auto", "off", "explain"] as const, { description: "Smart router mode. Defaults to off/inherit current main Pi model; set auto to route." })),
-	routingProfile: Type.Optional(StringEnum(["balanced", "cost_first", "quality_first", "latency_first"] as const, { description: "Router objective for cost/reward/quality/latency tradeoff." })),
 };
 
 const SpawnAgentTaskParams = Type.Object({
@@ -84,27 +81,7 @@ async function spawnOne(ctx: any, manager: ReturnType<ManagerGetter>, params: an
 	const contextSummary = (params.contextSummary ?? generatedContext) || undefined;
 	const explicitModel = params.model ?? agent?.model;
 	const explicitThinkingLevel = (params.thinkingLevel ?? agent?.thinkingLevel) as ThinkingLevel | undefined;
-	const routingMode = (params.routingMode ?? agent?.routingMode) as RoutingMode | undefined;
-	const routingProfile = (params.routingProfile ?? agent?.routingProfile) as RoutingObjective | undefined;
-	const routed = await resolveRouting(ctx, {
-		taskName: params.taskName,
-		prompt: params.prompt,
-		agentName: agent?.name ?? params.agentName,
-		agentDefinition: definition,
-		contextSummary,
-		contextMode,
-		writeMode: (params.writeMode ?? "read_only") as WriteMode,
-		tools: agent?.tools,
-		explicitModel,
-		explicitThinkingLevel,
-		routingMode,
-		routingProfile,
-	});
-	const downgradedThinking = downgradeSubagentThinking(
-		parentThinkingLevel(ctx),
-		routed.thinkingLevel,
-		explicitThinkingLevel,
-	);
+	const resolved = resolveChildModelAndThinking(ctx, explicitModel, explicitThinkingLevel);
 	return manager.spawnAgent({
 		taskName: params.taskName,
 		prompt: params.prompt,
@@ -121,12 +98,9 @@ async function spawnOne(ctx: any, manager: ReturnType<ManagerGetter>, params: an
 		allowedPaths: params.allowedPaths,
 		timeoutMs: params.timeoutMs,
 		maxOutputChars: params.maxOutputChars,
-		model: routed.model,
-		thinkingLevel: downgradedThinking,
+		model: resolved.model,
+		thinkingLevel: resolved.thinkingLevel,
 		tools: agent?.tools,
-		routingMode,
-		routingProfile,
-		routingDecision: routed.decision,
 	}, signal);
 }
 
