@@ -7,7 +7,6 @@ import type {
 	AgentResult,
 	AgentStatus,
 	AgentSummary,
-	FailureDomain,
 	RoutingDecision,
 	SpawnAgentRequest,
 	WaitAgentOptions,
@@ -17,9 +16,7 @@ import { buildInheritedContext } from "./ContextSanitizer.ts";
 import { DEFAULT_SUBAGENT_LIMITS, normalizeLimits, normalizeRuntimeTimeoutMs, type SubagentLimits } from "./Limits.ts";
 import { buildChildSystemPrompt, buildChildUserPrompt } from "./prompt.ts";
 import { StateStore } from "./StateStore.ts";
-import { NOOP_SUBAGENT_TELEMETRY } from "../telemetry/NoopTelemetry.ts";
-import { mergeCumulativeAgentMetrics } from "../telemetry/Usage.ts";
-import type { SubagentTelemetry, TelemetryDeliveryMode, TelemetryMessageKind, TelemetryOutcome, TelemetryTurnKind } from "../telemetry/Telemetry.ts";
+import { mergeCumulativeAgentMetrics } from "./metrics.ts";
 import {
 	appendOutputTail,
 	childTaskPath,
@@ -45,23 +42,6 @@ interface PendingStartConfig {
 	maxPersistedOutputTailChars: number;
 }
 
-export interface AgentRouteTerminalObservation {
-	routeId: string;
-	outcome: "succeeded" | "failed" | "timeout" | "cancelled" | "aborted";
-	failureDomain?: FailureDomain;
-	completedAt: number;
-	latencyMs?: number;
-	firstTokenMs?: number;
-	inputTokens?: number;
-	outputTokens?: number;
-	cacheReadTokens?: number;
-	cacheWriteTokens?: number;
-	costUsd?: number;
-	providerRequests?: number;
-	toolCalls?: number;
-	contextOverflow?: boolean;
-}
-
 export interface AgentManagerOptions {
 	backend: AgentBackend;
 	store: StateStore;
@@ -71,8 +51,6 @@ export interface AgentManagerOptions {
 	restoredEdges?: AgentGraphEdge[];
 	restoredLostAgentIds?: string[];
 	onChange?: (manager: AgentManager) => void;
-	telemetry?: SubagentTelemetry;
-	onRouteTerminal?: (observation: AgentRouteTerminalObservation, record: AgentRecord) => void | Promise<void>;
 }
 
 export interface MessageDeliveryResult {
@@ -101,15 +79,6 @@ export interface FollowupSpawnOptions {
 	routingDecision?: RoutingDecision;
 	inheritModelAndThinking?: boolean;
 } 
-
-interface RouteRuntimeSignals {
-	sawModelOutput: boolean;
-	providerError: boolean;
-	rpcError: boolean;
-	toolError: boolean;
-	policyError: boolean;
-	contextOverflow: boolean;
-}
 
 function applyRoutingFields(record: AgentRecord, decision: RoutingDecision | undefined): void {
 	record.routingDecision = decision;
@@ -168,20 +137,13 @@ export class AgentManager {
 	private readonly idleCloseHandles = new Map<string, NodeJS.Timeout>();
 	private readonly lastOutputPersistAt = new Map<string, number>();
 	private readonly activeTurnIds = new Map<string, string>();
-	private readonly activeTurnKinds = new Map<string, TelemetryTurnKind>();
 	private readonly activeTurnStartedAt = new Map<string, number>();
-	private readonly firstProgressTurnIds = new Set<string>();
 	private readonly firstProgressAt = new Map<string, number>();
 	private readonly processSpawnedAt = new Map<string, number>();
-	private readonly runtimeRecoveryStartedAt = new Map<string, number>();
-	private readonly routeSignals = new Map<string, RouteRuntimeSignals>();
 	private readonly pendingFollowupRoutes = new Map<string, RoutingDecision[]>();
 	private readonly closingAgentIds = new Set<string>();
 	private readonly interruptPromises = new Map<string, Promise<AgentRecord>>();
-	private readonly observedRouteIds = new Set<string>();
-	private readonly telemetry: SubagentTelemetry;
 	private readonly onChange?: (manager: AgentManager) => void;
-	private readonly onRouteTerminal?: AgentManagerOptions["onRouteTerminal"];
 	private shuttingDown = false;
 
 	constructor(options: AgentManagerOptions) {
@@ -195,9 +157,7 @@ export class AgentManager {
 			if (!restored.routeId && restored.routingDecision?.routeId) applyRoutingFields(restored, restored.routingDecision);
 			this.records.set(record.agentId, restored);
 		}
-		this.telemetry = options.telemetry ?? NOOP_SUBAGENT_TELEMETRY;
 		this.onChange = options.onChange;
-		this.onRouteTerminal = options.onRouteTerminal;
 		this.persistRestoredLostAgents(options.restoredLostAgentIds ?? []);
 	}
 
@@ -275,24 +235,6 @@ export class AgentManager {
 		if (request.routeId) record.routeId = request.routeId;
 		if (request.batchDecisionId) record.batchDecisionId = request.batchDecisionId;
 		this.records.set(agentId, record);
-		this.observeTelemetry((telemetry) => {
-			telemetry.agentQueued(this.telemetryDescriptor(record));
-			if (record.routingDecision) telemetry.routingResolved({
-				agentId: record.agentId,
-				routeId: record.routeId,
-				mode: record.routingDecision.mode,
-				profile: record.routingDecision.objective,
-				intent: record.routingDecision.intent,
-				complexityTier: record.routingDecision.complexityTier,
-				complexityScore: record.routingDecision.complexityScore,
-				selectedModel: record.routingDecision.selectedModel,
-				selectedThinkingLevel: record.routingDecision.selectedThinkingLevel,
-				estimatedInputTokens: record.routingDecision.estimatedInputTokens,
-				estimatedOutputTokens: record.routingDecision.estimatedOutputTokens,
-				applied: record.routingDecision.applied,
-				at: now,
-			});
-		});
 		this.pendingStart.set(agentId, {
 			agentDefinition: request.agentDefinition,
 			contextSummary: request.contextSummary,
@@ -327,13 +269,11 @@ export class AgentManager {
 		if (record.status === "running" && handle?.isAlive()) {
 			await handle.sendMessage(content);
 			this.store.appendEvent("agent.message", { agentId, taskPath: record.taskPath, data: { ...messageEvent, delivered: true, deliveryMode: "rpc_steer", kind } });
-			this.recordMessageTelemetry(agentId, kind, "rpc_steer", true, false, messageEvent.createdAt);
 			return { agentId, delivered: true, queued: false, deliveryMode: "rpc_steer", message: "Message delivered via RPC steer." };
 		}
 
 		const mode = handle?.isAlive() ? "mailbox_only" : "unavailable";
 		this.store.appendEvent("agent.message", { agentId, taskPath: record.taskPath, data: { ...messageEvent, delivered: false, deliveryMode: mode, kind } });
-		this.recordMessageTelemetry(agentId, kind, mode, false, mode === "mailbox_only", messageEvent.createdAt);
 		return {
 			agentId,
 			delivered: false,
@@ -355,7 +295,6 @@ export class AgentManager {
 				this.pendingFollowupRoutes.set(agentId, pending);
 			}
 			await handle.followupTask(prompt);
-			this.recordMessageTelemetry(agentId, "followup", "rpc_follow_up", true, true);
 			return { agentId, delivered: true, queued: true, deliveryMode: "rpc_follow_up", message: "Follow-up queued via RPC follow_up." };
 		}
 		if (mode === "live_if_supported" && (record.status === "succeeded" || record.status === "failed") && handle?.isAlive()) {
@@ -363,10 +302,9 @@ export class AgentManager {
 			const startedAt = nowMs();
 			if (spawnOptions.routingDecision) applyRoutingFields(record, spawnOptions.routingDecision);
 			this.transition(record, "running", { processState: "live_running", controllable: true, startedAt, finishedAt: undefined, error: undefined });
-			this.beginTurn(record, "live_followup", startedAt);
+			this.beginTurn(record, startedAt);
 			this.installAgentTimeout(agentId, record.timeoutMs ?? this.limits.maxRuntimeMsPerAgent);
 			await handle.prompt(prompt);
-			this.recordMessageTelemetry(agentId, "followup", "rpc_prompt", true, false, startedAt);
 			return { agentId, delivered: true, queued: false, deliveryMode: "rpc_prompt", message: "Follow-up started on the existing live agent." };
 		}
 		if (mode === "spawn_followup") {
@@ -392,10 +330,8 @@ export class AgentManager {
 				routingProfile,
 				routingDecision,
 			});
-			this.recordMessageTelemetry(agentId, "followup", "spawn_followup", true, spawned.status === "queued");
 			return { agentId, spawnedAgentId: spawned.agentId, delivered: true, queued: spawned.status === "queued", deliveryMode: "spawn_followup", message: `Spawned follow-up agent ${spawned.agentId}.` };
 		}
-		this.recordMessageTelemetry(agentId, "followup", "unavailable", false, false);
 		return { agentId, delivered: false, queued: false, deliveryMode: "unavailable", message: "Agent is not live. Use mode=spawn_followup to create a follow-up child." };
 	}
 
@@ -438,11 +374,7 @@ export class AgentManager {
 		this.ensureInterruptedResult(record, terminalReason, finishedAt);
 		if (hadActiveTurn) record.result!.metrics = mergeCumulativeAgentMetrics(previousMetrics, turnMetrics, { outputChars: record.outputChars });
 		this.transition(record, "interrupted", { processState: closeError ? "unknown" : "killed", controllable: false, finishedAt, error: terminalReason ?? "Interrupted by parent agent." });
-		const outcome: TelemetryOutcome = terminalReason?.toLowerCase().includes("timed out") ? "timeout" : "interrupted";
-		this.recordRouteTerminal(record, outcome === "timeout" ? "timeout" : "cancelled", finishedAt, turnMetrics, terminalReason, outcome === "timeout" ? "host" : "user");
-		this.finishRuntimeRecovery(record, outcome, finishedAt, terminalReason);
-		this.finishTurn(record, outcome, finishedAt, terminalReason, turnMetrics);
-		this.recordAgentCompletion(record, outcome, finishedAt, terminalReason);
+		this.finishTurn(record, finishedAt);
 		const edge = this.graph.closeEdge(agentId, "interrupted");
 		this.store.appendEvent("agent.interrupted", { agentId, taskPath: record.taskPath, data: { reason: terminalReason, result: record.result, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
 		if (edge) {
@@ -473,9 +405,7 @@ export class AgentManager {
 			record.result = { agentId, status: "interrupted", summary: reason ?? "Closed by parent agent.", output: record.outputTail, metrics: mergeCumulativeAgentMetrics(record.result?.metrics, turnMetrics, { outputChars: record.outputChars }) };
 		}
 		this.transition(record, "closed", { processState: "killed", controllable: false, finishedAt: closedAt, error: record.error });
-		if (hadActiveTurn) this.recordRouteTerminal(record, "aborted", closedAt, turnMetrics, reason, "user");
-		this.finishTurn(record, "closed", closedAt, reason, turnMetrics);
-		if (hadActiveTurn) this.recordAgentCompletion(record, "closed", closedAt, reason);
+		if (hadActiveTurn) this.finishTurn(record, closedAt);
 		const edge = this.graph.closeEdge(agentId, "closed");
 		this.store.appendEvent("agent.closed", { agentId, taskPath: record.taskPath, data: { reason } });
 		if (edge) {
@@ -507,10 +437,7 @@ export class AgentManager {
 				record.result = { agentId: record.agentId, status: "interrupted", summary: reason, output: record.outputTail, metrics: mergeCumulativeAgentMetrics(record.result?.metrics, turnMetrics, { outputChars: record.outputChars }) };
 			}
 			this.transition(record, "lost", { processState: "unknown", controllable: false, finishedAt: lostAt, error: reason });
-			this.recordRouteTerminal(record, "aborted", lostAt, turnMetrics, reason, "user");
-			this.finishRuntimeRecovery(record, "lost", lostAt, reason);
-			this.finishTurn(record, "lost", lostAt, reason, turnMetrics);
-			this.recordAgentCompletion(record, "lost", lostAt, reason);
+			if (this.activeTurnIds.has(record.agentId)) this.finishTurn(record, lostAt);
 		}
 
 		for (const timeout of this.timeoutHandles.values()) clearTimeout(timeout);
@@ -550,11 +477,6 @@ export class AgentManager {
 		for (const agentId of agentIds) {
 			const record = this.records.get(agentId);
 			if (!record || record.status !== "lost") continue;
-			this.observeTelemetry((telemetry) => {
-				telemetry.agentQueued(this.telemetryDescriptor(record));
-				telemetry.agentCompleted({ agentId, status: "lost", processState: "unknown", controllable: false, outcome: "lost", at: record.updatedAt, outputChars: record.outputChars, error: record.error });
-				telemetry.processExited({ agentId, status: "lost", processState: "unknown", controllable: false, at: record.updatedAt, error: record.error });
-			});
 			this.store.appendEvent("agent.lost", { agentId, taskPath: record.taskPath, data: { error: record.error, restored: true } });
 			this.store.appendAgentState(record);
 			const edge = this.graph.closeEdge(agentId, "lost");
@@ -604,8 +526,7 @@ export class AgentManager {
 
 		const startedAt = nowMs();
 		this.transition(record, "running", { processState: "live_running", controllable: true, startedAt });
-		this.beginTurn(record, "initial", startedAt);
-		this.observeTelemetry((telemetry) => telemetry.agentStarted({ agentId: record.agentId, status: record.status, processState: record.processState, controllable: record.controllable, at: startedAt }));
+		this.beginTurn(record, startedAt);
 		this.store.appendEvent("agent.started", { agentId: record.agentId, taskPath: record.taskPath });
 		this.installAgentTimeout(record.agentId, config.timeoutMs);
 		try {
@@ -655,7 +576,7 @@ export class AgentManager {
 		record.processState = "live_running";
 		record.controllable = true;
 		record.updatedAt = eventAt;
-		if (!this.activeTurnIds.has(agentId)) this.beginTurn(record, "live_followup", eventAt);
+		if (!this.activeTurnIds.has(agentId)) this.beginTurn(record, eventAt);
 		if (resumedTerminalAgent) this.installAgentTimeout(agentId, record.timeoutMs ?? this.limits.maxRuntimeMsPerAgent);
 		this.store.appendAgentState(record);
 		this.notifyChange();
@@ -695,11 +616,7 @@ export class AgentManager {
 		}
 		if (status === "interrupted") this.ensureInterruptedResult(record, result.summary, finishedAt);
 		this.transition(record, status, { processState: "live_idle", controllable: this.handles.get(agentId)?.isAlive() ?? true, finishedAt, error: status === "failed" ? result.summary : undefined });
-		const outcome: TelemetryOutcome = status === "succeeded" ? "succeeded" : status === "interrupted" ? "interrupted" : "failed";
-		this.recordRouteTerminal(record, status === "succeeded" ? "succeeded" : status === "interrupted" ? "cancelled" : "failed", finishedAt, turnMetrics, status === "succeeded" ? undefined : result.summary, status === "interrupted" ? "user" : undefined);
-		this.finishRuntimeRecovery(record, outcome, finishedAt, status === "succeeded" ? undefined : result.summary);
-		this.finishTurn(record, outcome, finishedAt, status === "succeeded" ? undefined : result.summary, turnMetrics);
-		this.recordAgentCompletion(record, outcome, finishedAt, status === "succeeded" ? undefined : result.summary);
+		this.finishTurn(record, finishedAt);
 		this.store.appendEvent(status === "succeeded" ? "agent.succeeded" : status === "interrupted" ? "agent.interrupted" : "agent.failed", {
 			agentId,
 			taskPath: record.taskPath,
@@ -739,10 +656,7 @@ export class AgentManager {
 	private failBeforeStart(record: AgentRecord, message: string): void {
 		const failedAt = nowMs();
 		this.transition(record, "failed", { processState: "exited", controllable: false, finishedAt: failedAt, error: message });
-		this.recordRouteTerminal(record, "failed", failedAt, undefined, message, "host");
-		this.finishTurn(record, "failed", failedAt, message);
-		this.recordAgentCompletion(record, "failed", failedAt, message);
-		this.observeTelemetry((telemetry) => telemetry.processExited({ agentId: record.agentId, status: record.status, processState: record.processState, controllable: false, at: failedAt, error: message }));
+		this.finishTurn(record, failedAt);
 		this.store.appendEvent("agent.failed", { agentId: record.agentId, taskPath: record.taskPath, data: { error: message } });
 		const edge = this.graph.closeEdge(record.agentId, "failed");
 		if (edge) this.store.appendEdgeState(edge);
@@ -765,10 +679,7 @@ export class AgentManager {
 			};
 		}
 		this.transition(record, "failed", { processState: "exited", controllable: false, finishedAt: failedAt, error: error.message });
-		this.recordRouteTerminal(record, "failed", failedAt, turnMetrics, error);
-		this.finishRuntimeRecovery(record, "failed", failedAt, error);
-		this.finishTurn(record, "failed", failedAt, error, turnMetrics);
-		this.recordAgentCompletion(record, "failed", failedAt, error);
+		this.finishTurn(record, failedAt);
 		this.store.appendEvent("agent.failed", { agentId, taskPath: record.taskPath, data: { error: error.message, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
 		const edge = this.graph.closeEdge(agentId, "failed");
 		if (edge) {
@@ -793,7 +704,6 @@ export class AgentManager {
 		record.controllable = false;
 		if (record.result?.metrics) record.result.metrics.exitCode = record.exitCode;
 		record.updatedAt = nowMs();
-		this.observeTelemetry((telemetry) => telemetry.processExited({ agentId, status: record.status, processState: record.processState, controllable: false, at: record.updatedAt, exitCode: exitCode ?? undefined, signal: closeSignal ?? undefined, error: exitError }));
 		this.store.appendAgentState(record);
 		if (!expectedExit) this.clearRetainedRuntimeState(agentId);
 		this.notifyChange();
@@ -816,8 +726,6 @@ export class AgentManager {
 		const reason = `Timed out after ${timeoutMs} ms`;
 		record.error = graceMs > 0 ? `${reason}; aborting the active turn before requesting a no-tools partial report.` : reason;
 		record.updatedAt = nowMs();
-		this.runtimeRecoveryStartedAt.set(agentId, record.updatedAt);
-		this.observeTelemetry((telemetry) => telemetry.recovery({ agentId, turnId: this.activeTurnIds.get(agentId), type: "runtime_timeout", phase: "started", at: record.updatedAt }));
 		this.store.appendEvent("agent.timeout_recovery", { agentId, taskPath: record.taskPath, data: { phase: "started", timeoutMs, graceMs, outputTail: record.outputTail.slice(-this.limits.maxPersistedOutputTailChars) } });
 		this.store.appendAgentState(record);
 		this.notifyChange();
@@ -854,124 +762,26 @@ export class AgentManager {
 
 	private handleBackendObservation(agentId: string, observation: BackendObservation): void {
 		const turnId = this.activeTurnIds.get(agentId);
-		this.observeTelemetry((telemetry) => {
-			switch (observation.kind) {
-				case "process.spawned":
-					this.processSpawnedAt.set(agentId, observation.at);
-					telemetry.processSpawned({ agentId, at: observation.at, pid: observation.pid });
-					break;
-				case "process.exited":
-					// onExit records the authoritative manager state and terminal process observation.
-					break;
-				case "rpc.started":
-					telemetry.rpcStarted({ agentId, turnId, requestId: observation.requestId, command: observation.command, at: observation.at });
-					break;
-				case "rpc.completed":
-					if (!observation.success) {
-						const signals = this.routeSignals.get(agentId);
-						if (signals) signals.rpcError = true;
-					}
-					telemetry.rpcCompleted({ agentId, turnId, requestId: observation.requestId, command: observation.command, at: observation.at, durationMs: observation.durationMs, outcome: observation.success ? "succeeded" : "failed", error: observation.error });
-					break;
-				case "model.first_output":
-					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.sawModelOutput = true;
-					if (!turnId || !this.firstProgressTurnIds.has(turnId)) {
-						if (turnId) {
-							this.firstProgressTurnIds.add(turnId);
-							this.firstProgressAt.set(turnId, observation.at);
-						}
-						telemetry.agentFirstProgress(agentId, observation.at);
-					}
-					break;
-				case "model.executed": {
-					const record = this.records.get(agentId);
-					if (record) {
-						if (observation.model) record.actualModel = observation.model;
-						if (observation.thinkingLevel) record.actualThinkingLevel = observation.thinkingLevel as AgentRecord["actualThinkingLevel"];
-					}
-					break;
-				}
-				case "tool.started":
-					telemetry.toolStarted({ agentId, turnId, toolCallId: observation.toolCallId, toolName: observation.toolName, at: observation.at });
-					break;
-				case "tool.completed": {
-					const signals = this.routeSignals.get(agentId);
-					if (signals && !observation.success) {
-						signals.toolError = true;
-						signals.policyError ||= Boolean(observation.policyRejected);
-					}
-					telemetry.toolCompleted({ agentId, turnId, toolCallId: observation.toolCallId, toolName: observation.toolName, at: observation.at, durationMs: observation.durationMs, outcome: observation.success ? "succeeded" : "failed", resultChars: observation.resultChars, resultTruncated: observation.resultTruncated, error: observation.error });
-					break;
-				}
-				case "compaction.started":
-					telemetry.recovery({ agentId, turnId, type: "compaction", phase: "started", at: observation.at });
-					break;
-				case "compaction.completed":
-					telemetry.recovery({ agentId, turnId, type: "compaction", phase: "completed", at: observation.at, durationMs: observation.durationMs, outcome: observation.success ? "succeeded" : "failed", error: observation.error });
-					break;
-				case "context_overflow.detected":
-					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.contextOverflow = true;
-					telemetry.recovery({ agentId, turnId, type: "context_overflow", phase: "started", at: observation.at });
-					break;
-				case "context_overflow.recovery":
-					telemetry.recovery({ agentId, turnId, type: "context_overflow", phase: observation.phase, at: observation.at, durationMs: observation.durationMs, outcome: observation.phase === "completed" ? observation.success ? "succeeded" : "failed" : undefined, error: observation.error });
-					break;
-				case "rpc.malformed":
-					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.rpcError = true;
-					telemetry.protocolError({ agentId, at: observation.at, error: observation.error });
-					break;
-				case "provider.error":
-					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.providerError = true;
-					telemetry.providerError({ agentId, turnId, at: observation.at, error: observation.error });
-					break;
-				case "provider.retry.start":
-					if (this.routeSignals.has(agentId)) this.routeSignals.get(agentId)!.providerError = true;
-					telemetry.recovery({ agentId, turnId, type: "provider_retry", phase: "started", at: observation.at, error: observation.error });
-					break;
-				case "provider.retry.end":
-					telemetry.recovery({ agentId, turnId, type: "provider_retry", phase: "completed", at: observation.at, outcome: observation.success ? "succeeded" : "failed", error: observation.error });
-					break;
-			}
-		});
+		if (observation.kind === "process.spawned") {
+			this.processSpawnedAt.set(agentId, observation.at);
+			return;
+		}
+		if (observation.kind === "model.first_output") {
+			if (turnId) this.firstProgressAt.set(turnId, observation.at);
+			return;
+		}
+		if (observation.kind !== "model.executed") return;
+		const record = this.records.get(agentId);
+		if (!record) return;
+		if (observation.model) record.actualModel = observation.model;
+		if (observation.thinkingLevel) record.actualThinkingLevel = observation.thinkingLevel as AgentRecord["actualThinkingLevel"];
 	}
-
-	private telemetryDescriptor(record: AgentRecord) {
-		return {
-			agentId: record.agentId,
-			parentAgentId: record.parentAgentId,
-			jobId: record.jobId,
-			taskPath: record.taskPath,
-			projectPath: this.rootCwd,
-			model: record.model,
-			thinkingLevel: record.thinkingLevel,
-			routingMode: record.routingMode,
-			routingProfile: record.routingProfile,
-			intent: record.routingDecision?.intent,
-			complexityTier: record.routingDecision?.complexityTier,
-			complexityScore: record.routingDecision?.complexityScore,
-			writeMode: record.writeMode,
-			contextMode: record.contextMode,
-			promptChars: record.prompt.length,
-			createdAt: record.createdAt,
-		};
-	}
-
-	private beginTurn(record: AgentRecord, kind: TelemetryTurnKind, at = nowMs()): string {
+	private beginTurn(record: AgentRecord, at = nowMs()): string {
 		const existing = this.activeTurnIds.get(record.agentId);
 		if (existing) return existing;
 		const turnId = createId("turn");
 		this.activeTurnIds.set(record.agentId, turnId);
-		this.activeTurnKinds.set(record.agentId, kind);
 		this.activeTurnStartedAt.set(turnId, at);
-		this.routeSignals.set(record.agentId, {
-			sawModelOutput: false,
-			providerError: false,
-			rpcError: false,
-			toolError: false,
-			policyError: false,
-			contextOverflow: false,
-		});
-		this.observeTelemetry((telemetry) => telemetry.turnStarted({ agentId: record.agentId, turnId, kind, at }));
 		return turnId;
 	}
 
@@ -990,150 +800,12 @@ export class AgentManager {
 		};
 	}
 
-	private finishTurn(record: AgentRecord, outcome: TelemetryOutcome, at = nowMs(), error?: unknown, metrics: AgentMetrics = this.completedTurnMetrics(record, undefined, at)): void {
+	private finishTurn(record: AgentRecord, at = nowMs()): void {
 		const turnId = this.activeTurnIds.get(record.agentId);
 		if (!turnId) return;
 		this.activeTurnIds.delete(record.agentId);
-		const kind = this.activeTurnKinds.get(record.agentId) ?? "initial";
-		this.activeTurnKinds.delete(record.agentId);
 		this.activeTurnStartedAt.delete(turnId);
-		this.firstProgressTurnIds.delete(turnId);
 		this.firstProgressAt.delete(turnId);
-		this.observeTelemetry((telemetry) => telemetry.turnCompleted({
-			agentId: record.agentId,
-			turnId,
-			kind,
-			at,
-			outcome,
-			durationMs: metrics.durationMs,
-			outputChars: metrics.outputChars,
-			toolCalls: metrics.toolCalls,
-			providerRequests: metrics.providerRequests,
-			compactions: metrics.compactions,
-			inputTokens: metrics.inputTokens,
-			outputTokens: metrics.outputTokens,
-			cacheReadTokens: metrics.cacheReadTokens,
-			cacheWriteTokens: metrics.cacheWriteTokens,
-			totalTokens: metrics.totalTokens,
-			costUsd: metrics.costUsd,
-			error,
-		}));
-	}
-
-	private recordAgentCompletion(record: AgentRecord, outcome: TelemetryOutcome, at = nowMs(), error?: unknown): void {
-		const metrics = record.result?.metrics;
-		this.observeTelemetry((telemetry) => telemetry.agentCompleted({
-			agentId: record.agentId,
-			status: record.status,
-			processState: record.processState,
-			controllable: record.controllable,
-			outcome,
-			at,
-			outputChars: record.outputChars,
-			durationMs: metrics?.durationMs ?? statusDurationMs(record, at),
-			queueDurationMs: metrics?.queueDurationMs ?? (record.startedAt ? Math.max(0, record.startedAt - record.createdAt) : undefined),
-			startupDurationMs: metrics?.startupDurationMs,
-			firstProgressMs: metrics?.firstProgressMs,
-			turns: metrics?.turns,
-			toolCalls: metrics?.toolCalls,
-			providerRequests: metrics?.providerRequests,
-			compactions: metrics?.compactions,
-			inputTokens: metrics?.inputTokens,
-			outputTokens: metrics?.outputTokens,
-			cacheReadTokens: metrics?.cacheReadTokens,
-			cacheWriteTokens: metrics?.cacheWriteTokens,
-			totalTokens: metrics?.totalTokens,
-			costUsd: metrics?.costUsd,
-			error,
-		}));
-	}
-
-	private routeFailureDomain(record: AgentRecord, error?: unknown, forced?: FailureDomain): FailureDomain | undefined {
-		if (forced) return forced;
-		const signals = this.routeSignals.get(record.agentId);
-		const tagged = error && typeof error === "object" && "failureDomain" in error
-			? (error as { failureDomain?: FailureDomain }).failureDomain
-			: undefined;
-		if (tagged) return tagged;
-		if (signals?.contextOverflow) return "model";
-		if (signals?.policyError) return "policy";
-		if (signals?.rpcError) return "rpc";
-		if (signals?.toolError) return "tool";
-		if (signals?.providerError) return "provider";
-		const message = error instanceof Error ? error.message : String(error ?? record.error ?? "");
-		if (/context window|context length|maximum context|too many tokens|input exceeds/i.test(message)) return "model";
-		if (/policy|not allowed|blocked by read-only|blocked by disjoint/i.test(message)) return "policy";
-		if (/auth|rate.?limit|provider|api key|http\s*(401|403|429)/i.test(message)) return "provider";
-		if (/rpc|malformed json|protocol/i.test(message)) return "rpc";
-		return (record.result?.metrics?.providerRequests ?? 0) > 0 ? "provider" : "host";
-	}
-
-	private recordRouteTerminal(
-		record: AgentRecord,
-		outcome: AgentRouteTerminalObservation["outcome"],
-		at: number,
-		metrics: AgentMetrics | undefined,
-		error?: unknown,
-		forcedDomain?: FailureDomain,
-	): void {
-		const routeId = record.routeId ?? record.routingDecision?.routeId;
-		const signals = this.routeSignals.get(record.agentId);
-		if (!routeId || this.observedRouteIds.has(routeId)) {
-			this.routeSignals.delete(record.agentId);
-			return;
-		}
-		this.observedRouteIds.add(routeId);
-		const failureDomain = outcome === "succeeded" ? undefined : this.routeFailureDomain(record, error, forcedDomain);
-		record.failureDomain = failureDomain;
-		if (record.routingDecision) record.routingDecision.failureDomain = failureDomain;
-		this.store.appendAgentState(record);
-		const observation: AgentRouteTerminalObservation = {
-			routeId,
-			outcome,
-			failureDomain,
-			completedAt: at,
-			latencyMs: metrics?.durationMs,
-			firstTokenMs: metrics?.firstProgressMs,
-			inputTokens: metrics?.inputTokens,
-			outputTokens: metrics?.outputTokens,
-			cacheReadTokens: metrics?.cacheReadTokens,
-			cacheWriteTokens: metrics?.cacheWriteTokens,
-			costUsd: metrics?.costUsd,
-			providerRequests: metrics?.providerRequests,
-			toolCalls: metrics?.toolCalls,
-			contextOverflow: Boolean(signals?.contextOverflow),
-		};
-		try {
-			void Promise.resolve(this.onRouteTerminal?.(observation, shallowCloneRecord(record))).catch(() => undefined);
-		} catch {
-			// Router persistence/telemetry must never change the child outcome.
-		}
-		this.routeSignals.delete(record.agentId);
-	}
-
-	private finishRuntimeRecovery(record: AgentRecord, outcome: TelemetryOutcome, at = nowMs(), error?: unknown): void {
-		const startedAt = this.runtimeRecoveryStartedAt.get(record.agentId);
-		if (startedAt === undefined) return;
-		this.runtimeRecoveryStartedAt.delete(record.agentId);
-		this.observeTelemetry((telemetry) => telemetry.recovery({
-			agentId: record.agentId,
-			turnId: this.activeTurnIds.get(record.agentId),
-			type: "runtime_timeout",
-			phase: "completed",
-			outcome,
-			at,
-			durationMs: Math.max(0, at - startedAt),
-			error,
-		}));
-	}
-
-	private recordMessageTelemetry(agentId: string, kind: string, deliveryMode: TelemetryDeliveryMode, delivered: boolean, queued: boolean, at = nowMs()): void {
-		const normalizedKind: TelemetryMessageKind = kind === "correction" || kind === "constraint" || kind === "note" || kind === "followup" ? kind : "message";
-		this.observeTelemetry((telemetry) => telemetry.messageDelivered({ agentId, kind: normalizedKind, deliveryMode, delivered, queued, at }));
-	}
-
-	private observeTelemetry(observe: (telemetry: SubagentTelemetry) => void): void {
-		try { observe(this.telemetry); } catch { /* telemetry must never alter agent behavior */ }
 	}
 
 	private clearAgentTimeout(agentId: string): void {
@@ -1179,15 +851,11 @@ export class AgentManager {
 		this.lastOutputPersistAt.delete(agentId);
 		this.pendingFollowupRoutes.delete(agentId);
 		this.processSpawnedAt.delete(agentId);
-		this.runtimeRecoveryStartedAt.delete(agentId);
-		this.routeSignals.delete(agentId);
 		this.clearIdleClose(agentId);
 		const turnId = this.activeTurnIds.get(agentId);
 		if (turnId) {
 			this.activeTurnIds.delete(agentId);
-			this.activeTurnKinds.delete(agentId);
 			this.activeTurnStartedAt.delete(turnId);
-			this.firstProgressTurnIds.delete(turnId);
 			this.firstProgressAt.delete(turnId);
 		}
 	}

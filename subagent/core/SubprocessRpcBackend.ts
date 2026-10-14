@@ -6,7 +6,7 @@ import type { AgentBackend, AgentBackendEvents, AgentHandle, BackendSpawnRequest
 import type { AgentRecord, AgentResult } from "./AgentTypes.ts";
 import { RpcClient } from "./RpcClient.ts";
 import { RUNTIME_TIMEOUT_RECOVERY_COMMAND_TEXT, RUNTIME_TIMEOUT_RECOVERY_MARKER } from "./TimeoutRecovery.ts";
-import { aggregateAssistantUsage } from "../telemetry/Usage.ts";
+import { aggregateAssistantUsage } from "./metrics.ts";
 import { appendOutputTail, summarizeText, truncateMiddle } from "./utils.ts";
 
 const STDERR_TAIL_CAP = 16_384;
@@ -262,7 +262,7 @@ export class SubprocessRpcBackend implements AgentBackend {
 		}) as ChildProcessWithoutNullStreams;
 
 		const observe = (observation: Parameters<NonNullable<typeof events.onObservation>>[0]) => {
-			try { events.onObservation?.(observation); } catch { /* telemetry must not affect the child */ }
+			try { events.onObservation?.(observation); } catch { /* observation handlers must not affect the child */ }
 		};
 		observe({ kind: "process.spawned", at: Date.now(), pid: proc.pid });
 
@@ -568,9 +568,7 @@ export class SubprocessRpcBackend implements AgentBackend {
 				events.onOutput?.(`\n[Failed to close child after initial prompt error: ${closeError instanceof Error ? closeError.message : String(closeError)}]\n`);
 			});
 			if (!sawFirstModelOutput && proc.exitCode !== null) {
-				const hostError = error instanceof Error ? error : new Error(String(error));
-				(hostError as Error & { failureDomain?: string }).failureDomain = "host";
-				throw hostError;
+				throw error;
 			}
 			throw error;
 		}

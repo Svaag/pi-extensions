@@ -1,4 +1,4 @@
-import type { AgentMetrics } from "../core/AgentTypes.ts";
+import type { AgentMetrics } from "./AgentTypes.ts";
 
 export type UsageMetrics = Pick<AgentMetrics,
 	| "providerRequests"

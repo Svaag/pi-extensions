@@ -13,8 +13,6 @@ import type {
 	ExportBatchResult,
 } from "./BatchTypes.ts";
 import { createId, isPathInside, nowMs, slugifyTaskName, summarizeText, truncateMiddle } from "./utils.ts";
-import { NOOP_SUBAGENT_TELEMETRY } from "../telemetry/NoopTelemetry.ts";
-import type { SubagentTelemetry, TelemetryOutcome } from "../telemetry/Telemetry.ts";
 
 export const SUBAGENT_BATCH_EVENT_ENTRY = "subagent-batch-event";
 export const SUBAGENT_BATCH_JOB_STATE_ENTRY = "subagent-batch-job-state";
@@ -39,7 +37,6 @@ export interface BatchJobManagerOptions {
 	rootCwd: string;
 	restoredJobs?: BatchJob[];
 	onChange?: (manager: BatchJobManager) => void;
-	telemetry?: SubagentTelemetry;
 	forkRoutingDecision?: (decision: RoutingDecision, item: BatchJobItem) => Promise<RoutingDecision>;
 }
 
@@ -179,7 +176,6 @@ export class BatchJobManager {
 	private readonly appender: BatchEntryAppender;
 	private readonly rootCwd: string;
 	private readonly onChange?: (manager: BatchJobManager) => void;
-	private readonly telemetry: SubagentTelemetry;
 	private readonly forkRoutingDecision?: (decision: RoutingDecision, item: BatchJobItem) => Promise<RoutingDecision>;
 	private readonly jobs = new Map<string, BatchJob>();
 	private readonly pumps = new Set<string>();
@@ -190,7 +186,6 @@ export class BatchJobManager {
 		this.appender = options.appender;
 		this.rootCwd = options.rootCwd;
 		this.onChange = options.onChange;
-		this.telemetry = options.telemetry ?? NOOP_SUBAGENT_TELEMETRY;
 		this.forkRoutingDecision = options.forkRoutingDecision;
 		for (const restored of options.restoredJobs ?? []) this.jobs.set(restored.jobId, cloneJob(restored));
 	}
@@ -259,10 +254,6 @@ export class BatchJobManager {
 			items,
 		};
 		this.jobs.set(jobId, job);
-		this.observeTelemetry((telemetry) => {
-			telemetry.batchStarted({ jobId, nameHashSource: job.name, projectPath: this.rootCwd, source: job.sourceType, maxConcurrency, itemCount: items.length, createdAt: now });
-			for (const item of items) telemetry.batchItem({ jobId, itemId: item.itemId, phase: "queued", at: now });
-		});
 		this.appendEvent("batch.started", jobId, { sourceType: job.sourceType, total: items.length, maxConcurrency });
 		this.saveJob(job);
 		void this.pump(jobId);
@@ -301,7 +292,6 @@ export class BatchJobManager {
 		for (const item of job.items) {
 			if (item.status === "queued") {
 				this.markItem(job, item, "cancelled", { error: reason });
-				this.observeTelemetry((telemetry) => telemetry.batchItem({ jobId, itemId: item.itemId, phase: "completed", outcome: "cancelled", at: item.finishedAt, error: reason }));
 			} else if (item.status === "running" && item.agentId) await this.agentManager.interruptAgent(item.agentId, reason);
 		}
 		this.updateItemsFromAgents(job);
@@ -375,7 +365,6 @@ export class BatchJobManager {
 		const now = nowMs();
 		item.prompt = interpolatePrompt(job.promptTemplate, item.data);
 		this.markItem(job, item, "running", { startedAt: now });
-		this.observeTelemetry((telemetry) => telemetry.batchItem({ jobId: job.jobId, itemId: item.itemId, phase: "started", queueDurationMs: Math.max(0, now - item.createdAt), at: now }));
 		job.status = "running";
 		job.startedAt = job.startedAt ?? now;
 		try {
@@ -404,7 +393,6 @@ export class BatchJobManager {
 		} catch (error) {
 			const finishedAt = nowMs();
 			this.markItem(job, item, "failed", { error: error instanceof Error ? error.message : String(error), finishedAt });
-			this.observeTelemetry((telemetry) => telemetry.batchItem({ jobId: job.jobId, itemId: item.itemId, phase: "completed", outcome: "failed", durationMs: item.startedAt ? Math.max(0, finishedAt - item.startedAt) : undefined, at: finishedAt, error }));
 			this.appendEvent("batch.worker_result", job.jobId, { itemId: item.itemId, status: item.status, error: item.error });
 		}
 	}
@@ -435,17 +423,6 @@ export class BatchJobManager {
 		} else {
 			this.markItem(job, item, "failed", { output, summary, error: record.error ?? record.result?.summary ?? "Worker failed.", finishedAt: record.finishedAt ?? nowMs() });
 		}
-		const finishedAt = item.finishedAt ?? nowMs();
-		this.observeTelemetry((telemetry) => telemetry.batchItem({
-			jobId: job.jobId,
-			itemId: item.itemId,
-			agentId: item.agentId,
-			phase: "completed",
-			outcome: this.itemTelemetryOutcome(item.status),
-			durationMs: item.startedAt ? Math.max(0, finishedAt - item.startedAt) : undefined,
-			at: finishedAt,
-			error: item.error,
-		}));
 		this.appendEvent("batch.worker_result", job.jobId, { itemId: item.itemId, status: item.status, agentId: item.agentId, summary: item.summary, error: item.error });
 	}
 
@@ -463,17 +440,6 @@ export class BatchJobManager {
 		job.finishedAt = nowMs();
 		job.updatedAt = job.finishedAt;
 		job.counts = computeCounts(job.items);
-		this.observeTelemetry((telemetry) => telemetry.batchCompleted({
-			jobId: job.jobId,
-			outcome: status === "succeeded" ? "succeeded" : status === "cancelled" ? "cancelled" : "failed",
-			durationMs: job.startedAt ? Math.max(0, job.finishedAt! - job.startedAt) : undefined,
-			total: job.counts.total,
-			succeeded: job.counts.succeeded,
-			failed: job.counts.failed,
-			cancelled: job.counts.cancelled,
-			lost: job.counts.lost,
-			at: job.finishedAt,
-		}));
 		this.appendEvent(status === "succeeded" ? "batch.completed" : status === "cancelled" ? "batch.cancelled" : "batch.failed", job.jobId, { counts: job.counts });
 		this.saveJob(job);
 	}
@@ -512,18 +478,6 @@ export class BatchJobManager {
 			};
 			this.waiters.add(done);
 		});
-	}
-
-	private itemTelemetryOutcome(status: BatchJobItem["status"]): TelemetryOutcome {
-		if (status === "succeeded") return "succeeded";
-		if (status === "cancelled") return "cancelled";
-		if (status === "lost") return "lost";
-		if (status === "failed") return "failed";
-		return "unknown";
-	}
-
-	private observeTelemetry(observe: (telemetry: SubagentTelemetry) => void): void {
-		try { observe(this.telemetry); } catch { /* telemetry must never alter batch execution */ }
 	}
 
 	private notifyChange(): void {

@@ -7,7 +7,7 @@ Personal extensions for the [Pi coding agent](https://github.com/earendil-works/
 - `plan-mode/` — read-only planning mode with proposed-plan extraction, interactive planning questions, and execution progress tracking.
 - `goal-mode/` — autonomous goal/execute mode inspired by Codex collaboration style.
 - `hyrule-loop/` — helper commands for running and inspecting the Hyrule Engineering Loop.
-- [`subagent/`](./subagent/README.md) — isolated RPC child-agent/swarm extension with metadata-only OTel.
+- [`subagent/`](./subagent/README.md) — isolated RPC child-agent/swarm extension.
 - `coding-conventions/` — deterministic `Assisted-by:` trailer on every commit + layered coding-conventions injection with ecosystem auto-detection.
 - [`code-mode/`](./code-mode/README.md) — Codex-style JavaScript REPL (`exec`/`wait`) that puts tool calling behind a sandbox, with RLM-style `llm.query()` sub-LLM calls.
 
@@ -31,13 +31,13 @@ Reload Pi with `/reload` after installing or updating.
 
 ## Testing
 
-Run the full extension, router, storage, telemetry, Pi-adapter, and Subagent regression suite:
+Run the full extension, router, storage, Pi-adapter, and Subagent regression suite:
 
 ```bash
 npm test
 ```
 
-The tests use Node's built-in test runner with TypeScript type stripping. Run `npm install` first for Pi/OTel integration dependencies.
+The tests use Node's built-in test runner with TypeScript type stripping. Run `npm install` first for Pi integration dependencies.
 
 ## Notes
 
